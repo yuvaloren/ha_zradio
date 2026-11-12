@@ -28,7 +28,8 @@
 #      back by itself; a keepalived that stops (systemctl stop, a crash, the shutdown) stops this VM serving — its own
 #      notify at a stop is not reliable [V: after a stop one VM's role file still said MASTER], and a crashed
 #      keepalived runs none. Enabled: zradio-quiet (silent sticks at every boot), keepalived, the nightly sync, the
-#      15-minute tick, the state line, the device-change watcher — and zradio.target, which names them all.
+#      15-minute tick, the state line, the device-change watcher, the election's gate (zradio-gate: observe mode
+#      unless zradio.conf says ELECTION=act) — and zradio.target, which names them all.
 #      NOTHING IS STARTED: `systemctl start zradio.target`, or the next boot, puts this VM into the pair.
 #   7. this VM's sync key (made if missing) and its two PUBLIC keys, with the line to run on the other VM.
 # Refused before anything is changed: not root; a missing sibling file; a conf that does not check.
@@ -63,9 +64,9 @@ pkg() { # pkg <name> [stop: the service the package starts]
   DEBIAN_FRONTEND=noninteractive apt-get install -y -q "$1" >/dev/null 2>&1 && done_ "$1 $(dpkg-query -W -f '${Version}' "$1" 2>/dev/null) installed" || { bad "apt-get install $1 failed"; return 1; }
   if [ -n "${2:-}" ]; then systemctl disable --now "$2" >/dev/null 2>&1; active "$2" && bad "$2 was started by its package and did not stop" || ok "$2 is stopped and not enabled (its package starts it; only the pair may)"; fi
 }
-SBIN="zradio-serve zradio-notify zradio-sync zradio-switch zradio-change-watch zradio-render zradio-detect zradio-apply"
+SBIN="zradio-serve zradio-notify zradio-sync zradio-switch zradio-change-watch zradio-render zradio-detect zradio-apply zradio-gate"
 LIBF="zradio-common.sh zradio-probe.py zui-restore.py zui-settings.json keepalived.conf.tmpl zradio-sync.timer usb-ids.json"
-UNITS="zradio.target zradio-serve.service zradio-quiet.service zradio-hush.service zradio-sync.service zradio-sync-tick.service zradio-sync-tick.timer zradio-state.service zradio-state.timer zradio-change-watch.service"
+UNITS="zradio.target zradio-serve.service zradio-quiet.service zradio-hush.service zradio-sync.service zradio-sync-tick.service zradio-sync-tick.timer zradio-state.service zradio-state.timer zradio-change-watch.service zradio-gate.service"
 
 echo "== 0. checks ($([ $RUN = 1 ] && echo RUN || echo REPORT) mode) =="
 [ "$(id -u)" = 0 ] && ok "root" || bad "not root"
@@ -167,8 +168,8 @@ for u in $UNITS; do put "$HERE/units/$u" "/etc/systemd/system/$u" 644; done
 printf '# zradio (install.sh): silent sticks first; a keepalived that dies comes back by itself; a keepalived that stops\n# (systemctl stop, a crash, the shutdown) stops this VM serving — its own notify at a stop is not reliable.\n[Unit]\nAfter=zradio-quiet.service\n[Service]\nRestart=always\nRestartSec=2\nExecStopPost=/usr/local/sbin/zradio-notify INSTANCE RADIO STOP 0\n' > "$TMP/dropin"
 put "$TMP/dropin" /etc/systemd/system/keepalived.service.d/10-zradio.conf 644
 if [ $RUN = 1 ]; then
-  systemctl daemon-reload && systemctl enable zradio.target zradio-quiet.service keepalived.service zradio-sync.timer zradio-sync-tick.timer zradio-state.timer zradio-change-watch.service >/dev/null 2>&1 \
-    && done_ "enabled: zradio-quiet (silent sticks at boot), keepalived, the nightly sync ($SYNC_AT${SYNC_TZ:+ $SYNC_TZ}), the 15-min tick, the state line, the device-change watcher — nothing started" \
+  systemctl daemon-reload && systemctl enable zradio.target zradio-quiet.service keepalived.service zradio-sync.timer zradio-sync-tick.timer zradio-state.timer zradio-change-watch.service zradio-gate.service >/dev/null 2>&1 \
+    && done_ "enabled: zradio-quiet (silent sticks at boot), keepalived, the nightly sync ($SYNC_AT${SYNC_TZ:+ $SYNC_TZ}), the 15-min tick, the state line, the device-change watcher, the election's gate (ELECTION=$ELECTION) — nothing started" \
     || bad "systemctl enable failed"
   systemctl disable ser2net >/dev/null 2>&1 || true
 else would "systemctl daemon-reload; enable zradio.target, zradio-quiet, keepalived, zradio-sync.timer, zradio-sync-tick.timer, zradio-state.timer, zradio-change-watch (nothing is started)"; fi
@@ -177,6 +178,7 @@ if [ $RUN = 1 ]; then
   case " $CHANGED " in *" /etc/ser2net.yaml "*) active ser2net && warn "/etc/ser2net.yaml changed and ser2net is active (this VM serves): the new file is used from the next switch on (zradio-switch --run), or after 'systemctl restart ser2net' — a few seconds without radios for Home Assistant";; esac
   case " $CHANGED " in *" /etc/keepalived/keepalived.conf "*) active keepalived && warn "/etc/keepalived/keepalived.conf changed and keepalived is active: 'systemctl restart keepalived' puts it in place (on the active VM that hands the radios to the other one)";; esac
   case " $CHANGED " in *zradio-change-watch*) active zradio-change-watch && { systemctl restart zradio-change-watch >/dev/null 2>&1; ok "zradio-change-watch restarted on the new file (it only watches)"; };; esac
+  case " $CHANGED " in *zradio-gate*|*zradio.conf*) active zradio-gate && { systemctl restart zradio-gate >/dev/null 2>&1; ok "zradio-gate restarted on the new files (ELECTION=$ELECTION)"; };; esac
 fi
 
 echo "== 7. this VM's sync key =="

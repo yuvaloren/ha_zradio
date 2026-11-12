@@ -26,12 +26,14 @@ export PATH="$d/bin:\$PATH" ZRADIO_CONF="$d/etc/zradio.conf" ZRADIO_RADIOS="$d/e
 export ZRADIO_SYNC_AUTH="$d/root.ssh/authorized_keys" ZRADIO_SYNC_HOSTKEY="$d/etc/ssh/host.pub" ZRADIO_SYNC_SECRETS="$d/secrets/sync"
 export ZRADIO_SYNC_STATE="$d/state" ZRADIO_SYNC_RUN="$d/run" ZRADIO_SYNC_PROBE="$d/probe.py" ZRADIO_SYNC_ZIGPY="$d/bin/zigpy"
 export ZRADIO_SYNC_RESTORE="$d/restore.sh" ZRADIO_SYNC_SERVE="$d/serve" ZRADIO_SYNC_SELFCMD="$d/self" ZRADIO_SYNC_ZWAVE_TTY="$d/dev/zwave"
-export ZRADIO_SYNC_ZIGBEE_TTY="$d/dev/zigbee" ZRADIO_SYNC_SSH="$d/bin/ssh" ZRADIO_SYNC_PAUSE=0
+export ZRADIO_SYNC_ZIGBEE_TTY="$d/dev/zigbee" ZRADIO_SYNC_SSH="$d/bin/ssh" ZRADIO_SYNC_PAUSE=0 ZRADIO_SYNC_SWITCH="$d/switch"
 EOF
   local rec; rec="echo \"\$(basename \$0) \$*\" >> '$d/calls'"
   fake "$d/bin" id 'case "${1:-}" in -u) echo 0;; *) command -p id "$@";; esac'
   fake "$d/bin" sleep "$rec"
   fake "$d/bin" logger "echo \"\$*\" >> '$d/journal'"
+  fake "$d/bin" ss "[ -f '$d/ss-broken' ] && exit 1; [ -f '$d/client' ] && echo 'ESTAB 0 0 10.20.30.50:6639 10.20.30.10:51234'; exit 0"
+  printf '#!/usr/bin/env bash\necho "zradio-switch $*" >> %q\n[ -f %q ] && { echo "FAIL  the standby is not ready"; exit 1; }\necho "DONE  handed over"\n' "$d/calls" "$d/switch-fail" > "$d/switch"; chmod +x "$d/switch"
   fake "$d/bin" systemctl "case \"\$1\" in
     is-active) [ \"\$(cat '$d/ser2net')\" = 1 ];;
     start) $rec; [ -f '$d/nostart' ] && exit 1; echo 1 > '$d/ser2net';;
@@ -65,7 +67,7 @@ print(json.dumps(out))
 EOF
   cat > "$d/restore.sh" <<EOF
 echo "zradio-apply \$*" >> "$d/calls"
-dir=\$3
+dir=""; prev=""; for x in "\$@"; do [ "\$prev" = --from ] && dir=\$x; prev=\$x; done
 [ -e "$d/state/standby-dirty" ] && [ -e "$d/run/applying" ] && echo yes > "$d/marked-during-restore"
 cp "\$dir/fetch.json" "$d/fetch-seen.json" 2>/dev/null
 [ -f "\$dir/zha-backup-restore.json" ] && python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["network_key"]["frame_counter"])' "\$dir/zha-backup-restore.json" > "$d/restored-counter"
@@ -135,7 +137,7 @@ echo "MASTER x priority=1" > "$T/p3/b/run/role"; echo 0 > "$T/p3/b/ser2net"
 ( . "$T/p3/b/env.sh"; printf 'x' | SSH_ORIGINAL_COMMAND=receive bash "$TOOL" serve-ssh ) > "$T/p3/b/out" 2>&1; RC=$?
 check "receive on a VM whose last word is MASTER: REFUSED, no restore" bash -c '[ "$2" = 1 ] && grep -q "^REFUSED this VM serves" "$1/out" && ! grep -q "zradio-apply" "$1/calls"' _ "$T/p3/b" "$RC"
 ( . "$T/p3/b/env.sh"; SSH_ORIGINAL_COMMAND="cat /etc/shadow" bash "$TOOL" serve-ssh ) > "$T/p3/b/out" 2>&1; RC=$?
-check "the forced command runs hello or receive, nothing else" bash -c '[ "$2" = 1 ] && grep -q "REFUSED: this key runs hello or receive, nothing else" "$1/out"' _ "$T/p3/b" "$RC"
+check "the forced command runs hello, receive, poke or yield, nothing else" bash -c '[ "$2" = 1 ] && grep -q "REFUSED: this key runs hello, receive, poke or yield, nothing else" "$1/out"' _ "$T/p3/b" "$RC"
 
 echo "-- the receiver does not come back on after the read: serve-failed, ser2net stays stopped, loud; nothing sent"
 pair "$T/p4"; : > "$T/p4/a/rf-on-fail"; sync "$T/p4/a" run
@@ -229,8 +231,8 @@ check "run on a VM that is not paired: step=keys, nothing read" bash -c '[ "$2" 
 
 echo "-- beat: the state line for ops, from both roles; the standby's tick hushes its sticks"
 pair "$T/pe"; sync "$T/pe/a" beat; sync "$T/pe/b" beat
-check "the active's line" has "$T/pe/a/journal" "-t zradio event=state name=radio1 role=MASTER serving=yes gen=none dirty=no applying=no zwave=synced:zwave-800 zigbee=synced:znp last=none"
-check "the standby's line" has "$T/pe/b/journal" "-t zradio event=state name=radio2 role=BACKUP serving=no gen=none dirty=no applying=no zwave=synced:zwave-800 zigbee=synced:znp last=none"
+check "the active's line" has "$T/pe/a/journal" "-t zradio event=state name=radio1 role=MASTER serving=yes gen=none dirty=no applying=no zwave=synced:zwave-800 zigbee=synced:znp term=0 used=no turn=none client=no outdated=no wait=no prio=100 zbfloor=0 last=none"
+check "the standby's line" has "$T/pe/b/journal" "-t zradio event=state name=radio2 role=BACKUP serving=no gen=none dirty=no applying=no zwave=synced:zwave-800 zigbee=synced:znp term=0 used=no turn=none client=no outdated=no wait=no prio=100 zbfloor=0 last=none"
 sync "$T/pe/b" tick
 check "the standby's tick: zradio-serve hush, nothing else" eq "$(cat "$T/pe/b/calls")" "zradio-serve hush"
 : > "$T/pe/b/state/standby-dirty"; : > "$T/pe/b/calls"; sync "$T/pe/b" tick
@@ -271,6 +273,84 @@ PY
 check "a set with a Zigbee image for a standby that has no synced Zigbee stick: REFUSED, nothing written, not dirty" bash -c '[ "$2" = 1 ] && grep -q "^REFUSED no synced zigbee stick here" "$1/out" && ! grep -q zradio-apply "$1/calls" && [ ! -e "$1/state/standby-dirty" ]' _ "$B" "$RC"
 pair "$T/q7"; rm -f "$T/q7/b/etc/radios.conf"; sync "$T/q7/b" hello
 check "a VM with no radios.conf says none / none in its hello (nothing is synced onto it)" has "$T/q7/b/out" "zwave=none zigbee=none"
+
+echo "-- the version: a sync carries the active's term; the standby's copy is that term, not yet used"
+act() { echo "ELECTION=act" >> "$1/etc/zradio.conf"; }
+ver() { cat "$1/state/version" 2>/dev/null; }
+pair "$T/v1"; echo "term=4 used=yes" > "$T/v1/a/state/version"; : > "$T/v1/b/state/outdated"; : > "$T/v1/b/run/hold"; sync "$T/v1/a" run
+check "exit 0; the manifest's term reached the standby: term=4 used=no" bash -c '[ "$2" = 0 ] && [ "$(cat "$1/state/version")" = "term=4 used=no" ]' _ "$T/v1/b" "$RC"
+check "a landed sync settles 'outdated' and lifts the hold" bash -c '[ ! -e "$1/state/outdated" ] && [ ! -e "$1/run/hold" ]' _ "$T/v1/b"
+check "the Zigbee counter floors: the active's own reading, the standby's written value" eq "$(cat "$T/v1/a/state/counter-floor") $(cat "$T/v1/b/state/counter-floor")" "4943413 5943413"
+pair "$T/v2"; act "$T/v2/b"; echo "term=4 used=yes" > "$T/v2/a/state/version"; echo "term=6 used=no" > "$T/v2/b/state/version"; sync "$T/v2/a" run
+check "ELECTION=act: a set of a lower term is refused by the VM that is ahead, nothing written, its version kept" bash -c '[ "$3" = 1 ] && grep -q "REFUSED older term: the set is term 4, this VM holds 6" "$1/out" && ! grep -q zradio-apply "$2/calls" && [ "$(cat "$2/state/version")" = "term=6 used=no" ]' _ "$T/v2/a" "$T/v2/b" "$RC"
+pair "$T/v3"; echo "term=4 used=yes" > "$T/v3/a/state/version"; echo "term=6 used=no" > "$T/v3/b/state/version"; sync "$T/v3/a" run
+check "observe mode (the default): the same set is written as before (nothing is refused for its term)" bash -c '[ "$2" = 0 ] && grep -q zradio-apply "$1/calls"' _ "$T/v3/b" "$RC"
+check "…and the standby's journal says what act mode would have done: would-refuse" has "$T/v3/b/journal" "event=sync-apply result=would-refuse"
+
+echo "-- beat: the term goes up once, when Home Assistant uses a confirmed turn"
+pair "$T/b1"; A="$T/b1/a"; echo "term=4 used=no" > "$A/state/version"; echo confirmed > "$A/run/turn"; sync "$A" beat
+check "serving, confirmed, but no client yet: no advance; hello says client=no" bash -c '[ "$(cat "$1/state/version")" = "term=4 used=no" ] && grep -q " client=no " "$1/out"' _ "$A"
+: > "$A/client"; sync "$A" beat
+check "a client is connected: term 5, used, said once in the journal, and the state line shows it" bash -c '[ "$(cat "$1/state/version")" = "term=5 used=yes" ] && grep -q "event=version result=advanced term=5" "$1/journal" && grep -q "event=state .* term=5 used=yes turn=confirmed client=yes" "$1/journal"' _ "$A"
+sync "$A" beat
+check "the next beat does not advance again" eq "$(ver "$A"); $(grep -c 'event=version' "$A/journal")" "term=5 used=yes; 1"
+pair "$T/b2"; A="$T/b2/a"; echo "term=4 used=no" > "$A/state/version"; echo provisional > "$A/run/turn"; : > "$A/client"; sync "$A" beat
+check "a provisional turn never advances, client or not" eq "$(ver "$A")" "term=4 used=no"
+pair "$T/b3"; A="$T/b3/a"; echo confirmed > "$A/run/turn"; : > "$A/client"; : > "$A/ss-broken"; sync "$A" beat
+check "ss does not work: client=unknown, no advance (never a guess)" bash -c '[ ! -e "$1/state/version" ] && grep -q " client=unknown " "$1/out"' _ "$A"
+pair "$T/b4"; B="$T/b4/b"; echo confirmed > "$B/run/turn"; : > "$B/client"; sync "$B" beat
+check "a standby never advances" bash -c '[ ! -e "$1/state/version" ]' _ "$B"
+pair "$T/bq"; A="$T/bq/a"; echo "term=4 used=no" > "$A/state/version"; echo confirmed > "$A/run/turn"; : > "$A/client"; sync "$A" beat --quiet
+check "beat --quiet (zradio-gate's look every few seconds): the version advances, and NO state line is written" bash -c '[ "$(cat "$1/state/version")" = "term=5 used=yes" ] && ! grep -q "event=state" "$1/journal" && [ ! -s "$1/out" ]' _ "$A"
+pair "$T/b5"; A="$T/b5/a"; echo "term=4 used=no" > "$A/state/version"; echo confirmed > "$A/run/turn"; echo "term=5 zbfloor=9" > "$A/state/outdated"; : > "$A/client"; sync "$A" beat
+check "observe mode: an 'outdated' VM that Home Assistant uses advances like any other, and is not outdated any more (it IS the copy in use)" bash -c '[ "$(cat "$1/state/version")" = "term=5 used=yes" ] && [ ! -e "$1/state/outdated" ]' _ "$A"
+pair "$T/b6"; A="$T/b6/a"; act "$A"; echo "term=4 used=no" > "$A/state/version"; echo "term=4 used=yes" > "$T/b6/b/state/version"; echo confirmed > "$A/run/turn"; : > "$A/client"; sync "$A" beat
+check "ELECTION=act, the peer answers and is AHEAD (a cut link healed; an old active back first): no advance, the turn is provisional now, said" bash -c '[ "$(cat "$1/state/version")" = "term=4 used=no" ] && [ "$(cat "$1/run/turn")" = provisional ] && grep -q "event=election result=behind Home Assistant is connected here, but the peer answers and holds the newer networks (term=4 used=yes; this VM term=4 used=no)" "$1/journal"' _ "$A"
+check "…and the state line of that beat shows it" has "$A/out" " term=4 used=no turn=provisional client=yes "
+pair "$T/b7"; A="$T/b7/a"; echo "term=4 used=no" > "$A/state/version"; echo "term=4 used=yes" > "$T/b7/b/state/version"; echo confirmed > "$A/run/turn"; : > "$A/client"; sync "$A" beat
+check "observe mode, the same: would-behind is said, and the version advances as before this feature" bash -c '[ "$(cat "$1/state/version")" = "term=5 used=yes" ] && [ "$(cat "$1/run/turn")" = confirmed ] && grep -q "event=election result=would-behind" "$1/journal"' _ "$A"
+pair "$T/b8"; A="$T/b8/a"; act "$A"; echo "term=4 used=no" > "$A/state/version"; echo "term=9 used=yes" > "$T/b8/b/state/version"; echo confirmed > "$A/run/turn"; : > "$A/client"; : > "$A/ssh-down"; sync "$A" beat
+check "ELECTION=act, the peer does not answer (it is dead, or the link is cut): the version advances — this is the failover" eq "$(ver "$A")" "term=5 used=yes"
+pair "$T/b9"; A="$T/b9/a"; act "$A"; echo "term=4 used=no" > "$A/state/version"; echo "term=4 used=no" > "$T/b9/b/state/version"; echo confirmed > "$A/run/turn"; : > "$A/client"; sync "$A" beat
+check "ELECTION=act, the peer answers and is level (it released its claim): the version advances" eq "$(ver "$A")" "term=5 used=yes"
+
+echo "-- poke and yield: the two things a peer may ask besides hello and receive"
+pair "$T/k1"; A="$T/k1/a"; B="$T/k1/b"; sync "$B" peer-poke
+check "poke from the standby: the active starts its tick now, without waiting" bash -c 'grep -q "^POKED" "$2/out" && grep -q "^systemctl start --no-block zradio-sync-tick.service" "$1/calls"' _ "$A" "$B"
+sync "$A" peer-poke
+check "poke to a VM that does not serve: ignored" bash -c 'grep -q "^IGNORED" "$1/out" && ! grep -q "sync-tick" "$2/calls"' _ "$A" "$B"
+echo "term=5 used=yes" > "$B/state/version"; echo "term=4 used=yes" > "$A/state/version"; sync "$B" peer-yield
+check "yield in observe mode: refused, said as would-yield on the serving VM, no switch" bash -c 'grep -q "^REFUSED observe mode" "$2/out" && grep -q "event=election result=would-yield" "$1/journal" && ! grep -q "^zradio-switch" "$1/calls"' _ "$A" "$B"
+act "$A"; sync "$B" peer-yield
+check "ELECTION=act and the asker is ahead: the serving VM runs zradio-switch --run --yield and answers YIELDED" bash -c 'grep -q "^YIELDED" "$2/out" && grep -q "^zradio-switch --run --yield$" "$1/calls"' _ "$A" "$B"
+: > "$A/calls"; echo "term=4 used=no" > "$B/state/version"; sync "$B" peer-yield
+check "the asker is not ahead (term 4 unused against term 4 used): refused, no switch" bash -c 'grep -q "^REFUSED not more advanced" "$2/out" && ! grep -q "^zradio-switch" "$1/calls"' _ "$A" "$B"
+echo "term=5 used=yes" > "$B/state/version"; : > "$A/switch-fail"; sync "$B" peer-yield
+check "the handover fails on the serving VM: FAILED with its reason, a loud line" bash -c 'grep -q "^FAILED yield: FAIL  the standby is not ready" "$2/out" && grep -q "event=election result=loud yield" "$1/journal"' _ "$A" "$B"
+( . "$B/env.sh"; SSH_ORIGINAL_COMMAND="yield 9 yes" bash "$TOOL" serve-ssh ) > "$B/out" 2>&1
+check "yield on a VM that does not serve: refused" has "$B/out" "REFUSED this VM does not serve"
+: > "$A/calls"; ( . "$A/env.sh"; SSH_ORIGINAL_COMMAND="yield 9 yes; reboot" bash "$TOOL" serve-ssh ) > "$A/out" 2>&1
+check "anything glued to the two arguments: refused as malformed, nothing run" bash -c 'grep -q "REFUSED yield wants <term> <yes|no>" "$1/out" && ! grep -q "^zradio-switch" "$1/calls"' _ "$A"
+( . "$A/env.sh"; SSH_ORIGINAL_COMMAND="yield x yes" bash "$TOOL" serve-ssh ) > "$A/out" 2>&1
+check "yield with a term that is not a number: refused" has "$A/out" "REFUSED yield wants <term> <yes|no>"
+
+echo "-- self-raise: this VM's own Zigbee counter above a number, before an older copy goes on the air"
+pair "$T/s1"; B="$T/s1/b"; sync "$B" self-raise --above 9000000
+check "exit 0 on the standby" eq "$RC" 0
+check "its own backup is read, written back through zradio-apply (--only zigbee), then silenced" eq "$(grep -E '^(zigpy|zradio-apply|zradio-serve)' "$B/calls" | sed "s#$B##g; s# /secrets.*raise/zha-backup.json##" | tr '\n' ';')" "zigpy radio znp /dev/zigbee backup;zradio-apply --run --only zigbee --from /secrets/sync/in/raise;zradio-serve down;"
+check "the counter written is max(read 4943413, 9000000) + 1000000" eq "$(cat "$B/restored-counter")" "10000000"
+check "the floor is recorded, the markers are gone, no image stays, the journal has the two numbers and no key" bash -c '[ "$(cat "$1/state/counter-floor")" = 10000000 ] && [ ! -e "$1/state/standby-dirty" ] && [ ! -e "$1/run/applying" ] && [ ! -e "$1/secrets/sync/in/raise" ] && grep -q "event=election result=raised .*4943413 → 10000000" "$1/journal"' _ "$B"
+check "the network key is nowhere in the output or the journal" nokey "$B"
+pair "$T/s2"; B="$T/s2/b"; sync "$B" self-raise --above 100
+check "a number below the stick's own reading: the reading + 1000000" eq "$(cat "$B/restored-counter")" "5943413"
+pair "$T/s3"; sync "$T/s3/a" self-raise --above 100
+check "on a VM that serves: refused, the stick is not touched" bash -c '[ "$2" = 1 ] && grep -q "^REFUSED this VM serves" "$1/out" && ! grep -q "^zigpy" "$1/calls"' _ "$T/s3/a" "$RC"
+pair "$T/s4"; B="$T/s4/b"; : > "$B/zb-blank"; sync "$B" self-raise --above 100
+check "a coordinator that holds no network: exit 1, a loud line, nothing written" bash -c '[ "$2" = 1 ] && grep -q "result=loud self-raise: BAD this coordinator is not on a network" "$1/journal" && ! grep -q zradio-apply "$1/calls"' _ "$B" "$RC"
+pair "$T/s5"; B="$T/s5/b"; : > "$B/restore-fail"; sync "$B" self-raise --above 100
+check "the write fails: exit 1, standby-dirty stays (a half-written stick does not serve)" bash -c '[ "$2" = 1 ] && [ -e "$1/state/standby-dirty" ] && [ ! -e "$1/run/applying" ]' _ "$B" "$RC"
+pair "$T/s6"; B="$T/s6/b"; radios "$B" ZWAVE=synced ZWAVE_FAMILY=zwave-800 ZIGBEE=served ZIGBEE_FAMILY=ezsp; sync "$B" self-raise --above 100
+check "no synced Zigbee stick: nothing to raise, exit 0, no call" bash -c '[ "$2" = 0 ] && [ ! -s "$1/calls" ]' _ "$B" "$RC"
 
 echo "-- the conf and the usage"
 pair "$T/pz"; echo 'PEER=$(reboot)' >> "$T/pz/a/etc/zradio.conf"; sync "$T/pz/a" hello

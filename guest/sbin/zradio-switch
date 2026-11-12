@@ -3,6 +3,9 @@
 # INSIDE the ACTIVE radio VM as root; /usr/local/sbin/zradio-switch. Report mode unless --run.
 #
 #   zradio-switch [--run] [--sync]
+#   zradio-switch --run --yield     called by zradio-sync when a more advanced peer asks for the radios (docs/DESIGN.md
+#                                   §3a): no sync first (this VM's copy is the older one), and this VM is marked
+#                                   outdated and held — before keepalived runs here again — until the peer's sync lands
 #
 # Steps with --run:
 #   0. checks: this VM serves (ser2net active, keepalived's last word MASTER); the standby answers hello as BACKUP, not
@@ -21,8 +24,8 @@
 # [V reference pair 2026-11-11: Home Assistant's Z-Wave back after 1.3 s, Zigbee after 7 s.]
 # Journal lines: `zradio: event=switch result=…`. Tests: tests/t-switch.sh. Env: ZRADIO_SWITCH_*.
 set -uo pipefail
-RUN=0 SYNC=0
-while [ $# -gt 0 ]; do case "$1" in --run) RUN=1; shift;; --sync) SYNC=1; shift;;
+RUN=0 SYNC=0 YIELD=0
+while [ $# -gt 0 ]; do case "$1" in --run) RUN=1; shift;; --sync) SYNC=1; shift;; --yield) YIELD=1; shift;;
   -h|--help) sed -n '2,/^set -uo pipefail$/{/^set -uo pipefail$/!p}' "$0"; exit 0;; *) echo "unknown arg: $1" >&2; exit 2;; esac; done
 SYNCCMD=${ZRADIO_SWITCH_SYNC:-/usr/local/sbin/zradio-sync}
 SYSTEMCTL=${ZRADIO_SWITCH_SYSTEMCTL:-systemctl}
@@ -49,7 +52,7 @@ role=$([ -f "$RUNDIR/role" ] && cut -d' ' -f1 < "$RUNDIR/role" || echo none)
 H=$(peer_hello) || true
 case "$H" in
   HELLO\ *)
-    if [ "$(field "$H" role)" = BACKUP ] && [ "$(field "$H" serving)" = no ] && [ "$(field "$H" dirty)" = no ] && [ "$(field "$H" applying)" = no ]; then ok "the standby is ready: $H"
+    if [ "$(field "$H" role)" = BACKUP ] && [ "$(field "$H" serving)" = no ] && [ "$(field "$H" dirty)" = no ] && [ "$(field "$H" applying)" = no ] && [ "$(field "$H" wait)" != yes ]; then ok "the standby is ready: $H"
     else bad "the standby is not ready to take the role: $H"; fi;;
   *) bad "the standby does not answer (zradio-sync peer-hello): no switch into the dark";;
 esac
@@ -58,7 +61,9 @@ try: print(json.load(open(sys.argv[1])).get("gen") or "")
 except Exception: print("")' "$STATE/last-sync.json")
 THEIRS=$(field "${H:-}" gen)
 NEED_SYNC=0
-if [ $SYNC = 1 ]; then NEED_SYNC=1; ok "--sync: one sync before the switch"
+PEER_TERM=$(field "${H:-}" term); PEER_FLOOR=$(field "${H:-}" zbfloor)
+if [ $YIELD = 1 ]; then ok "--yield: the peer holds the newer networks: no sync from here"
+elif [ $SYNC = 1 ]; then NEED_SYNC=1; ok "--sync: one sync before the switch"
 elif [ -n "$MINE" ] && [ "$MINE" = "$THEIRS" ]; then ok "the standby holds this VM's last sync ($MINE): taken as it is"
 else NEED_SYNC=1; ok "the standby holds '${THEIRS:-nothing}', this VM's last sync is '${MINE:-none}': one sync first"; fi
 echo "== checks: $FAILS FAIL =="
@@ -85,9 +90,18 @@ for _ in $(seq 1 $((WAIT * 2))); do
   if [ "$(field "$H" role)" = MASTER ] && [ "$(field "$H" serving)" = yes ]; then took=$(since "$T0"); break; fi
   sleep 0.5
 done
+if [ -n "$took" ] && [ $YIELD = 1 ]; then
+  # outdated AND held before keepalived runs here again: from its first second as a standby this VM must not be able
+  # to take the radios back with the older copy (zradio-gate keeps the hold until the peer's sync has landed)
+  mkdir -p "$STATE" "$RUNDIR" && echo "term=${PEER_TERM:-?} zbfloor=${PEER_FLOOR:-0}" > "$STATE/outdated" && : > "$RUNDIR/hold"
+fi
 "$SYSTEMCTL" start keepalived || bad "systemctl start keepalived failed here — this VM is out of the pair until it runs"
 if [ -n "$took" ]; then
   done_ "the standby says MASTER and serving $took s after the stop; keepalived runs here again (this VM is the standby)"
+  # this VM gave the role away knowingly: it no longer claims to be the copy in use (zradio-notify did this already
+  # when keepalived stopped — before the standby took over; here once more for a notify that did not run)
+  [ -f "$STATE/version" ] && sed -i 's/ used=yes$/ used=no/' "$STATE/version"
+  [ $YIELD = 0 ] || done_ "this VM is marked outdated ($STATE/outdated) and held until the peer's sync lands"
   log ok "took_s=$took — the peer serves; this VM is the standby (the peer's tick syncs it within 15 min)"
   [ $FAILS -eq 0 ] || exit 1
   exit 0

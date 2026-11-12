@@ -59,9 +59,11 @@ Rails, each from something that went wrong or nearly did:
 
 - A VM never serves a stick set that was not written to the end (a mark on disk, set before the first write).
 - A new VM whose synced sticks hold no network does not serve until a sync has filled them.
-- A returning VM is synced once by the serving VM's next tick. **Gap, until §3a is built:** until that sync (up to
-  15 minutes) the returning VM is a standby with an older copy — if the serving VM failed in that window, the older
-  copy would serve at once, with a Zigbee frame counter that may be behind what the devices have seen.
+- A returning VM is synced once by the serving VM's next tick. Until that sync it is a standby with an older copy:
+  with the election of §3a armed (`ELECTION=act`) it is held out of the claim for that time and asks for the sync at
+  once; in observe mode (the default) that window is as long as it was — up to 15 minutes in which a failure of
+  the serving VM puts the older copy on the air, with a Zigbee frame counter that may be behind what the devices
+  have seen.
 - A standby stick is silenced at boot, at every change to standby and every 15 minutes: a stick that re-enumerates
   or loses power for a moment comes back listening.
 - One lock around every operation on the sticks.
@@ -69,41 +71,87 @@ Rails, each from something that went wrong or nearly did:
   silent-stick check could not see the sticks' answers, declared two healthy sticks hung in turn, and no VM served
   for 2 min 22 s.)
 
-## 3a. Who serves when it is not obvious — decided 2026-11-11, **not built yet**
+## 3a. Who serves when it is not obvious — built 2026-11-11, **off by default** (`ELECTION=observe`)
 
-Today the first VM whose keepalived starts wins, and a VM that returns after a failure is an ordinary standby from
-its first second, with an older copy until the next sync. Priority cannot fix that: it shortens the claim timer by
-at most one second [V sandbox, keepalived 2.2.8: priority 100 started 2 s before priority 200 — the 100 served].
-The decided behaviour, after DRBD's wait-for-connection and outdated peer, and Galera's "start from the most
-advanced node" [source: drbd.conf(5); Galera crash recovery]:
+Without this, the first VM whose keepalived starts wins, and a VM that returns after a failure is an ordinary
+standby from its first second, with an older copy until the next sync. Priority cannot fix that: it shortens the
+claim timer by at most one second [V sandbox, keepalived 2.2.8: priority 100 started 2 s before priority 200 — the
+100 served]. The rules follow DRBD's wait-for-connection and outdated peer, and Galera's "start from the most
+advanced node" [source: drbd.conf(5); Galera crash recovery]. keepalived still decides who serves; `zradio-gate`
+only makes `zradio-serve check` fail for a VM that should not claim yet, and asks a serving VM to hand over.
 
-1. **A version that is a counter, not a clock:** `(term, used)`. A sync gives the standby the active's term with
-   `used = no`. The term goes up by one when Home Assistant first connects to a VM in a serving turn that is
-   *confirmed* (rule 3) — that is, when the network really starts to move on from that VM's sticks. A VM that serves
-   with no client (a cut link, with Home Assistant on the other side) does not advance.
-2. **Wait for the peer before claiming.** At boot a VM asks the other one for its version, for up to the *standard
-   wait* (60 s). Both up: the higher version serves; equal versions: the configured priority. No answer: it serves.
-3. **Confirmed or provisional.** A turn is confirmed when the VM knew, from the peer itself, that nobody was ahead
-   of it: a clean, in-sync standby taking over, or a boot comparison it won. A VM that serves because nobody
-   answered serves *provisionally*: its version does not advance.
-4. **An outdated VM serves after the standard wait, not after 4 seconds** (decision: Yuval, 2026-11-11). A VM that
-   knows the peer's term is higher is outdated until a sync lands. If the peer falls silent it waits the standard
-   wait, then serves provisionally — a short blip of the serving VM never hands the radios to an older copy.
-5. **A more advanced VM preempts — once.** When a VM with a strictly higher version finds the other one serving,
-   it asks it to hand over (the planned-switch mechanism) and then syncs it. Nothing else ever preempts, and after
-   the sync the versions are equal, so this cannot oscillate. What changed on the less advanced VM while it served
-   (a device added there) is overwritten by that sync.
-6. The serving VM syncs a returning peer as soon as it sees it, not at the next 15-minute tick.
+**Status.** The rules below were rehearsed with the real keepalived and this kit's real tools — `zradio-gate`'s own
+loop included — in two network namespaces [V sandbox: `tests/rehearse-election.sh`, 52 checks, seven scenarios,
+four runs in a row without a failure].
+The sticks, ser2net, systemd, ssh and Home Assistant are stand-ins there. **Nothing of this has run on a radio VM.**
+It can take the radios away from a VM, so it ships in observe mode: every decision is a `would-…` journal line and
+nothing is held, raised or taken.
 
-Open, to settle while building:
+1. **A version that is a counter, not a clock:** `(term, used)` in `/var/lib/zradio/version`. A sync gives the
+   standby the active's term with `used = no`. The term goes up by one when Home Assistant is first connected to a
+   VM in a *confirmed* serving turn — when the networks really start to move on from that VM's sticks. Before it
+   advances, the VM asks the peer: **it never advances past a peer that answers and is ahead** (then its turn
+   becomes provisional and the peer takes the radios back). A VM that serves with no client does not advance.
+2. **A VM that gives the radios up no longer claims the copy in use.** keepalived stopped (a planned switch, a
+   shutdown) or the VM's own health check failed: `used` goes back to `no` at that moment (`zradio-notify`), before
+   the other VM takes over. So a failover or a planned switch *stands*: the VM that gave up is level with the VM
+   that took over, not ahead of it. A VM that dies hard, or is displaced by the other one when a cut link heals,
+   keeps its claim — unless it then cannot serve (a stick gone): after the standard wait of a failing health check
+   it gives the claim up too, so a broken VM never stands above the one that works.
+3. **Wait for the peer before claiming.** At boot a VM asks the other one for its version, for up to the *standard
+   wait* (`ELECTION_WAIT`, 60 s). Both up: the higher version claims at once; equal versions: the higher
+   `PRIORITY`. No answer for the whole wait: it serves, provisionally.
+4. **Confirmed or provisional.** A turn is provisional when the VM serves without knowing it holds the newest
+   copy: nobody answered at boot, or it is outdated (rule 5). A provisional turn never advances the version. It
+   becomes confirmed when the peer answers and is not ahead.
+5. **An outdated VM is held, and serves only after the standard wait** (decision: Yuval, 2026-11-11). A VM that
+   learns the peer's term is higher is *outdated* until a sync lands: it does not claim, so a blip of the serving
+   VM never hands the radios to an older copy. It asks the serving VM for the sync as soon as that one has served
+   for a minute (not at the next 15-minute tick). When the peer has not served for the standard wait, it raises
+   its own Zigbee frame counter above the peer's last known one and serves provisionally.
+6. **A newer copy takes the radios back — once.** A VM whose version is strictly higher than that of the VM that
+   serves raises its Zigbee counter above the peer's, takes a new term, and asks the peer to hand over (the planned
+   switch, without a sync from the older copy). It does so within a second of becoming a standby (`zradio-notify`
+   wakes the gate at every role change), otherwise at the gate's next look (a minute when nothing is pending). The
+   peer is outdated against the new term — held from the moment it hands over — until the sync has landed; then
+   the versions are level and nothing preempts again. What changed on the older copy while it served (a device
+   added there) is overwritten by that sync. At most one attempt in five minutes. Who can be ahead of a serving VM, given rule 2: the VM Home Assistant was using when a cut link split
+   the pair; an old active that died hard and is back before the new one was used; a newer copy that returns while
+   an outdated one serves provisionally.
+7. A set of a lower term is refused by a standby that holds a higher one.
 
-- **[H] Zigbee in and after a provisional turn.** An older copy's frame counter may be below what the devices have
-  already seen, and after it served, the returning VM's counter may be below *its*. Each such change of hands
-  probably needs the taker to raise its own stick's counter first (zigpy backup → raise → restore, the proven write
-  path, inside the wait). Not measured.
-- Two nodes cannot tell a dead peer from a cut link; rule 1's "used" is what keeps a cut link from picking the wrong
-  side afterwards. A third witness would be the textbook answer and is not planned.
-- Everything here can take the radios away from a VM: it goes onto real VMs in observe mode first.
+What the rehearsal showed [V sandbox, standard wait 20 s there; the same times, to the second, in three runs]:
+
+| Scenario | Result |
+|---|---|
+| Both boot; the VM whose copy was in use boots 4 s later and has the lower priority | it serves (10 s after its own boot); the other stands by |
+| The serving VM dies hard; it returns | the standby serves after 5 s and its term advances with Home Assistant connected; the returning VM is outdated and held |
+| The serving VM's keepalived is gone for 6 s while the other is outdated | the outdated VM stays out; it is synced on request afterwards and the hold is lifted |
+| The serving VM dies while the other is outdated | the outdated VM serves after 36 s (the wait of 20 s, the gate's pace, the counter raised, keepalived's claim), provisionally, its term unchanged; the newer VM returns and serves again 8 s after its boot; one preemption, then quiet |
+| A planned switch | stands: the VM that gave the radios away released its claim first; nobody preempts |
+| A cut link; Home Assistant on the lower-priority side | both serve during the cut (as before: two VMs cannot tell a cut link from a dead peer); at the heal keepalived leaves the address with the higher priority, and 4 s later the radios are back on the side Home Assistant was using |
+| The same as the fourth, in observe mode | the pair behaves as before this feature (the older copy serves after 4 s, and its next sync overwrites the newer one); the journals say `would-wait`, `would-provisional`, `would-preempt`, `would-refuse` |
+
+What it costs when armed: a VM that claims at boot serves about 10 s after its boot instead of about 4 s (the check
+fails first and must pass twice); a VM that boots with nobody answering serves after the standard wait plus about
+10 s; an outdated VM whose peer disappears serves after the standard wait plus up to half a minute. A failover to a
+standby that is already up is as fast as before. A preemption interrupts Home Assistant like a planned switch — and
+after a cut link twice: once when keepalived moves the address at the heal, once when the radios go back.
+
+Limits and open points:
+
+- **[H] The Zigbee counter in and after a provisional turn.** Each change of hands to a VM that was not synced in
+  between is preceded by a raise of that VM's own counter by a million above the other's last known one (zigpy
+  backup → raise → restore, the write path of the sync). Rehearsed on a stand-in for the coordinator only: not on a
+  stick, not with devices.
+- **Both VMs shut down cleanly:** both released their claim (rule 2), the versions are level, and the higher
+  priority serves — with the last synced copy, as after any failover.
+- **During a cut link both VMs serve**, as before: two coordinators with the same identity are on the air. This
+  feature only decides which copy survives the heal. A third witness would be the textbook answer; not planned.
+- **Both VMs must run the same mode.** A VM in act mode that asks a VM in observe mode to hand over is refused
+  (and says so loudly every five minutes).
+- Observe mode logs each VM's own decision from what it actually sees. Because nothing is held, the two VMs can
+  end up where act mode would not have put them, and the lines after that point describe that other world.
 
 ## 4. Recognising the radios
 

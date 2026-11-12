@@ -10,6 +10,9 @@ Before=keepalived.service zradio-serve.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+# first the gate's boot-wait (ELECTION=act: this VM claims nothing until the peer was asked); a failure there must not
+# keep the sticks from being silenced
+ExecStartPre=-/usr/local/sbin/zradio-gate arm
 ExecStart=/usr/local/sbin/zradio-serve down
 TimeoutStartSec=90
 

@@ -71,6 +71,7 @@ host "$T/u5"; rm -f "$T/u5/dev/zigbee"; serve "$T/u5" up
 check "a tty missing: exit 1, no stick call, no start, the marker" bash -c '[ "$2" = 1 ] && [ ! -s "$1/calls" ] && [ -e "$1/run/serve-failed" ] && grep -q "result=failed step=tty" "$1/journal"' _ "$T/u5" "$RC"
 host "$T/u6"; touch "$T/u6/nostart"; serve "$T/u6" up
 check "ser2net does not start: exit 1, the marker, the line" bash -c '[ "$2" = 1 ] && [ -e "$1/run/serve-failed" ] && grep -q "result=failed step=ser2net" "$1/journal"' _ "$T/u6" "$RC"
+check "…and no serving turn is left behind (it is written before the ports open, and taken back)" bash -c '[ ! -e "$1/run/turn" ]' _ "$T/u6"
 host "$T/u7"; : > "$T/u7/run/serve-failed"; serve "$T/u7" up
 check "a clean up clears an older failed marker" bash -c '[ "$2" = 0 ] && [ ! -e "$1/run/serve-failed" ]' _ "$T/u7" "$RC"
 
@@ -110,16 +111,27 @@ serve "$T/c3" bogus
 check "an unknown verb: exit 2" eq "$RC" 2
 
 echo "-- zradio-notify: keepalived's states become systemd jobs, nothing else"
-notify() { local d=$1; shift; PATH="$d/bin:$PATH" ZRADIO_NOTIFY_RUN="$d/run" bash "$NOTIFY" "$@" > "$d/out" 2>&1; RC=$?; }
+notify() { local d=$1; shift; PATH="$d/bin:$PATH" ZRADIO_NOTIFY_RUN="$d/run" ZRADIO_NOTIFY_STATE="$d/state" bash "$NOTIFY" "$@" > "$d/out" 2>&1; RC=$?; }
 host "$T/n"; notify "$T/n" INSTANCE RADIO MASTER 100
 check "MASTER: start --no-block zradio-serve.service" eq "$(calls "$T/n")" "systemctl start --no-block zradio-serve.service;"
 check "the role is recorded, the line is logged" bash -c 'grep -q "^MASTER 20..-..-..T..:..:..Z priority=100$" "$1/run/role" && grep -q "event=role state=MASTER instance=RADIO priority=100" "$1/journal"' _ "$T/n"
+check "…and zradio-gate is told that the role changed (gate-kick)" bash -c '[ -e "$1/run/gate-kick" ]' _ "$T/n"
 for st in FAULT STOP; do
   host "$T/n-$st"; notify "$T/n-$st" INSTANCE RADIO "$st" 100
   check "$st: stop --no-block zradio-serve.service" eq "$(calls "$T/n-$st")" "systemctl stop --no-block zradio-serve.service;"
 done
 host "$T/n-BACKUP"; notify "$T/n-BACKUP" INSTANCE RADIO BACKUP 100
 check "BACKUP: stop the serving, then hush the standby's sticks (a stick back after a FAULT listens)" eq "$(calls "$T/n-BACKUP")" "systemctl stop --no-block zradio-serve.service;systemctl start --no-block zradio-hush.service;"
+for st in FAULT STOP; do
+  host "$T/r-$st"; mkdir -p "$T/r-$st/state"; echo "term=4 used=yes" > "$T/r-$st/state/version"; notify "$T/r-$st" INSTANCE RADIO MASTER 100; notify "$T/r-$st" INSTANCE RADIO "$st" 100
+  check "MASTER -> $st: this VM gave the radios up — its version no longer claims the copy in use, said once" bash -c '[ "$(cat "$1/state/version")" = "term=4 used=no" ] && [ "$(grep -c "event=version result=released term=4 used=no" "$1/journal")" = 1 ]' _ "$T/r-$st"
+done
+notify "$T/r-STOP" INSTANCE RADIO STOP 100
+check "a second STOP (keepalived's own and the unit's ExecStopPost): nothing more" eq "$(grep -c "result=released" "$T/r-STOP/journal")" 1
+host "$T/r2"; mkdir -p "$T/r2/state"; echo "term=4 used=yes" > "$T/r2/state/version"; notify "$T/r2" INSTANCE RADIO MASTER 100; notify "$T/r2" INSTANCE RADIO BACKUP 100
+check "MASTER -> BACKUP (displaced by the other MASTER when a cut link heals): the claim is KEPT" eq "$(cat "$T/r2/state/version")" "term=4 used=yes"
+host "$T/r3"; mkdir -p "$T/r3/state"; echo "term=4 used=yes" > "$T/r3/state/version"; notify "$T/r3" INSTANCE RADIO FAULT 100; notify "$T/r3" INSTANCE RADIO BACKUP 100
+check "a boot (FAULT, then BACKUP, never MASTER): the claim of the VM that died serving is KEPT for the comparison" eq "$(cat "$T/r3/state/version")" "term=4 used=yes"
 host "$T/n2"; notify "$T/n2" INSTANCE RADIO DELETED 100
 check "an unknown state: exit 2, no systemd job, said in the journal" bash -c '[ "$2" = 2 ] && [ ! -s "$1/calls" ] && grep -q "event=role result=ignored state=DELETED" "$1/journal"' _ "$T/n2" "$RC"
 host "$T/n3"; notify "$T/n3"
@@ -262,5 +274,22 @@ serve "$T/bad" check
 check "a radios.conf with anything but KEY=value is not read: check fails" eq "$RC" 1
 serve "$T/s2" status
 check "status names the levels" has "$T/s2/out" "radios: Z-Wave served (zwave-500), Zigbee served (deconz)"
+
+echo "-- a serving turn is confirmed or provisional (docs/DESIGN.md 3a); only ELECTION=act makes one provisional"
+actconf() { printf '%s\n' NAME=radio1 SELF=10.20.30.5 PEER=10.20.30.6 VIP=10.20.30.50/24 VRID=50 PRIORITY=110 "ELECTION=$2" > "$1/zradio.conf"; }
+host "$T/t1"; mkdir -p "$T/t1/state"; echo "term=5 zbfloor=7" > "$T/t1/state/outdated"; serve "$T/t1" up
+check "observe mode (no conf, or ELECTION=observe): an outdated VM that serves is an ordinary, confirmed turn — as before" eq "$(cat "$T/t1/run/turn")" confirmed
+host "$T/t2"; mkdir -p "$T/t2/state"; echo "term=5 zbfloor=7" > "$T/t2/state/outdated"; actconf "$T/t2" act; ZRADIO_CONF="$T/t2/zradio.conf" serve "$T/t2" up
+check "ELECTION=act, outdated: the turn is provisional and the journal says what follows from that" bash -c '[ "$(cat "$1/run/turn")" = provisional ] && grep -q "event=serve result=provisional .*it is outdated: term=5 zbfloor=7" "$1/journal"' _ "$T/t2"
+host "$T/t3"; : > "$T/t3/run/gate-alone"; actconf "$T/t3" act; ZRADIO_CONF="$T/t3/zradio.conf" serve "$T/t3" up
+check "ELECTION=act, nobody answered at boot: provisional" eq "$(cat "$T/t3/run/turn")" provisional
+host "$T/t4"; actconf "$T/t4" act; ZRADIO_CONF="$T/t4/zradio.conf" serve "$T/t4" up
+check "ELECTION=act, a clean standby taking over: confirmed" eq "$(cat "$T/t4/run/turn")" confirmed
+serve "$T/t4" down
+check "down ends the turn" bash -c '[ ! -e "$1/run/turn" ]' _ "$T/t4"
+mkdir -p "$T/t4/state"; echo "term=7 used=yes" > "$T/t4/state/version"; : > "$T/t4/run/hold"; serve "$T/t4" check
+check "check fails on the gate's hold" eq "$RC" 1
+serve "$T/t4" status
+check "status shows the version and the hold" bash -c 'grep -q "version: term 7, used yes" "$1/out" && grep -q "marker: .*hold" "$1/out"' _ "$T/t4"
 
 finish

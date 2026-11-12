@@ -31,14 +31,29 @@
 #   zradio-sync reapply  standby: write the last received set again
 #   zradio-sync hello    one line: name, role, serving, the set this VM holds, dirty, and its radios' levels
 #   zradio-sync beat     the same facts as one journal line, `zradio: event=state …`, every minute by timer on both
-#                       VMs: what monitoring counts ("no active", "both active", "the standby is not ready")
+#                       VMs: what monitoring counts ("no active", "both active", "the standby is not ready").
+#                       It is also where this VM's version advances (docs/DESIGN.md §3a): Home Assistant connected in
+#                       a confirmed turn, and the peer — asked first — not ahead. `beat --quiet`: that check without
+#                       the journal line (zradio-gate runs it every few seconds while a turn is not used yet).
 #   zradio-sync peer-hello   the other VM's hello line, over the sync's ssh (zradio-switch asks with it)
 #   zradio-sync status   the records, readable
 #   zradio-sync keys     make this VM's sync key if missing; print its PUBLIC half and this VM's ssh host key
 #   zradio-sync trust --sync-key 'ssh-ed25519 AAAA…' --host-key 'ssh-ed25519 AAAA…' [--peer ADDR]
 #                       the peer's two public keys: its host key pinned for PEER, its sync key allowed to run
 #                       `zradio-sync serve-ssh` from PEER and nothing else (authorized_keys: command=, from=, restrict)
-#   zradio-sync serve-ssh   the forced command: hello | receive (from SSH_ORIGINAL_COMMAND); anything else is refused
+#   zradio-sync serve-ssh   the forced command: hello | receive | poke | yield <term> <used> (from
+#                       SSH_ORIGINAL_COMMAND); anything else is refused
+#   zradio-sync peer-poke   ask the serving peer to run its tick now (a returning standby wants its sync at once)
+#   zradio-sync peer-yield  ask the serving peer to hand the radios over: only honoured when this VM's version is
+#                       strictly higher than the peer's and ELECTION=act (docs/DESIGN.md §3a); the peer answers YIELDED
+#   zradio-sync self-raise --above N   on a VM that does not serve: raise this VM's own Zigbee frame counter above N
+#                       (its own backup, the counter set to max(read, N) + $BUMP, written back and verified by
+#                       zradio-apply) — before an older copy, or a copy returning after an older one served, goes on
+#                       the air: devices drop frames whose counter is below one they have already seen
+#
+# The version (docs/DESIGN.md §3a): $STATE/version holds `term=N used=yes|no`. A sync carries the active's term to
+# the standby (used=no). `beat` raises the term by one when Home Assistant is connected to a VM in a confirmed
+# serving turn that has not been counted yet. In ELECTION=act a set with a lower term than this VM's is refused.
 #
 # What never happens: a set applied on a VM that serves; a set older than the one the standby holds; a key, an NVM byte
 # or the Zigbee network key on stdout or in the journal. The Zigbee counter: the standby's copy starts $BUMP frames
@@ -63,6 +78,8 @@ RESTORE=${ZRADIO_SYNC_RESTORE:-/usr/local/sbin/zradio-apply}
 SERVE=${ZRADIO_SYNC_SERVE:-/usr/local/sbin/zradio-serve}
 SELFCMD=${ZRADIO_SYNC_SELFCMD:-/usr/local/sbin/zradio-sync}
 SYSTEMCTL=${ZRADIO_SYNC_SYSTEMCTL:-systemctl}
+SWITCH=${ZRADIO_SYNC_SWITCH:-/usr/local/sbin/zradio-switch}
+SS=${ZRADIO_SYNC_SS:-ss}
 SSH=${ZRADIO_SYNC_SSH:-ssh}
 LOGGER=${ZRADIO_SYNC_LOGGER:-logger}
 BUMP=${ZRADIO_SYNC_BUMP:-1000000}
@@ -80,7 +97,17 @@ load_conf() { # the pair's conf and this VM's radios; ZW / ZB = the ttys
   zr_load_radios || true          # no radios.conf = both "none": nothing here is synced, hello says so
   ZW=${ZRADIO_SYNC_ZWAVE_TTY:-$ZWAVE_TTY}
   ZB=${ZRADIO_SYNC_ZIGBEE_TTY:-$ZIGBEE_TTY}
+  zr_version_read "$STATE"
 }
+floor() { local f; f=$(cat "$STATE/counter-floor" 2>/dev/null); [[ "$f" =~ ^[0-9]{1,10}$ ]] && echo "$f" || echo 0; }
+set_floor() { [[ "$1" =~ ^[0-9]{1,10}$ ]] && [ "$1" -gt "$(floor)" ] && { mkdir -p "$STATE"; echo "$1" > "$STATE/counter-floor"; }; return 0; }
+client_state() { # yes | no | unknown: does Home Assistant hold a connection to one of the sticks' ports?
+  local out
+  serving || { echo no; return; }
+  out=$("$SS" -Htn state established "( sport = :$ZWAVE_PORT or sport = :$ZIGBEE_PORT )" 2>/dev/null) || { echo unknown; return; }
+  [ -n "$out" ] && echo yes || echo no
+}
+client_connected() { [ "$(client_state)" = yes ]; }
 synced_here() { # the kinds this VM can sync, as "zwave:<family> zigbee:<family>" words (the family is part of the match)
   local out=""
   zr_has zwave synced && out="zwave:${ZWAVE_FAMILY:-?}"
@@ -121,11 +148,14 @@ field() { printf '%s\n' "$1" | tr ' ' '\n' | sed -n "s/^$2=//p" | head -1; }   #
 
 # ---------------------------------------------------------------- the standby's side
 hello_line() {
-  local s=no d=no a=no g
+  local s=no d=no a=no w=no o=no g l t
   serving && s=yes; [ -e "$DIRTY" ] && d=yes; [ -e "$APPLYING" ] && a=yes
+  { [ -e "$RUN/boot-wait" ] || [ -e "$RUN/hold" ]; } && w=yes; [ -e "$STATE/outdated" ] && o=yes
   g=$(jget "$SYNCED" gen); [ -n "$g" ] || g=none
-  printf 'HELLO name=%s role=%s serving=%s gen=%s dirty=%s applying=%s zwave=%s zigbee=%s\n' "$NAME" "$(role)" "$s" "$g" "$d" "$a" \
-    "$ZWAVE${ZWAVE_FAMILY:+:$ZWAVE_FAMILY}" "$ZIGBEE${ZIGBEE_FAMILY:+:$ZIGBEE_FAMILY}"
+  l=$(jget "$LAST" gen); [ -n "$l" ] || l=none
+  t=$(cat "$RUN/turn" 2>/dev/null); [ -n "$t" ] || t=none
+  printf 'HELLO name=%s role=%s serving=%s gen=%s dirty=%s applying=%s zwave=%s zigbee=%s term=%s used=%s turn=%s client=%s outdated=%s wait=%s prio=%s zbfloor=%s last=%s\n' "$NAME" "$(role)" "$s" "$g" "$d" "$a" \
+    "$ZWAVE${ZWAVE_FAMILY:+:$ZWAVE_FAMILY}" "$ZIGBEE${ZIGBEE_FAMILY:+:$ZIGBEE_FAMILY}" "$ZR_TERM" "$ZR_USED" "$t" "$(client_state)" "$o" "$w" "$PRIORITY" "$(floor)" "$l"
 }
 prep_set() { # prep_set <dir>: the manifest and the files checked; fetch.json + zha-backup-restore.json written.
   # stdout: "gen=<gen> only=<only> id=<the identities, for the lines>" — or a line starting with BAD
@@ -144,6 +174,8 @@ except Exception as e: bad("manifest.json: %s" % e)
 if m.get("format") != "zradio sync v1": bad("manifest format %r" % m.get("format"))
 gen = str(m.get("gen") or "")
 if not re.fullmatch(r"\d{8}T\d{6}Z", gen): bad("gen %r" % gen)
+term = m.get("term", 0)
+if not isinstance(term, int) or isinstance(term, bool) or not 0 <= term < 10**9: bad("term %r" % term)
 only = m.get("only") or ""
 if only not in ("", "zwave", "zigbee"): bad("only %r" % only)
 sha = lambda n: hashlib.sha256(open(os.path.join(d, n), "rb").read()).hexdigest()
@@ -184,11 +216,11 @@ if only in ("", "zigbee"):
     ident.append("zigbee=%s/%s/%d counter=%d" % (ieee_c, pan, ch, to))
 fd = os.open(os.path.join(d, "fetch.json"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
 with os.fdopen(fd, "w") as f: json.dump(fetch, f, indent=1)
-print("gen=%s only=%s id=%s" % (gen, only or "both", ",".join(ident).replace(" ", ",")))
+print("gen=%s only=%s term=%d floor=%d id=%s" % (gen, only or "both", term, (fetch.get("bump") or {}).get("to", 0), ",".join(ident).replace(" ", ",")))
 PY
 }
-apply_set() { # apply_set <dir> <gen> <only|both> <id>: onto this VM's sticks; the answer's last line on stdout
-  local d=$1 gen=$2 only=$3 id=$4 t0 rc
+apply_set() { # apply_set <dir> <gen> <only|both> <id> [term] [zigbee counter written]: onto this VM's sticks; the answer's last line on stdout
+  local d=$1 gen=$2 only=$3 id=$4 term=${5:-} zfloor=${6:-0} t0 rc
   t0=$(now); mkdir -p "$STATE" "$RUN"
   : > "$DIRTY"; : > "$APPLYING"
   local args=(--run --from "$d"); [ "$only" = both ] || args+=(--only "$only")
@@ -216,6 +248,10 @@ for net in (("zwave", "zigbee") if only == "both" else (only,)): rec["gens"][net
 json.dump(rec, open(p + ".tmp", "w"), indent=1); os.replace(p + ".tmp", p)
 PY
   rm -f "$DIRTY" "$APPLYING"
+  # the copy is the active's: its term, not yet used here; whatever said this VM was behind is settled
+  if [[ "$term" =~ ^[0-9]+$ ]]; then zr_version_write "$STATE" "$term" no; fi
+  set_floor "$zfloor"
+  rm -f "$STATE/outdated" "$RUN/hold" "$RUN/outdated-may-serve" "$RUN/gate-alone"
   rm -f "$d/zwave-nvm.bin" "$d/zha-backup.json" "$d/zha-backup-restore.json"   # written and verified: no image stays at rest
   log sync-apply ok "gen=$gen $id apply_s=$(since "$t0") — the sticks hold the set and are silent" >&2
   echo "SYNCED gen=$gen $id apply_s=$(since "$t0")"
@@ -231,7 +267,12 @@ cmd_receive() {
   ( umask 077; tar -C "$tmp" -xf - --no-same-owner --no-same-permissions ) 2>/dev/null || { rm -rf "$tmp"; echo "FAILED the stream was not a tar"; exit 1; }
   p=$(prep_set "$tmp") || { rm -rf "$tmp"; log sync-apply refused "${p:-the set did not check}" >&2; echo "REFUSED ${p:-the set did not check}"; exit 1; }
   gen=$(field "$p" gen); only=$(field "$p" only); id=$(field "$p" id)
-  local k
+  local k st; st=$(field "$p" term)
+  if [ "$ELECTION" = act ] && [ "${st:-0}" -lt "$ZR_TERM" ]; then
+    rm -rf "$tmp"; log sync-apply refused "gen=$gen — the set is of term ${st:-0} and this VM holds term $ZR_TERM: an older copy is not written over a newer one" >&2
+    echo "REFUSED older term: the set is term ${st:-0}, this VM holds $ZR_TERM"; exit 1
+  fi
+  [ "${st:-0}" -ge "$ZR_TERM" ] || log sync-apply would-refuse "gen=$gen — the set is of term ${st:-0} and this VM holds term $ZR_TERM: in act mode an older copy would not be written over a newer one (observe mode: it is)" >&2
   for k in zwave zigbee; do
     if { [ "$only" = both ] || [ "$only" = "$k" ]; } && ! zr_has "$k" synced; then
       rm -rf "$tmp"; log sync-apply refused "gen=$gen — the set holds a $k image and this VM has no synced $k stick (radios.conf)" >&2
@@ -241,7 +282,7 @@ cmd_receive() {
   cur=$(jget "$SYNCED" gen)
   if [ -n "$cur" ] && [[ "$gen" < "$cur" ]]; then rm -rf "$tmp"; echo "REFUSED stale: this VM holds $cur, the set is $gen"; exit 1; fi
   rm -rf "$IND/current"; mv "$tmp" "$IND/current"
-  apply_set "$IND/current" "$gen" "$only" "$id"
+  apply_set "$IND/current" "$gen" "$only" "$id" "$st" "$(field "$p" floor)"
 }
 cmd_reapply() {
   need_root; mkdir -p "$RUN"
@@ -249,7 +290,7 @@ cmd_reapply() {
   if serving || [ "$(role)" = MASTER ]; then echo "REFUSED this VM serves"; exit 1; fi
   [ -f "$IND/current/manifest.json" ] || { echo "no received set under $IND/current — nothing to write again (the next sync brings one)"; exit 1; }
   local p; p=$(prep_set "$IND/current") || { echo "REFUSED ${p:-the kept set did not check} (a set written to the end keeps no image: only a set that failed can be written again)"; exit 1; }
-  apply_set "$IND/current" "$(field "$p" gen)" "$(field "$p" only)" "$(field "$p" id)"
+  apply_set "$IND/current" "$(field "$p" gen)" "$(field "$p" only)" "$(field "$p" id)" "$(field "$p" term)" "$(field "$p" floor)"
 }
 
 # ---------------------------------------------------------------- the active's side
@@ -293,12 +334,12 @@ read_sticks() { # read_sticks <dir> <only|""> <serving: 1|0> — the pause; sets
   return 0
 }
 mk_manifest() { # mk_manifest <dir> <gen> <only|""> <reason> <pause_s>: manifest.json; stdout the identities, or BAD …
-  python3 - "$1" "$2" "$3" "$4" "$5" "$NAME" <<'PY'
+  python3 - "$1" "$2" "$3" "$4" "$5" "$NAME" "$ZR_TERM" <<'PY'
 import hashlib, json, os, re, sys
-d, gen, only, reason, pause, name = sys.argv[1:7]
+d, gen, only, reason, pause, name, term = sys.argv[1:8]
 def bad(why): print("BAD " + why); sys.exit(1)
 sha = lambda n: hashlib.sha256(open(os.path.join(d, n), "rb").read()).hexdigest()
-m = {"format": "zradio sync v1", "gen": gen, "from": name, "reason": reason, "only": only, "pause_s": float(pause)}
+m = {"format": "zradio sync v1", "gen": gen, "from": name, "reason": reason, "only": only, "pause_s": float(pause), "term": int(term)}
 ident = []
 if only in ("", "zwave"):
     try: z = json.load(open(os.path.join(d, "zw-probe.json"))).get("zwave") or {}
@@ -395,6 +436,7 @@ cmd_run() {
     if read_sticks "$OUTD" "$only" $((1 - rehearse)); then :; else write_pending "$gen" "the read failed"; exit 1; fi
     trap - EXIT
     id=$(mk_manifest "$OUTD" "$gen" "$only" "$reason" "$PAUSE_S") || { write_pending "$gen" "the read did not check"; log sync failed "step=check gen=$gen — ${id:-the read set did not check} (pause ${PAUSE_S} s)"; rm -rf "$OUTD"; exit 1; }
+    set_floor "$(jget "$OUTD/manifest.json" zigbee.frame_counter)"     # this stick's own counter, as read just now
     rm -f "$OUTD"/zw-probe.json "$OUTD"/*.err "$OUTD"/zigpy-backup.log
     log sync note "gen=$gen reason=$reason read: $id pause_s=$PAUSE_S"
   fi
@@ -451,6 +493,80 @@ cmd_tick() {
   fi
   echo "standby — nothing else to do"; exit 0
 }
+cmd_beat() { # the state line (not with --quiet); and the term goes up once Home Assistant uses a confirmed turn
+  if is_active && [ "$ZR_USED" = no ] && [ "$(cat "$RUN/turn" 2>/dev/null)" = confirmed ] && client_connected; then
+    # …but never past a peer that answers and is ahead: that is what a healed cut link looks like from the side Home
+    # Assistant was NOT using (or an old active back before this VM was used). The peer's gate takes the radios back.
+    local ph pk=-1 mk; mk=$(zr_vkey "$ZR_TERM" "$ZR_USED")
+    ph=$(peer_ssh 10 hello 2>/dev/null | tail -1) || true
+    case "$ph" in HELLO\ *) pk=$(zr_vkey "$(field "$ph" term)" "$(field "$ph" used)");; esac
+    if [ "$pk" -gt "$mk" ] && [ "$ELECTION" = act ]; then
+      echo provisional > "$RUN/turn"
+      log election behind "Home Assistant is connected here, but the peer answers and holds the newer networks (term=$(field "$ph" term) used=$(field "$ph" used); this VM term=$ZR_TERM used=$ZR_USED): this VM's version does not advance, its turn is provisional now, and the peer takes the radios back" >/dev/null
+    else
+      [ "$pk" -le "$mk" ] || log election would-behind "Home Assistant is connected here, and the peer answers and holds the newer networks (term=$(field "$ph" term) used=$(field "$ph" used); this VM term=$ZR_TERM used=$ZR_USED): in act mode this VM's version would not advance and the peer would take the radios back (observe mode: it advances)" >/dev/null
+      zr_version_write "$STATE" $((ZR_TERM + 1)) yes && zr_version_read "$STATE"
+      rm -f "$STATE/outdated"                            # (observe mode: an outdated VM may get here; it IS the copy in use now)
+      "$LOGGER" -t zradio "event=version result=advanced term=$ZR_TERM — Home Assistant is connected in a confirmed turn: this VM's sticks are now the newest copy" 2>/dev/null || true
+    fi
+  fi
+  [ "${1:-}" != --quiet ] || return 0            # zradio-gate's look every few seconds: no state line
+  local h; h=$(hello_line); "$LOGGER" -t zradio "event=state ${h#HELLO }" 2>/dev/null || true; echo "$h"
+}
+cmd_yield() { # the forced command's `yield <term> <used>`: a more advanced VM asks this serving VM to hand over
+  local rt=${1:-} ru=${2:-} mine theirs out
+  [[ "$rt" =~ ^[0-9]{1,9}$ ]] && { [ "$ru" = yes ] || [ "$ru" = no ]; } || { echo "REFUSED yield wants <term> <yes|no>"; exit 1; }
+  is_active || { echo "REFUSED this VM does not serve"; exit 1; }
+  mine=$(zr_vkey "$ZR_TERM" "$ZR_USED"); theirs=$(zr_vkey "$rt" "$ru")
+  [ "$theirs" -gt "$mine" ] || { echo "REFUSED not more advanced: yours term=$rt used=$ru, mine term=$ZR_TERM used=$ZR_USED"; exit 1; }
+  if [ "$ELECTION" != act ]; then
+    log election would-yield "the peer (term=$rt used=$ru) is ahead of this serving VM (term=$ZR_TERM used=$ZR_USED) and asked for the radios; observe mode: nothing is changed" >&2
+    echo "REFUSED observe mode (ELECTION is not 'act')"; exit 1
+  fi
+  log election yield "the peer (term=$rt used=$ru) is ahead of this serving VM (term=$ZR_TERM used=$ZR_USED): handing the radios over" >&2
+  if out=$("$SWITCH" --run --yield 2>&1); then echo "YIELDED"; else
+    log election loud "yield: the handover did not end clean: $(printf '%s' "$out" | grep -E '^FAIL' | head -1 | cut -c1-200)" >&2
+    echo "FAILED yield: $(printf '%s' "$out" | grep -E '^FAIL' | head -1 | cut -c1-160)"; exit 1; fi
+}
+cmd_self_raise() { # this VM's own Zigbee counter above N, on a VM that does not serve
+  local above=""; while [ $# -gt 0 ]; do case "$1" in --above) above=$2; shift 2;; *) echo "unknown arg: $1" >&2; exit 2;; esac; done
+  [[ "$above" =~ ^[0-9]{1,10}$ ]] || { echo "die: --above N" >&2; exit 2; }
+  need_root; mkdir -p "$RUN" "$STATE" "$IND"; chmod 700 "$SECRETS" "$IND" 2>/dev/null
+  zr_has zigbee synced || { echo "no synced Zigbee stick here — nothing to raise"; exit 0; }
+  if serving || [ "$(role)" = MASTER ]; then echo "REFUSED this VM serves: a counter is raised before serving, never under Home Assistant"; exit 1; fi
+  exec 8>"$RUN/sync-in.lock"; flock -n 8 || { echo "busy — a set is being written"; exit 75; }
+  local d="$IND/raise" p rc
+  rm -rf "$d"; mkdir -m 700 "$d" || exit 1
+  ( umask 077; timeout 90 "$ZIGPY" radio znp "$ZB" backup "$d/zha-backup.json" > "$d/zigpy-backup.log" 2>&1 ) || { rm -rf "$d"; log election loud "self-raise: zigpy's backup of this VM's own coordinator did not end clean — the counter was not raised"; exit 1; }
+  p=$(python3 - "$d" "$above" "$BUMP" <<'PY'
+import json, os, re, sys
+d, above, bump = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+def bad(why): print("BAD " + why); sys.exit(1)
+try: j = json.load(open(os.path.join(d, "zha-backup.json")))
+except Exception as e: bad("zigpy's backup: %s" % type(e).__name__)
+nk = j.get("network_key") or {}; fc = nk.get("frame_counter")
+ieee = str(j.get("coordinator_ieee") or "").lower(); pan = str(j.get("pan_id") or "").lower(); ch = j.get("channel")
+if not isinstance(fc, int) or not re.fullmatch(r"[0-9a-f]{16}", ieee) or not re.fullmatch(r"[0-9a-f]{4}", pan) or not isinstance(ch, int): bad("the backup holds no network identity / counter")
+if set(str(nk.get("key") or "0").lower()) <= {"0"} or pan in ("ffff", "fffe"): bad("this coordinator is not on a network (nothing to raise)")
+to = max(fc, above) + bump
+if to > 0xFFFFFFFF - bump: bad("the counter %d leaves no room for the raise" % max(fc, above))
+nk["frame_counter"] = to
+ic = ":".join(ieee[i:i + 2] for i in range(0, 16, 2))
+for name, obj in (("zha-backup-restore.json", j), ("fetch.json", {"format": "zradio sync v1", "sets": {"zigbee": "raise-%d" % to}, "identities": {"zigbee": {"ieee": ic, "channel": ch, "pan_id": pan}}, "bump": {"from": fc, "to": to, "how": "zradio-sync self-raise --above %d" % above}})):
+    fd = os.open(os.path.join(d, name), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f: json.dump(obj, f)
+print("from=%d to=%d" % (fc, to))
+PY
+  ) || { rm -rf "$d"; log election loud "self-raise: ${p:-the backup did not check} — the counter was not raised"; exit 1; }
+  : > "$DIRTY"; : > "$APPLYING"
+  bash "$RESTORE" --run --only zigbee --from "$d" > "$STATE/self-raise.log" 2>&1; rc=$?
+  if [ $rc = 0 ] && "$SERVE" down >> "$STATE/self-raise.log" 2>&1; then
+    rm -f "$DIRTY" "$APPLYING"; set_floor "$(field "$p" to)"; rm -rf "$d"
+    log election raised "the Zigbee frame counter of this VM's own coordinator: $(field "$p" from) → $(field "$p" to) (above $above)"; exit 0
+  fi
+  rm -f "$APPLYING"
+  log election loud "self-raise: writing the raised backup did not end clean (rc $rc; log: $STATE/self-raise.log; standby-dirty stays: this VM does not serve until a set is written to the end)"; exit 1
+}
 cmd_keys() {
   need_root
   if [ ! -f "$KEYF" ]; then ( umask 077; mkdir -p "$(dirname "$KEYF")"; ssh-keygen -q -t ed25519 -N '' -C "zradio-sync@$NAME" -f "$KEYF" ) || { echo "ssh-keygen failed" >&2; exit 1; }; fi
@@ -488,8 +604,11 @@ case "$MODE" in
   tick) cmd_tick;;
   reapply) cmd_reapply;;
   hello) hello_line;;
-  beat) h=$(hello_line); "$LOGGER" -t zradio "event=state ${h#HELLO } last=$(v=$(jget "$LAST" gen); echo "${v:-none}")"; echo "$h";;
+  beat) cmd_beat "${1:-}";;
   peer-hello) need_root; peer_ssh 15 hello;;
+  peer-poke) need_root; peer_ssh 15 poke;;
+  peer-yield) need_root; peer_ssh 90 "yield $ZR_TERM $ZR_USED";;
+  self-raise) cmd_self_raise "$@";;
   status) cmd_status;;
   keys) cmd_keys;;
   trust) cmd_trust "$@";;
@@ -497,7 +616,9 @@ case "$MODE" in
     case "${SSH_ORIGINAL_COMMAND:-}" in
       hello) hello_line;;
       receive) cmd_receive;;
-      *) echo "REFUSED: this key runs hello or receive, nothing else" >&2; exit 1;;
+      poke) if is_active; then "$SYSTEMCTL" start --no-block zradio-sync-tick.service && echo "POKED the tick runs now"; else echo "IGNORED this VM does not serve"; fi;;
+      yield\ *) read -r _ yt yu _ <<<"$SSH_ORIGINAL_COMMAND"; cmd_yield "$yt" "$yu";;
+      *) echo "REFUSED: this key runs hello, receive, poke or yield, nothing else" >&2; exit 1;;
     esac;;
-  *) echo "usage: zradio-sync run|tick|reapply|hello|beat|peer-hello|status|keys|trust|serve-ssh (--help)" >&2; exit 2;;
+  *) echo "usage: zradio-sync run|tick|reapply|hello|beat|peer-hello|peer-poke|peer-yield|self-raise|status|keys|trust|serve-ssh (--help)" >&2; exit 2;;
 esac

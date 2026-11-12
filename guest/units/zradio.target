@@ -4,7 +4,7 @@
 # Starting it on a VM that is already in the pair changes nothing. Installed by guest/install.sh.
 [Unit]
 Description=zradio: this VM takes part in the radio pair
-Wants=zradio-quiet.service keepalived.service zradio-sync.timer zradio-sync-tick.timer zradio-state.timer zradio-change-watch.service
+Wants=zradio-quiet.service keepalived.service zradio-gate.service zradio-sync.timer zradio-sync-tick.timer zradio-state.timer zradio-change-watch.service
 After=zradio-quiet.service
 [Install]
 WantedBy=multi-user.target

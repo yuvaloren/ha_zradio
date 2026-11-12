@@ -12,6 +12,7 @@ global_defs {
 
 vrrp_script radio_health {
     script "/usr/local/sbin/zradio-serve check"
+    init_fail
     interval 3
     timeout 2
     fall 2

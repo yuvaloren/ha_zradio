@@ -48,11 +48,11 @@ Recognition starts from the USB lists Home Assistant's own Zigbee and Z-Wave int
 
 ```
 guest/install.sh          the installer: run inside each radio VM
-guest/sbin/               zradio-detect  -serve  -notify  -sync  -apply  -switch  -change-watch  -render
+guest/sbin/               zradio-detect  -serve  -notify  -sync  -apply  -switch  -gate  -change-watch  -render
 guest/lib/                the probe, the Z-Wave JS UI restore client, templates, the USB list
 guest/units/              systemd units
 zradio.conf.example       the one config file
-tests/                    bash tests/run.sh
+tests/                    bash tests/run.sh; tests/rehearse-election.sh (root: the real keepalived in two namespaces)
 tools/                    maintenance (the USB list)
 docs/DESIGN.md            how it works and why; what is not built
 ```
@@ -80,10 +80,25 @@ with the other VM and with Home Assistant.
 | `zradio-sync status` | what was last synced, and whether the standby holds it |
 | `zradio-sync run --reason manual` | on the serving VM: sync now (pauses the radios about 12 s) |
 | `zradio-switch` / `zradio-switch --run` | check, then hand the radios to the standby |
+| `zradio-gate status` | this VM's version of the networks (term, used), and whether it is waiting, outdated or held |
 | `zradio-detect` | what the kit sees on the USB ports (on a VM that does not serve) |
 | `journalctl -t zradio` | every decision, one line each: `event=… result=…` |
 
 Each tool's header says what it does, what it refuses and why; `--help` prints it.
+
+## Who serves when it is not obvious (built, off by default)
+
+Which VM serves after both boot together, after a failed VM returns with an older copy, or after the link between
+the nodes was cut — decided by a version of the networks each VM keeps (a counter, not a clock), not by which
+keepalived started first. `docs/DESIGN.md` §3a has the rules and what a rehearsal with the real keepalived showed.
+
+It ships as `ELECTION=observe`: the pair behaves exactly as without it, and every decision it *would* take is a
+journal line (`journalctl -t zradio | grep would-`). `ELECTION=act` in `zradio.conf` on **both** VMs, then
+`systemctl restart zradio-gate` on both, arms it. Before arming: read some days of `would-` lines; have one sync run
+(`zradio-sync run --reason manual` on the serving VM) so both VMs hold the same term (`zradio-gate status`); and
+know what it costs — a VM that boots with nobody answering serves after `ELECTION_WAIT` (60 s) plus about 10 s
+instead of after 4 s, and a VM with an older copy whose peer disappears after that wait plus up to half a minute. **It has not run on a radio VM, and its handling of the Zigbee frame counter has not been
+tried with devices.**
 
 ## Not built yet
 
@@ -101,6 +116,12 @@ Each tool's header says what it does, what it refuses and why; `--help` prints i
 `bash tests/run.sh` — bash 4+, python3, util-linux, openssh-client (`ssh-keygen`). Where `ser2net`, `socat`,
 `keepalived` and `systemd-analyze` are installed, the rendered config files are given to the real programs. Nothing
 in the tests reaches a radio.
+
+`sudo bash tests/rehearse-election.sh` (about 3 minutes; needs keepalived and iproute2) plays seven situations with
+the real keepalived and the kit's own tools in two network namespaces on one machine: both VMs booting, a hard
+death and return, a short outage, an outdated VM serving and being preempted, a planned switch, a cut link, and
+observe mode. It creates and removes two namespaces, a bridge and `/root/zradio-rehearse`; run it on a scratch
+machine, not on a radio VM.
 
 ## License
 

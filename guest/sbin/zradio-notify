@@ -9,10 +9,12 @@
 # touches a stick or an address (zradio-serve does the sticks; the address is keepalived's own).
 # keepalived's own notify at a stop is not reliable, and a crashed keepalived runs none: the installer's drop-in for
 # keepalived.service calls this script with STOP from ExecStopPost as well. Tests: tests/t-serve.sh.
+# One more thing, for the election: see `released` below.
 set -uo pipefail
 SYSTEMCTL=${ZRADIO_NOTIFY_SYSTEMCTL:-systemctl}
 LOGGER=${ZRADIO_NOTIFY_LOGGER:-logger}
 RUN=${ZRADIO_NOTIFY_RUN:-/run/zradio}
+STATE=${ZRADIO_NOTIFY_STATE:-/var/lib/zradio}
 UNIT=zradio-serve.service
 state=${3:-}; prio=${4:-?}; name=${2:-?}
 case "$state" in
@@ -22,8 +24,17 @@ case "$state" in
      "$LOGGER" -t zradio "event=role result=ignored state=${state:-none} — not MASTER, BACKUP, FAULT or STOP" 2>/dev/null || true
      exit 2;;
 esac
+# A VM that gives the radios up in an orderly way — keepalived stopped (a planned switch, a shutdown) or its own
+# health check failed — no longer claims to hold the copy in use: whoever takes over is not behind it (docs/DESIGN.md
+# §3a). MASTER -> BACKUP is different: that is a VM displaced by the other MASTER after a cut link, and it keeps its claim.
+prev=$([ -f "$RUN/role" ] && cut -d' ' -f1 < "$RUN/role" || echo none)
+if [ "$prev" = MASTER ] && { [ "$state" = FAULT ] || [ "$state" = STOP ]; } && grep -q ' used=yes$' "$STATE/version" 2>/dev/null; then
+  sed -i 's/ used=yes$/ used=no/' "$STATE/version" \
+    && "$LOGGER" -t zradio "event=version result=released $(cat "$STATE/version" 2>/dev/null) — this VM gave the radios up ($state): it no longer claims to hold the copy in use" 2>/dev/null || true
+fi
 mkdir -p "$RUN" && printf '%s %s priority=%s\n' "$state" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$prio" > "$RUN/role.tmp" && mv -f "$RUN/role.tmp" "$RUN/role"
 "$LOGGER" -t zradio "event=role state=$state instance=$name priority=$prio — $verb $UNIT" 2>/dev/null || true
+: > "$RUN/gate-kick" 2>/dev/null || true     # a role change is news: zradio-gate looks at the peer now, not at its next round
 # BACKUP is also what keepalived says when a stick's tty is back after a FAULT: such a stick listens again, so the
 # standby is hushed (zradio-hush.service: zradio-serve hush; it waits for a `down` that is still running).
 if [ "$state" = BACKUP ]; then "$SYSTEMCTL" "$verb" --no-block "$UNIT" || true; exec "$SYSTEMCTL" start --no-block zradio-hush.service; fi

@@ -30,7 +30,7 @@ zr_port() { [[ "$1" =~ ^[0-9]{1,5}$ ]] && [ "$1" -ge 1024 ] && [ "$1" -le 65535 
 
 zr_load_conf() { # the pair's conf into NAME SELF PEER VIP VRID PRIORITY IFACE ZWAVE_PORT ZIGBEE_PORT SYNC_AT SYNC_TZ ZUI_IMAGE
   NAME="" SELF="" PEER="" VIP="" VRID="" PRIORITY="" IFACE=""
-  ZWAVE_PORT=6639 ZIGBEE_PORT=6638 SYNC_AT=04:30 SYNC_TZ=""
+  ZWAVE_PORT=6639 ZIGBEE_PORT=6638 SYNC_AT=04:30 SYNC_TZ="" ELECTION=observe ELECTION_WAIT=60
   ZUI_IMAGE=docker.io/zwavejs/zwave-js-ui:11.25.2
   [ -r "$ZR_CONF" ] || { ZR_ERR="no $ZR_CONF (copy zradio.conf.example there and fill it in)"; return 1; }
   zr_kv_only "$ZR_CONF" || { ZR_ERR="$ZR_CONF holds a line that is not KEY=value (it is sourced: nothing else may be in it)"; return 1; }
@@ -50,6 +50,8 @@ zr_load_conf() { # the pair's conf into NAME SELF PEER VIP VRID PRIORITY IFACE Z
   zr_port "$ZWAVE_PORT" && zr_port "$ZIGBEE_PORT" && [ "$ZWAVE_PORT" != "$ZIGBEE_PORT" ] || { ZR_ERR="ZWAVE_PORT '$ZWAVE_PORT' / ZIGBEE_PORT '$ZIGBEE_PORT': two different ports, 1024-65535"; return 1; }
   [[ "$SYNC_AT" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || { ZR_ERR="SYNC_AT '$SYNC_AT': HH:MM"; return 1; }
   [ -z "$SYNC_TZ" ] || [[ "$SYNC_TZ" =~ ^[A-Za-z][A-Za-z0-9_+/-]{1,40}$ ]] || { ZR_ERR="SYNC_TZ '$SYNC_TZ': a time zone name (Europe/Berlin), or empty for the VM's own"; return 1; }
+  case "$ELECTION" in observe|act) ;; *) ZR_ERR="ELECTION '$ELECTION': observe or act"; return 1;; esac
+  [[ "$ELECTION_WAIT" =~ ^[0-9]{2,3}$ ]] && [ "$ELECTION_WAIT" -ge 20 ] && [ "$ELECTION_WAIT" -le 600 ] || { ZR_ERR="ELECTION_WAIT '$ELECTION_WAIT': 20-600 seconds (a VM needs about 10 s from its claim to serving; a shorter wait gives up on it too early)"; return 1; }
   [[ "$ZUI_IMAGE" =~ ^[a-z0-9][a-z0-9./_-]*:[A-Za-z0-9._-]+$ ]] || { ZR_ERR="ZUI_IMAGE '$ZUI_IMAGE': registry/name:tag (a pinned tag)"; return 1; }
   return 0
 }
@@ -70,6 +72,23 @@ zr_load_radios() { # what zradio-detect found into ZWAVE / ZIGBEE (none|served|s
 zr_has() { # zr_has zwave|zigbee [level]: this VM has that radio (at that level)
   local lv; case "$1" in zwave) lv=$ZWAVE;; zigbee) lv=$ZIGBEE;; *) return 1;; esac
   if [ $# -ge 2 ]; then [ "$lv" = "$2" ]; else [ "$lv" != none ]; fi
+}
+
+# The version of the networks a VM's sticks hold (docs/DESIGN.md §3a): a counter, never a clock. `term` goes up when
+# Home Assistant starts using a VM in a confirmed serving turn; a sync gives the standby the active's term with used=no.
+zr_version_read() { # zr_version_read <state dir>: into ZR_TERM, ZR_USED (0 / no when there is no record)
+  ZR_TERM=0 ZR_USED=no
+  local l; l=$(cat "$1/version" 2>/dev/null) || return 0
+  if [[ "$l" =~ ^term=([0-9]{1,9})\ used=(yes|no)$ ]]; then ZR_TERM=$((10#${BASH_REMATCH[1]})); ZR_USED=${BASH_REMATCH[2]}; fi
+  return 0
+}
+zr_version_write() { # zr_version_write <state dir> <term> <yes|no>
+  mkdir -p "$1" && printf 'term=%s used=%s\n' "$2" "$3" > "$1/version.tmp" && mv -f "$1/version.tmp" "$1/version"
+}
+zr_vkey() { # zr_vkey <term> <yes|no>: one number; the higher one is the more advanced copy
+  local u=0; [ "$2" = yes ] && u=1
+  [[ "$1" =~ ^[0-9]{1,9}$ ]] || { echo 0; return; }
+  echo $(( 10#$1 * 2 + u ))
 }
 
 zr_iface() { # the pair's interface into ZR_IFACE: IFACE from the conf, else the one that holds SELF; 1 when none does.

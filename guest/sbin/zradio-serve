@@ -42,7 +42,13 @@
 #   - $STATE/stick-wedged exists (zradio-change-watch saw a stick answer nothing while Home Assistant kept asking: hung
 #     firmware behind a tty that is still there). hush removes it once the sticks answer a probe again, or
 #   - `up` failed less than $HOLD s ago ($RUN/serve-failed): without the hold a VM whose receiver will not come on
-#     would take the address back every few seconds.
+#     would take the address back every few seconds, or
+#   - $RUN/boot-wait or $RUN/hold exists (zradio-gate, ELECTION=act only; docs/DESIGN.md §3a): this VM is still asking
+#     the other one who holds the newer networks, or knows that it holds an older copy and the peer has not been
+#     silent for the standard wait yet.
+# A serving turn is `confirmed` or `provisional` ($RUN/turn): provisional when this VM serves without having heard from
+# the peer that nobody is ahead of it (it knows it is outdated, or nobody answered at boot). Only ELECTION=act makes
+# a turn provisional; a provisional turn never advances this VM's version (zradio-sync beat).
 # Journal lines: `zradio: event=serve result=…` (logger). Tests: tests/t-serve.sh. Env: ZRADIO_SERVE_*, ZRADIO_RADIOS.
 set -uo pipefail
 MODE=${1:-}
@@ -59,6 +65,7 @@ TRIES=${ZRADIO_SERVE_TRIES:-4}            # receiver calls: the stick answers CA
 PAUSE=${ZRADIO_SERVE_PAUSE:-3}
 HOLD=${ZRADIO_SERVE_HOLD:-300}            # s a failed `up` keeps this VM out of the election
 FAILED="$RUN/serve-failed"; APPLYING="$RUN/applying"; DIRTY="$STATE/standby-dirty"; WEDGED="$STATE/stick-wedged"
+BOOTWAIT="$RUN/boot-wait"; HELD="$RUN/hold"
 RADIOS_OK=1; zr_load_radios || RADIOS_OK=0
 ZW=${ZRADIO_SERVE_ZWAVE_TTY:-$ZWAVE_TTY}
 ZB=${ZRADIO_SERVE_ZIGBEE_TTY:-$ZIGBEE_TTY}
@@ -115,6 +122,10 @@ up)
     if receiver on; then :
     else : > "$FAILED"; say failed "step=zwave-receiver — SetRFReceiveMode on did not answer in $TRIES tries ($(why)): not serving, out of the election for $HOLD s"; exit 1; fi
   fi
+  # the kind of turn is written BEFORE the ports open: the peer never sees a serving VM without one
+  turn=confirmed
+  if zr_load_conf 2>/dev/null && [ "$ELECTION" = act ] && { [ -e "$STATE/outdated" ] || [ -e "$RUN/gate-alone" ]; }; then turn=provisional; fi
+  echo "$turn" > "$RUN/turn"
   if "$SYSTEMCTL" start ser2net && serving; then
     # a new turn as the active: from now on these sticks move on by themselves, so they are no longer "a copy of sync X"
     # (synced.json), and whatever this VM sent in an earlier turn (last-sync.json) says nothing about what the peer
@@ -122,15 +133,18 @@ up)
     # turn: that sync is what lifts the returning VM's Zigbee frame counter above this one's.
     rm -f "$STATE/synced.json" "$STATE/last-sync.json"
     rm -f "$FAILED"
+    [ $turn = confirmed ] || say provisional "this VM serves without knowing that it holds the newest networks ($([ -e "$STATE/outdated" ] && echo "it is outdated: $(cat "$STATE/outdated" 2>/dev/null)" || echo "the peer did not answer at boot")): its version does not advance, and a more advanced peer takes the radios back when it returns"
     if zr_has zwave synced; then say up "the Z-Wave receiver is on and ser2net is started — Home Assistant connects (ZHA starts the coordinator)"
     else say up "ser2net is started — Home Assistant connects"; fi
     exit 0
   fi
+  rm -f "$RUN/turn"
   : > "$FAILED"; say failed "step=ser2net — ser2net did not start: not serving, out of the election for $HOLD s"; exit 1;;
 
 down)
   [ "$(id -u)" = 0 ] || { echo "die: run as root" >&2; exit 2; }
   sticks_lock; rc=0; gone=""; did=""
+  rm -f "$RUN/turn" "$RUN/observe/turn"
   if serving; then "$SYSTEMCTL" stop ser2net || true; fi
   if serving; then say loud "step=ser2net — ser2net did not stop: this VM still answers Home Assistant"; exit 1; fi
   [ $RADIOS_OK = 1 ] || { say down-partial "ser2net is stopped; $ZR_ERR: no stick is known here, none was silenced"; exit 0; }
@@ -185,6 +199,8 @@ check)
   [ -e "$APPLYING" ] && exit 1
   [ -e "$DIRTY" ] && exit 1
   [ -e "$WEDGED" ] && exit 1
+  [ -e "$BOOTWAIT" ] && [ "$(age_of "$BOOTWAIT")" -lt 300 ] && exit 1     # older: the gate died; it must not keep this VM out
+  [ -e "$HELD" ] && exit 1
   [ -e "$FAILED" ] && [ "$(age_of "$FAILED")" -lt "$HOLD" ] && exit 1
   exit 0;;
 
@@ -198,6 +214,10 @@ status)
   [ -e "$DIRTY" ] && echo "marker: $DIRTY (a synced image was not written to the end: this VM may not serve)"
   [ -e "$WEDGED" ] && echo "marker: $WEDGED ($(cat "$WEDGED" 2>/dev/null): a stick stopped answering; this VM may not serve until the sticks answer a probe)"
   [ -e "$FAILED" ] && echo "marker: $FAILED ($(age_of "$FAILED") s old; holds this VM out for $HOLD s)"
+  [ -e "$BOOTWAIT" ] && echo "marker: $BOOTWAIT (asking the peer who holds the newer networks before this VM may claim)"
+  [ -e "$HELD" ] && echo "marker: $HELD (this VM holds an older copy: it may serve only after the peer has been silent for the standard wait)"
+  [ -e "$STATE/outdated" ] && echo "outdated: the peer was ahead ($(cat "$STATE/outdated" 2>/dev/null)); a sync clears this"
+  zr_version_read "$STATE"; echo "version: term $ZR_TERM, used $ZR_USED$([ -f "$RUN/turn" ] && echo "; this turn is $(cat "$RUN/turn")")"
   [ -f "$RUN/role" ] && echo "keepalived's last word: $(cat "$RUN/role")"
   exit 0;;
 

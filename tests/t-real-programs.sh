@@ -58,7 +58,7 @@ fi
 if command -v keepalived >/dev/null; then
   echo "-- $(keepalived --version 2>&1 | head -1 | cut -d' ' -f1,2) reads the rendered keepalived.conf"
   r > "$T/keepalived.conf"
-  OUT=$(keepalived -t -f "$T/keepalived.conf" 2>&1); RC=$?
+  OUT=$(keepalived -t -f "$T/keepalived.conf" 2>&1)
   # here the interface eth9 and /usr/local/sbin/zradio-serve do not exist: keepalived says so and that is expected.
   # What must not appear is a complaint about the file's own words.
   check "no unknown keyword, no syntax complaint" bash -c '! printf "%s" "$1" | grep -qiE "unknown keyword|syntax|unexpected|missing .*}|invalid"' _ "$OUT"

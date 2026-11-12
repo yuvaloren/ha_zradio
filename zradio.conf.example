@@ -37,6 +37,15 @@ ZIGBEE_PORT=6638
 SYNC_AT=04:30
 SYNC_TZ=
 
+# Optional. Who serves when it is not obvious (docs/DESIGN.md §3a): at boot each VM asks the other which of the two
+# holds the newer networks before it claims the radios; a VM that knows its copy is older waits ELECTION_WAIT seconds
+# (20-600) without the other serving before it serves; a VM with the newer copy takes the radios back from an older one.
+#   observe  (default) every such decision is only written to the journal (`journalctl -t zradio | grep would-`)
+#   act      the decisions are carried out. Read a few days of observe lines first: this can take the radios away.
+# Set the same mode on BOTH VMs (a VM in observe mode refuses to hand over to one in act mode).
+ELECTION=observe
+ELECTION_WAIT=60
+
 # Optional. The Z-Wave JS UI container image that writes a copied Z-Wave network onto the standby's stick. A pinned
 # tag: the installer pulls exactly this, once.
 ZUI_IMAGE=docker.io/zwavejs/zwave-js-ui:11.25.2

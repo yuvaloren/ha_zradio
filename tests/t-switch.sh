@@ -18,7 +18,7 @@ vm() { # vm <dir> [role: MASTER|BACKUP] [ser2net: 1|0] [peer takes over: yes|no]
     is-active) u=\${*: -1}; [ \"\$(cat '$d/'\$u)\" = 1 ] && { [ \"\$2\" = --quiet ] || echo active; exit 0; }; [ \"\$2\" = --quiet ] || echo inactive; exit 3;;
     stop) $rec; [ -f '$d/nostop' ] && exit 1; echo 0 > '$d/keepalived'; echo 0 > '$d/ser2net'
           [ \"\$(cat '$d/takes')\" = yes ] && sed -i 's/role=BACKUP serving=no/role=MASTER serving=yes/' '$d/peer'; exit 0;;
-    start) $rec; echo 1 > '$d/keepalived'; exit 0;;
+    start) $rec; echo 1 > '$d/keepalived'; [ -e '$d/run/hold' ] && : > '$d/held-at-start'; exit 0;;
     *) $rec; exit 9;; esac"
   fake "$d/sync" zradio-sync "$rec; case \"\$1\" in peer-hello) [ -f '$d/peer-down' ] && exit 255; cat '$d/peer';; run) [ -f '$d/sync-fail' ] && { echo 'failed  step=apply'; exit 1; }; g=20261112T050000Z; echo \"{\\\"gen\\\": \\\"\$g\\\"}\" > '$d/state/last-sync.json'; sed -i \"s/gen=[^ ]*/gen=\$g/\" '$d/peer'; echo 'ok  gen='\$g;; esac"
 }
@@ -62,4 +62,17 @@ vm "$T/x4"; : > "$T/x4/nostop"; sw "$T/x4" --run
 check "keepalived does not stop: exit 1, says this VM still serves" bash -c '[ "$2" = 1 ] && grep -q "systemctl stop keepalived failed — this VM still serves" "$1/out"' _ "$T/x4" "$RC"
 OUT=$(bash "$TOOL" --help 2>&1); RC=$?
 check "--help: exit 0, names the steps" bash -c '[ "$1" = 0 ] && printf "%s" "$2" | grep -q "zradio-switch \[--run\] \[--sync\]" && printf "%s" "$2" | grep -q "^#   3\. wait"' _ "$RC" "$OUT"
+echo "-- --yield (asked for by a more advanced peer): no sync from the older copy; this VM is outdated afterwards"
+vm "$T/y" MASTER 1 yes 20261101T000000Z 20261112T001339Z; sed -i 's/$/ term=5 used=yes zbfloor=7000000 wait=no/' "$T/y/peer"; echo "term=4 used=yes" > "$T/y/state/version"; sw "$T/y" --run --yield
+check "exit 0; the standby does not hold this VM's last sync, yet no sync is run" bash -c '[ "$2" = 0 ] && ! grep -q "zradio-sync run" "$1/calls" && grep -q "OK    --yield" "$1/out"' _ "$T/y" "$RC"
+check "keepalived stopped and started again; outdated holds the peer's term and counter floor" bash -c 'grep -q "^systemctl stop keepalived" "$1/calls" && grep -q "^systemctl start keepalived" "$1/calls" && [ "$(cat "$1/state/outdated")" = "term=5 zbfloor=7000000" ]' _ "$T/y"
+check "this VM no longer claims to be the copy in use" eq "$(cat "$T/y/state/version")" "term=4 used=no"
+check "…and it is HELD before keepalived runs here again: not one second as a standby that could take the radios back with the older copy" bash -c '[ -e "$1/run/hold" ] && [ -e "$1/held-at-start" ]' _ "$T/y"
+vm "$T/y1" MASTER 1 no; sed -i 's/$/ term=5 used=yes zbfloor=7000000 wait=no/' "$T/y1/peer"; sw "$T/y1" --run --yield
+check "--yield and the peer does not take the radios: exit 1, and this VM is neither outdated nor held (it serves again)" bash -c '[ "$2" = 1 ] && [ ! -e "$1/state/outdated" ] && [ ! -e "$1/run/hold" ]' _ "$T/y1" "$RC"
+vm "$T/y2"; echo "term=4 used=yes" > "$T/y2/state/version"; sw "$T/y2" --run
+check "an ordinary planned switch also drops 'used' (the role was given away knowingly), and marks nothing outdated, holds nothing" bash -c '[ "$(cat "$1/state/version")" = "term=4 used=no" ] && [ ! -e "$1/state/outdated" ] && [ ! -e "$1/run/hold" ]' _ "$T/y2"
+vm "$T/y3"; sed -i 's/$/ wait=yes/' "$T/y3/peer"; sw "$T/y3" --run
+check "a standby that is itself held back (wait=yes) is not ready: no switch" bash -c '[ "$2" = 1 ] && ! grep -q "stop keepalived" "$1/calls"' _ "$T/y3" "$RC"
+
 finish
