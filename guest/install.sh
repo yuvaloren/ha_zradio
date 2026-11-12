@@ -16,6 +16,7 @@
 #   --first        with --initial-role primary: the sticks hold no network yet (a new house; Home Assistant forms it).
 #   Without --initial-role (the kit before the role was asked): a VM whose "synced" sticks are blank is marked "not
 #                  filled" unless --first; a VM whose sticks hold any network may serve.
+#   --from-node    run by ./install.sh on the Proxmox node, which pairs the two VMs itself: the trust line is not printed
 #   --detect       look at the USB ports again even though /etc/zradio/radios.conf exists (after changing a stick)
 #   --use zigbee=/dev/ttyUSB3[:family]   passed to zradio-detect (repeatable)
 #
@@ -45,9 +46,9 @@
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 R=${ZRADIO_INSTALL_ROOT:-}
-RUN=0 CONF_SRC="" FIRST=0 DETECT=0 USE=() ROLE=""
+RUN=0 CONF_SRC="" FIRST=0 DETECT=0 USE=() ROLE="" BYNODE=0
 while [ $# -gt 0 ]; do case "$1" in
-  --run) RUN=1; shift;; --conf) CONF_SRC=$2; shift 2;; --first) FIRST=1; shift;; --detect) DETECT=1; shift;; --initial-role) ROLE=${2:-}; shift 2;;
+  --run) RUN=1; shift;; --conf) CONF_SRC=$2; shift 2;; --first) FIRST=1; shift;; --detect) DETECT=1; shift;; --from-node) BYNODE=1; shift;; --initial-role) ROLE=${2:-}; shift 2;;
   --use) USE+=(--use "$2"); shift 2;;
   -h|--help) sed -n '2,/^set -uo pipefail$/{/^set -uo pipefail$/!p}' "$0"; exit 0;; *) echo "unknown arg: $1" >&2; exit 2;; esac; done
 case "$ROLE" in ""|primary|standby) ;; *) echo "--initial-role '$ROLE': primary (its sticks hold the networks today) or standby (its sticks will be overwritten)" >&2; exit 2;; esac
@@ -230,11 +231,15 @@ fi
 echo "== 7. this VM's sync key =="
 if [ $RUN = 1 ]; then
   if K=$(env ZRADIO_SYNC_KEY="$R/etc/zradio/sync.key" ZRADIO_SYNC_HOSTKEY="${ZRADIO_INSTALL_HOSTKEY:-$R/etc/ssh/ssh_host_ed25519_key.pub}" bash "$R/usr/local/sbin/zradio-sync" keys 2>&1); then
-    done_ "the sync key is at /etc/zradio/sync.key (0600). On the OTHER radio VM ($PEER), as root, run:"
-    printf "      zradio-sync trust --sync-key '%s' --host-key '%s'\n" "$(printf '%s\n' "$K" | sed -n 's/^SYNCKEY //p')" "$(printf '%s\n' "$K" | sed -n 's/^HOSTKEY //p')"
+    if [ $BYNODE = 1 ]; then done_ "the sync key is at /etc/zradio/sync.key (0600)"
+    else
+      done_ "the sync key is at /etc/zradio/sync.key (0600). On the OTHER radio VM ($PEER), as root, run:"
+      printf "      zradio-sync trust --sync-key '%s' --host-key '%s'\n" "$(printf '%s\n' "$K" | sed -n 's/^SYNCKEY //p')" "$(printf '%s\n' "$K" | sed -n 's/^HOSTKEY //p')"
+    fi
   else bad "zradio-sync keys: $K"; fi
 else would "zradio-sync keys (make the sync key if missing; print the line the other VM runs to trust this one)"; fi
 [ $RUN = 1 ] || { echo "REPORT ONLY — nothing was changed."; exit 0; }
 [ $FAILS -eq 0 ] || { echo "== $FAILS FAIL =="; exit 1; }
-echo "== installed. Next: the same on the other VM, the two 'zradio-sync trust' lines, then 'systemctl start zradio.target' — on the VM that holds the networks FIRST =="
+if [ $BYNODE = 1 ]; then echo "== installed =="          # the node's install.sh pairs the two VMs and starts them
+else echo "== installed. Next: the same on the other VM, the two 'zradio-sync trust' lines, then 'systemctl start zradio.target' — $([ -n "$ROLE" ] && echo "in both" || echo "on the VM that holds the networks FIRST") =="; fi
 exit 0

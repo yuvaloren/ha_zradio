@@ -1,0 +1,22 @@
+# answers.example — ./install.sh without questions:   ./install.sh --answers my.answers --run
+# One option per line, as KEY=value (the option's name in capitals, - as _). Anything left out is asked when someone
+# is there, and otherwise takes its default. An option given on the command line wins. ./install.sh --help lists them.
+
+# What this node is INITIALLY. primary: its sticks hold your networks and stay as they are.
+# standby: its sticks WILL BE WIPED by the first sync. (Afterwards the two VMs swap.)
+INITIAL_ROLE=primary
+# A new house, nothing paired yet:
+#FIRST=yes
+
+NAME=zradio1
+# This VM, the other radio VM, and the floating address Home Assistant connects to:
+SELF=192.168.1.21/24
+PEER=192.168.1.22
+VIP=192.168.1.20/24
+BRIDGE=vmbr0
+GATEWAY=192.168.1.1
+
+# Start the VM in the pair at the end:
+#START=yes
+
+# The second node needs none of this: it takes the addresses from the first VM and the opposite role. NAME if you like.
