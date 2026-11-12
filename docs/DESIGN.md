@@ -59,15 +59,51 @@ Rails, each from something that went wrong or nearly did:
 
 - A VM never serves a stick set that was not written to the end (a mark on disk, set before the first write).
 - A new VM whose synced sticks hold no network does not serve until a sync has filled them.
-- A returning VM is synced once by the serving VM's next tick. **Gap, open:** until that sync (up to 15 minutes) the
-  returning VM is a standby with an older copy — if the serving VM failed in that window, the older copy would
-  serve, with a Zigbee frame counter that may be behind what the devices have seen.
+- A returning VM is synced once by the serving VM's next tick. **Gap, until §3a is built:** until that sync (up to
+  15 minutes) the returning VM is a standby with an older copy — if the serving VM failed in that window, the older
+  copy would serve at once, with a Zigbee frame counter that may be behind what the devices have seen.
 - A standby stick is silenced at boot, at every change to standby and every 15 minutes: a stick that re-enumerates
   or loses power for a moment comes back listening.
 - One lock around every operation on the sticks.
 - A check that can take the radios away from a VM runs in observe mode first. (2026-11-11: a first version of the
   silent-stick check could not see the sticks' answers, declared two healthy sticks hung in turn, and no VM served
   for 2 min 22 s.)
+
+## 3a. Who serves when it is not obvious — decided 2026-11-11, **not built yet**
+
+Today the first VM whose keepalived starts wins, and a VM that returns after a failure is an ordinary standby from
+its first second, with an older copy until the next sync. Priority cannot fix that: it shortens the claim timer by
+at most one second [V sandbox, keepalived 2.2.8: priority 100 started 2 s before priority 200 — the 100 served].
+The decided behaviour, after DRBD's wait-for-connection and outdated peer, and Galera's "start from the most
+advanced node" [source: drbd.conf(5); Galera crash recovery]:
+
+1. **A version that is a counter, not a clock:** `(term, used)`. A sync gives the standby the active's term with
+   `used = no`. The term goes up by one when Home Assistant first connects to a VM in a serving turn that is
+   *confirmed* (rule 3) — that is, when the network really starts to move on from that VM's sticks. A VM that serves
+   with no client (a cut link, with Home Assistant on the other side) does not advance.
+2. **Wait for the peer before claiming.** At boot a VM asks the other one for its version, for up to the *standard
+   wait* (60 s). Both up: the higher version serves; equal versions: the configured priority. No answer: it serves.
+3. **Confirmed or provisional.** A turn is confirmed when the VM knew, from the peer itself, that nobody was ahead
+   of it: a clean, in-sync standby taking over, or a boot comparison it won. A VM that serves because nobody
+   answered serves *provisionally*: its version does not advance.
+4. **An outdated VM serves after the standard wait, not after 4 seconds** (decision: Yuval, 2026-11-11). A VM that
+   knows the peer's term is higher is outdated until a sync lands. If the peer falls silent it waits the standard
+   wait, then serves provisionally — a short blip of the serving VM never hands the radios to an older copy.
+5. **A more advanced VM preempts — once.** When a VM with a strictly higher version finds the other one serving,
+   it asks it to hand over (the planned-switch mechanism) and then syncs it. Nothing else ever preempts, and after
+   the sync the versions are equal, so this cannot oscillate. What changed on the less advanced VM while it served
+   (a device added there) is overwritten by that sync.
+6. The serving VM syncs a returning peer as soon as it sees it, not at the next 15-minute tick.
+
+Open, to settle while building:
+
+- **[H] Zigbee in and after a provisional turn.** An older copy's frame counter may be below what the devices have
+  already seen, and after it served, the returning VM's counter may be below *its*. Each such change of hands
+  probably needs the taker to raise its own stick's counter first (zigpy backup → raise → restore, the proven write
+  path, inside the wait). Not measured.
+- Two nodes cannot tell a dead peer from a cut link; rule 1's "used" is what keeps a cut link from picking the wrong
+  side afterwards. A third witness would be the textbook answer and is not planned.
+- Everything here can take the radios away from a VM: it goes onto real VMs in observe mode first.
 
 ## 4. Recognising the radios
 
