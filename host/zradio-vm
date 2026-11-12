@@ -405,7 +405,7 @@ gx 30 cat /var/log/zradio-install.log | grep -vE '^ *OK ' | sed 's/^/      | /'
 if [ "$rc" = 0 ]; then ok "the kit is installed in $NAME"
 elif [ $NOUSB = 1 ] && gx 30 cat /var/log/zradio-install.log | grep -q "FAIL  zradio-detect did not end clean"; then
   ok "the drill went as far as a VM without a stick can: the VM, cloud-init, the kit unpacked, its packages — and the installer stopped at the detection, with no stick to find"
-  echo "== a drill. To remove it: ha-manager remove vm:$VMID; ha-manager rules remove $NAME-on-$NODE; qm stop $VMID; qm destroy $VMID --purge; and the file $SNIPDIR/$NAME-zradio.yaml =="
+  echo "== a drill. To remove it: $([ $HA = 1 ] && echo "ha-manager rules remove $NAME-on-$NODE; ha-manager remove vm:$VMID; ")qm stop $VMID; qm destroy $VMID --purge; and the file $SNIPDIR/$NAME-zradio.yaml =="
   exit 0
 else bad "install.sh ended ${rc:-without a code} in $NAME — nothing was started there; fix, then in the VM: bash /opt/zradio/kit/guest/install.sh --run --detect"; exit 1; fi
 addr=$(qm guest cmd "$VMID" network-get-interfaces 2>/dev/null | python3 -c '
