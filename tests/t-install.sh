@@ -55,6 +55,13 @@ check "keepalived and ser2net installed; both stopped again and not enabled by t
 check "detection ran once, with --write" eq "$(grep -c '^zradio-detect --write$' "$T/w/calls")" 1
 check "a synced Z-Wave stick: podman installed, the pinned image pulled" bash -c 'grep -q "^apt-get install -y -q podman" "$1/calls" && grep -q "^podman pull -q docker.io/zwavejs/zwave-js-ui:11.25.2" "$1/calls"' _ "$T/w"
 check "a synced Zigbee stick: zigpy in its own venv" bash -c 'grep -q "^zigpy-setup .*/opt/zradio/zigpy" "$1/calls" && [ -x "$1/root/opt/zradio/zigpy/bin/zigpy" ]' _ "$T/w"
+# the real line (no setup hook): python3 -m venv, then pip with the PINNED release from zradio.conf's default
+vm "$T/pin"; REALPY=$(command -v python3)
+fake "$T/pin/bin" python3 "if [ \"\$1 \$2\" = '-m venv' ]; then mkdir -p \"\$3/bin\" && printf '#!/bin/sh\necho \"pip \$*\" >> %s\nprintf \"#!/bin/sh\\\\n\" > %s/bin/zigpy; chmod +x %s/bin/zigpy\n' '$T/pin/calls' \"\$3\" \"\$3\" > \"\$3/bin/pip\" && chmod +x \"\$3/bin/pip\"; else exec '$REALPY' \"\$@\"; fi"
+PATH="$T/pin/bin:$PATH" ZRADIO_INSTALL_ROOT="$T/pin/root" ZRADIO_INSTALL_DETECT="$T/pin/detect" bash "$TOOL" --conf "$T/pin/my.conf" --run > "$T/pin/out" 2>&1
+check "zigpy-cli is installed at a pinned release (2.0.0 unless zradio.conf says otherwise), not whatever is newest that day" bash -c 'grep -qx "pip install -q zigpy-cli==2.0.0" "$1/calls" && grep -q "zigpy-cli 2.0.0 installed in its own venv" "$1/out"' _ "$T/pin"
+vm "$T/pin2"; echo "ZIGPY_VERSION=latest" >> "$T/pin2/my.conf"; inst "$T/pin2" --conf "$T/pin2/my.conf" --run
+check "ZIGPY_VERSION that is not a release number: the conf is refused, nothing installed" bash -c '[ "$2" != 0 ] && grep -q "ZIGPY_VERSION .latest.: a zigpy-cli release" "$1/out" && ! grep -q "^apt-get" "$1/calls"' _ "$T/pin2" "$RC"
 check "keepalived.conf rendered for this VM (eth1 holds SELF) and checked with keepalived -t" bash -c 'grep -qx "    interface eth1" "$1/root/etc/keepalived/keepalived.conf" && grep -qx "    unicast_src_ip 10.20.30.6" "$1/root/etc/keepalived/keepalived.conf" && grep -q "^keepalived -t -f " "$1/calls"' _ "$T/w"
 check "ser2net.yaml: both radios on the floating address; the package's file kept once as .dist" bash -c '[ "$(grep -c "accepter: tcp,10.20.30.50," "$1/root/etc/ser2net.yaml")" = 2 ] && grep -q "the package.s file" "$1/root/etc/ser2net.yaml.dist"' _ "$T/w"
 check "the nightly timer at the default time" has "$(R "$T/w" /etc/systemd/system/zradio-sync.timer)" "OnCalendar=*-*-* 04:30:00"

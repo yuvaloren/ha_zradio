@@ -175,8 +175,8 @@ documentation and **not verified on hardware** unless marked proven (two entries
 
 | Phase | Content | Proves |
 |---|---|---|
-| 1 (this) | the VM's side, one config file, detection, the "served" fallback | the reference pair rebuilt from this repository |
-| 2 | a Proxmox helper script per node (creates the VM, passes the sticks through, proposes a free address), a pairing code instead of the two `trust` lines, one ser2net per port so one stick's read does not pause the other [H] | two commands on a clean Proxmox pair |
+| 1 (this) | the VM's side, one config file, detection, the "served" fallback; `host/zradio-vm` (the VM itself: cloud image, the sticks by USB mapping, the kit by cloud-init, Proxmox HA with a strict node rule) — built 2026-11-12, tested against fakes, its cloud-init file checked by cloud-init's own schema and decoder [V sandbox, cloud-init 26.2]; **not yet run on a node** | the reference pair rebuilt from this repository |
+| 2 | one command with no addresses typed (proposes a free address), a pairing code instead of the two `trust` lines, switching a stopped VM's USB ports off, one ser2net per port so one stick's read does not pause the other [H] | two commands on a clean Proxmox pair |
 | 3 | a Home Assistant integration (HACS): status, "sync now", "switch", repair notices; a sync that reads through Home Assistant's own backup APIs, without the pause [H]; device add/remove events instead of the packet watcher | the pause gone; no separate monitoring needed |
 | 4 | more families synced (EZSP first), Zigbee2MQTT, a hardware table filled by reports | a wide variety of setups |
 

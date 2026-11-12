@@ -5,11 +5,12 @@ Home Assistant over the network; the other stands by with **its sticks holding a
 takes over within seconds when the first one stops, dies, or loses a stick. Home Assistant talks to one floating
 address and does not take part in the decision.
 
-**Status: phase 1 of 4, under construction.** What is in this repository is the part that runs *inside* a radio VM.
-It is extracted from the scripts that run a real pair since 2026-11-11 and is tested against fakes (and against the
-real `ser2net`, `keepalived` and `systemd-analyze` where installed). **This repository's own code has not yet run on
-real sticks**: its first hardware run is the rebuild of that pair from this kit. Until that is recorded here, treat it
-as unproven.
+**Status: phase 1 of 4, under construction.** What is in this repository is the part that runs *inside* a radio VM,
+and `host/zradio-vm`, which builds such a VM on a Proxmox node. The VM's side is extracted from the scripts that run
+a real pair since 2026-11-11; both are tested against fakes (and against the real `ser2net`, `keepalived`,
+`systemd-analyze` and `cloud-init` where installed). **This repository's own code has not yet run on real sticks,
+and `zradio-vm` has not yet created a VM on a real node**: the first run of both is the rebuild of that pair from this
+kit. Until that is recorded here, treat it as unproven.
 
 ## What it does, and what was measured
 
@@ -47,6 +48,7 @@ Recognition starts from the USB lists Home Assistant's own Zigbee and Z-Wave int
 ## Layout
 
 ```
+host/zradio-vm            on a Proxmox node: build that node's radio VM (below)
 guest/install.sh          the installer: run inside each radio VM
 guest/sbin/               zradio-detect  -serve  -notify  -sync  -apply  -switch  -gate  -change-watch  -render
 guest/lib/                the probe, the Z-Wave JS UI restore client, templates, the USB list
@@ -100,11 +102,30 @@ know what it costs — a VM that boots with nobody answering serves after `ELECT
 instead of after 4 s, and a VM with an older copy whose peer disappears after that wait plus up to half a minute. **It has not run on a radio VM, and its handling of the Zigbee frame counter has not been
 tried with devices.**
 
+## A radio VM from nothing: `host/zradio-vm`
+
+On each Proxmox node, as root, from a checkout of this repository:
+
+```
+host/zradio-vm sticks                     # what is plugged into this node that the kit knows; changes nothing
+host/zradio-vm create --name zradio1 --self 192.0.2.11/24 --peer 192.0.2.12 --vip 192.0.2.10/24 --gateway 192.0.2.1
+host/zradio-vm create …the same… --run    # without --run it only says what it would do
+```
+
+It makes the VM from Debian 13's cloud image, passes this node's sticks through (Proxmox USB mappings; the VM finds
+out by itself which stick is what), installs the kit inside by cloud-init, makes the VM a Proxmox HA resource with a
+**strict** node rule — Proxmox restarts it here and never moves it onto the other node's sticks — and only then starts
+it. It ends by showing what the installer found and the `zradio-sync trust` line for the other VM. The VM joins the
+pair at `systemctl start zradio.target` (or with `--start`). `--pair-bridge BR` puts the pair's traffic on a link of
+its own; `--usb-mapping ID` uses mappings you already have; `--hookscript` attaches a hookscript of yours.
+
+It refuses, before anything is changed, a name or id that is taken, a **running** VM that already uses the address or
+one of the sticks, a missing key for root, and a node without Proxmox HA unless `--no-ha` is said. It never rebuilds
+or removes a VM. **Not built:** switching a stopped VM's USB ports off (a stick keeps its radio on while it has power:
+a site with a hub that can switch ports brings its own hookscript for now).
+
 ## Not built yet
 
-- **The Proxmox side**: creating the VM, passing the sticks through, powering a stopped VM's USB ports down, and
-  putting each radio VM under Proxmox HA restricted to its own node (so Proxmox restarts it but never moves it).
-  Today that is done by hand.
 - **One command per node and a pairing code** instead of the config file and the two `trust` lines (phase 2).
 - **The Home Assistant integration**: status, "sync now", "switch", a sync without the pause, repair notices (phase 3).
 - **More families synced**: Silicon Labs EZSP first; Zigbee2MQTT (phase 4). These need hardware this project does
@@ -113,7 +134,7 @@ tried with devices.**
 
 ## Tests
 
-`bash tests/run.sh` — bash 4+, python3, util-linux, openssh-client (`ssh-keygen`). Where `ser2net`, `socat`,
+`bash tests/run.sh` — bash 4+, python3 (with PyYAML for `t-host.sh`), util-linux, openssh-client (`ssh-keygen`). Where `ser2net`, `socat`,
 `keepalived` and `systemd-analyze` are installed, the rendered config files are given to the real programs. Nothing
 in the tests reaches a radio.
 

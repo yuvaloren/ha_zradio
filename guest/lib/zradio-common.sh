@@ -28,10 +28,11 @@ zr_ip4() { # zr_ip4 <text>: 0 for a dotted IPv4 host address (no 0.x, no 224+, n
 }
 zr_port() { [[ "$1" =~ ^[0-9]{1,5}$ ]] && [ "$1" -ge 1024 ] && [ "$1" -le 65535 ]; }
 
-zr_load_conf() { # the pair's conf into NAME SELF PEER VIP VRID PRIORITY IFACE ZWAVE_PORT ZIGBEE_PORT SYNC_AT SYNC_TZ ZUI_IMAGE
+zr_load_conf() { # the pair's conf into NAME SELF PEER VIP VRID PRIORITY IFACE ZWAVE_PORT ZIGBEE_PORT SYNC_AT SYNC_TZ ZUI_IMAGE ZIGPY_VERSION
   NAME="" SELF="" PEER="" VIP="" VRID="" PRIORITY="" IFACE=""
   ZWAVE_PORT=6639 ZIGBEE_PORT=6638 SYNC_AT=04:30 SYNC_TZ="" ELECTION=observe ELECTION_WAIT=60
   ZUI_IMAGE=docker.io/zwavejs/zwave-js-ui:11.25.2
+  ZIGPY_VERSION=2.0.0
   [ -r "$ZR_CONF" ] || { ZR_ERR="no $ZR_CONF (copy zradio.conf.example there and fill it in)"; return 1; }
   zr_kv_only "$ZR_CONF" || { ZR_ERR="$ZR_CONF holds a line that is not KEY=value (it is sourced: nothing else may be in it)"; return 1; }
   # shellcheck disable=SC1090
@@ -53,6 +54,7 @@ zr_load_conf() { # the pair's conf into NAME SELF PEER VIP VRID PRIORITY IFACE Z
   case "$ELECTION" in observe|act) ;; *) ZR_ERR="ELECTION '$ELECTION': observe or act"; return 1;; esac
   [[ "$ELECTION_WAIT" =~ ^[0-9]{2,3}$ ]] && [ "$ELECTION_WAIT" -ge 20 ] && [ "$ELECTION_WAIT" -le 600 ] || { ZR_ERR="ELECTION_WAIT '$ELECTION_WAIT': 20-600 seconds (a VM needs about 10 s from its claim to serving; a shorter wait gives up on it too early)"; return 1; }
   [[ "$ZUI_IMAGE" =~ ^[a-z0-9][a-z0-9./_-]*:[A-Za-z0-9._-]+$ ]] || { ZR_ERR="ZUI_IMAGE '$ZUI_IMAGE': registry/name:tag (a pinned tag)"; return 1; }
+  [[ "$ZIGPY_VERSION" =~ ^[0-9]+(\.[0-9a-z]+){1,3}$ ]] || { ZR_ERR="ZIGPY_VERSION '$ZIGPY_VERSION': a zigpy-cli release, like 2.0.0 (a pinned version)"; return 1; }
   return 0
 }
 

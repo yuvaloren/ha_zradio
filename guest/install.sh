@@ -139,9 +139,9 @@ else
     elif [ $RUN = 1 ]; then
       pkg python3-venv || exit 1
       if [ -n "${ZRADIO_INSTALL_ZIGPY_SETUP:-}" ]; then "$ZRADIO_INSTALL_ZIGPY_SETUP" "$R/opt/zradio/zigpy"
-      else python3 -m venv "$R/opt/zradio/zigpy" && "$R/opt/zradio/zigpy/bin/pip" install -q zigpy-cli; fi
-      [ -x "$R/opt/zradio/zigpy/bin/zigpy" ] && done_ "zigpy installed in its own venv /opt/zradio/zigpy" || bad "zigpy did not install into /opt/zradio/zigpy (python3 -m venv + pip install zigpy-cli)"
-    else would "python3 -m venv /opt/zradio/zigpy; pip install zigpy-cli"; fi
+      else python3 -m venv "$R/opt/zradio/zigpy" && "$R/opt/zradio/zigpy/bin/pip" install -q "zigpy-cli==$ZIGPY_VERSION"; fi
+      [ -x "$R/opt/zradio/zigpy/bin/zigpy" ] && done_ "zigpy-cli $ZIGPY_VERSION installed in its own venv /opt/zradio/zigpy" || bad "zigpy did not install into /opt/zradio/zigpy (python3 -m venv + pip install zigpy-cli==$ZIGPY_VERSION)"
+    else would "python3 -m venv /opt/zradio/zigpy; pip install zigpy-cli==$ZIGPY_VERSION"; fi
   else ok "no synced Zigbee stick: zigpy is not needed"; fi
 fi
 [ $FAILS -eq 0 ] || { echo "== FAILED before any service file was touched: $FAILS FAIL =="; exit 1; }

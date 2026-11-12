@@ -37,6 +37,9 @@ ZIGBEE_PORT=6638
 SYNC_AT=04:30
 SYNC_TZ=
 
+# Optional. The zigpy-cli release that reads and writes a synced Zigbee stick (default 2.0.0; both VMs the same).
+#ZIGPY_VERSION=2.0.0
+
 # Optional. Who serves when it is not obvious (docs/DESIGN.md §3a): at boot each VM asks the other which of the two
 # holds the newer networks before it claims the radios; a VM that knows its copy is older waits ELECTION_WAIT seconds
 # (20-600) without the other serving before it serves; a VM with the newer copy takes the radios back from an older one.
