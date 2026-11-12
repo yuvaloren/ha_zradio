@@ -87,8 +87,9 @@ Each tool's header says what it does, what it refuses and why; `--help` prints i
 
 ## Not built yet
 
-- **The Proxmox side**: creating the VM, passing the sticks through, powering a stopped VM's USB ports down. Today
-  that is done by hand (step 0 above).
+- **The Proxmox side**: creating the VM, passing the sticks through, powering a stopped VM's USB ports down, and
+  putting each radio VM under Proxmox HA restricted to its own node (so Proxmox restarts it but never moves it).
+  Today that is done by hand.
 - **One command per node and a pairing code** instead of the config file and the two `trust` lines (phase 2).
 - **The Home Assistant integration**: status, "sync now", "switch", a sync without the pause, repair notices (phase 3).
 - **More families synced**: Silicon Labs EZSP first; Zigbee2MQTT (phase 4). These need hardware this project does

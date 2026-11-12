@@ -59,7 +59,9 @@ Rails, each from something that went wrong or nearly did:
 
 - A VM never serves a stick set that was not written to the end (a mark on disk, set before the first write).
 - A new VM whose synced sticks hold no network does not serve until a sync has filled them.
-- A returning VM is synced once before it can matter again (its copy's Zigbee counter is behind).
+- A returning VM is synced once by the serving VM's next tick. **Gap, open:** until that sync (up to 15 minutes) the
+  returning VM is a standby with an older copy — if the serving VM failed in that window, the older copy would
+  serve, with a Zigbee frame counter that may be behind what the devices have seen.
 - A standby stick is silenced at boot, at every change to standby and every 15 minutes: a stick that re-enumerates
   or loses power for a moment comes back listening.
 - One lock around every operation on the sticks.
@@ -94,8 +96,17 @@ documentation and **not verified on hardware** unless marked proven (two entries
 | 3 | a Home Assistant integration (HACS): status, "sync now", "switch", repair notices; a sync that reads through Home Assistant's own backup APIs, without the pause [H]; device add/remove events instead of the packet watcher | the pause gone; no separate monitoring needed |
 | 4 | more families synced (EZSP first), Zigbee2MQTT, a hardware table filled by reports | a wide variety of setups |
 
-Decisions taken: a VM, not a container (Proxmox manages it; USB hot-plug and device permissions differ least between
-setups); keepalived always decides who serves — Home Assistant may ask for a switch, never decide one.
+Decisions taken:
+
+- A VM, not a container (Proxmox manages it; USB hot-plug and device permissions differ least between setups).
+- keepalived always decides who serves — Home Assistant may ask for a switch, never decide one.
+- **Each radio VM is a Proxmox HA resource, restricted to its own node by a strict node-affinity rule** (2026-11-11).
+  Proxmox restarts a radio VM that dies and never moves it: on the other node it would be handed that node's sticks,
+  which the other radio VM holds. This is the stock mechanism for a guest whose device passthrough exists on a subset
+  of nodes [source: ha-manager(1), PVE 9.2: "restrict the HA resource to that subset with a strict node affinity
+  rule"; "if none of the defined nodes are available, the resource will be stopped"]. A plain VM with `onboot` — what
+  the reference pair ran on its first day — is started only when its node boots: a crashed VM stayed down until
+  someone noticed. Restart-in-place under such a rule is **[H]** here until drilled.
 
 Open questions:
 
