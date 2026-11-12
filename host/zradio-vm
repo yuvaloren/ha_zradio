@@ -33,7 +33,10 @@
 #       --start             join the pair right away (systemctl start zradio.target in the VM). Without it the VM is
 #                           installed and stops there: it joins at `systemctl start zradio.target` or its next boot.
 #       --no-ha             do not make it a Proxmox HA resource (a node that is in no cluster needs this)
-#       --allow-no-radios   build the VM although no stick was found (a drill of the tool itself)
+#       --no-usb            pass no USB device through at all: a drill of the tool on a node whose sticks are in use.
+#                           The kit's installer in such a VM ends with "no stick found" — in a drill that line means
+#                           everything before it worked (the VM, cloud-init, the kit unpacked, its packages).
+#       --allow-no-radios   build the VM although this node has no stick the kit knows
 #       --image-dir URL     where the Debian image comes from (default https://cloud.debian.org/images/cloud/trixie/latest)
 #
 # What create --run does, in order (every step is re-checked; a VM that exists under this name is refused):
@@ -140,11 +143,11 @@ fi
 
 # ---------------------------------------------------------------------------------------------------------- create
 NAME="" SELF="" PEER="" VIP="" VRID=50 PRIORITY=100 BRIDGE=vmbr0 PAIR_BRIDGE="" GATEWAY="" PAIR_MAC="" VMID="" STORAGE="" SNIP=local
-MEMORY=2048 CORES=2 DISK=8G HOOK="" KEYS=${ZRADIO_VM_KEYS:-/root/.ssh/authorized_keys} FIRST=0 START=0 HA=1 NORADIOS=0
+MEMORY=2048 CORES=2 DISK=8G HOOK="" KEYS=${ZRADIO_VM_KEYS:-/root/.ssh/authorized_keys} FIRST=0 START=0 HA=1 NORADIOS=0 NOUSB=0
 IMAGE_DIR=https://cloud.debian.org/images/cloud/trixie/latest
 USBMAPS=() EXTRA=()
 while [ $# -gt 0 ]; do case "$1" in
-  --run) RUN=1; shift;; --first) FIRST=1; shift;; --start) START=1; shift;; --no-ha) HA=0; shift;; --allow-no-radios) NORADIOS=1; shift;;
+  --run) RUN=1; shift;; --first) FIRST=1; shift;; --start) START=1; shift;; --no-ha) HA=0; shift;; --allow-no-radios) NORADIOS=1; shift;; --no-usb) NOUSB=1; shift;;
   --name) NAME=$2; shift 2;; --self) SELF=$2; shift 2;; --peer) PEER=$2; shift 2;; --vip) VIP=$2; shift 2;; --vrid) VRID=$2; shift 2;;
   --priority) PRIORITY=$2; shift 2;; --bridge) BRIDGE=$2; shift 2;; --pair-bridge) PAIR_BRIDGE=$2; shift 2;; --gateway) GATEWAY=$2; shift 2;;
   --pair-mac) PAIR_MAC=$2; shift 2;; --vmid) VMID=$2; shift 2;; --storage) STORAGE=$2; shift 2;; --snippets) SNIP=$2; shift 2;;
@@ -167,6 +170,8 @@ if [ -z "$PAIR_BRIDGE" ]; then ip4 "$GATEWAY" || die "without --pair-bridge the 
 [[ "$MEMORY" =~ ^[0-9]{3,6}$ ]] && [[ "$CORES" =~ ^[0-9]{1,2}$ ]] && [[ "$DISK" =~ ^[0-9]+G$ ]] || die "--memory MB, --cores N, --disk <n>G"
 [ -z "$HOOK" ] || [[ "$HOOK" =~ ^[A-Za-z0-9_-]+:snippets/[A-Za-z0-9._-]+$ ]] || die "--hookscript '$HOOK': a volume id like local:snippets/my-hook.sh"
 for m in ${USBMAPS[@]+"${USBMAPS[@]}"}; do [[ "$m" =~ ^[A-Za-z][A-Za-z0-9_-]{0,60}$ ]] || die "--usb-mapping '$m'"; done
+[ $NOUSB = 0 ] || [ ${#USBMAPS[@]} -eq 0 ] || die "--no-usb and --usb-mapping contradict each other"
+[ $NOUSB = 0 ] || [ $START = 0 ] || die "--no-usb is a drill: a VM without a stick is not put into a pair (--start)"
 for e in ${EXTRA[@]+"${EXTRA[@]}"}; do
   [[ "$e" =~ ^[A-Z][A-Z0-9_]*=[A-Za-z0-9./:_@+-]*$ ]] || die "--conf '$e': KEY=value"
   case "${e%%=*}" in NAME|SELF|PEER|VIP|VRID|PRIORITY) die "--conf ${e%%=*}: that one has its own option";; esac
@@ -240,7 +245,9 @@ vm_with_usb() { # vm_with_usb running|idle <vid:pid> [<bus-port>]: prints the na
 USE=()            # the mapping ids the VM gets, in order
 DEVS=()           # the device behind each: "<vid:pid> <bus-port or ->"
 TODO=()           # "create <id> <vid:pid> <path|->" or "extend <id> <vid:pid> <path|->"
-if [ ${#USBMAPS[@]} -gt 0 ]; then
+if [ $NOUSB = 1 ]; then
+  warn "--no-usb: no USB device is passed through. This VM is a drill of the tool: its installer will end with 'no stick found'"
+elif [ ${#USBMAPS[@]} -gt 0 ]; then
   for m in "${USBMAPS[@]}"; do
     e=$(printf '%s\n' "$M" | awk -v m="$m" -v n="$NODE" '$1 == m && $2 == n { print $3; exit }')
     if [ -z "$e" ]; then bad "the USB mapping '$m' has no entry for $NODE (pvesh get /cluster/mapping/usb)"; continue; fi
@@ -394,8 +401,13 @@ done
 case "$st" in done|degraded) ok "cloud-init finished ($st)";; *) bad "cloud-init ended '${st:-no answer}' — in the VM: /var/log/cloud-init-output.log"; exit 1;; esac
 rc=$(gx 20 cat /root/zradio-install.rc | tr -dc 0-9)
 echo "   the installer's lines that are not OK (all of it: /var/log/zradio-install.log in the VM):"
-gx 30 cat /var/log/zradio-install.log | grep -vE '^   OK ' | sed 's/^/      | /'
-if [ "$rc" = 0 ]; then ok "the kit is installed in $NAME"; else bad "install.sh ended ${rc:-without a code} in $NAME — nothing was started there; fix, then in the VM: bash /opt/zradio/kit/guest/install.sh --run --detect"; exit 1; fi
+gx 30 cat /var/log/zradio-install.log | grep -vE '^ *OK ' | sed 's/^/      | /'
+if [ "$rc" = 0 ]; then ok "the kit is installed in $NAME"
+elif [ $NOUSB = 1 ] && gx 30 cat /var/log/zradio-install.log | grep -q "FAIL  zradio-detect did not end clean"; then
+  ok "the drill went as far as a VM without a stick can: the VM, cloud-init, the kit unpacked, its packages — and the installer stopped at the detection, with no stick to find"
+  echo "== a drill. To remove it: ha-manager remove vm:$VMID; ha-manager rules remove $NAME-on-$NODE; qm stop $VMID; qm destroy $VMID --purge; and the file $SNIPDIR/$NAME-zradio.yaml =="
+  exit 0
+else bad "install.sh ended ${rc:-without a code} in $NAME — nothing was started there; fix, then in the VM: bash /opt/zradio/kit/guest/install.sh --run --detect"; exit 1; fi
 addr=$(qm guest cmd "$VMID" network-get-interfaces 2>/dev/null | python3 -c '
 import json, sys
 try: ifs = json.load(sys.stdin)

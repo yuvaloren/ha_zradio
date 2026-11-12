@@ -19,7 +19,7 @@ node() { # node <dir> [sticks: both|none|twins|dark] [ha: 1|0]
   echo '[]' > "$d/usbmap.json"; echo '[]' > "$d/vms.json"
   echo '[{"storage":"local","type":"dir","content":"images,snippets,iso,vztmpl","path":"'"$d"'/store"},{"storage":"local-zfs","type":"zfspool","content":"images,rootdir"}]' > "$d/storages.json"
   echo "image-bytes" > "$d/cache/debian-13-generic-amd64.qcow2"; echo "abcdef0123456789abcdef" > "$d/cache/debian-13-generic-amd64.qcow2.sha512"
-  printf '   OK    keepalived installed\n   DONE  radios: zwave=synced (zwave-800) zigbee=synced (znp)\n   DONE  the sync key is at /etc/zradio/sync.key (0600). On the OTHER radio VM (10.20.30.5), as root, run:\n      zradio-sync trust --sync-key '"'"'ssh-ed25519 AAAAkey'"'"' --host-key '"'"'ssh-ed25519 AAAAhost'"'"'\n== installed. Next: … ==\n' > "$d/install.log"
+  printf '== 2. keepalived and ser2net (Debian'"'"'s packages) ==\nOK    keepalived 2.3.3 installed\nDONE  the radios are detected and named\nDONE  the sync key is at /etc/zradio/sync.key (0600). On the OTHER radio VM (10.20.30.5), as root, run:\n      zradio-sync trust --sync-key '"'"'ssh-ed25519 AAAAkey'"'"' --host-key '"'"'ssh-ed25519 AAAAhost'"'"'\n== installed. Next: … ==\n' > "$d/install.log"
   echo 0 > "$d/install.rc"; echo "done" > "$d/ci-status"; echo "$ha" > "$d/ha"
   local rec; rec="echo \"\$(basename \$0) \$*\" >> '$d/calls'"
   fake "$d/bin" id 'case "${1:-}" in -u) echo 0;; *) command -p id "$@";; esac'
@@ -115,7 +115,7 @@ if command -v cloud-init >/dev/null 2>&1; then
   check "…and the real cloud-init accepts the file (cloud-init schema)" bash -c 'cloud-init schema --config-file "$1" 2>&1 | grep -q "^Valid schema"' _ "$Y"
 else echo "  (cloud-init is not installed here: its schema check of the file is skipped)"; fi
 check "the VM carries that file, the tag and a description that says what it is" bash -c 'grep "^qm create" "$1/calls" | grep -q -- "--cicustom user=local:snippets/zr2-zradio.yaml .*--tags zradio --description zr2: one radio VM of a zradio pair"' _ "$T/c"
-check "the installer's result is shown: the radios it found and the line for the other VM; not its OK lines" bash -c 'grep -q "| *DONE  radios: zwave=synced" "$1/out" && grep -q "zradio-sync trust --sync-key" "$1/out" && ! grep -q "keepalived installed" "$1/out" && grep -q "the kit is installed in zr2" "$1/out"' _ "$T/c"
+check "the installer's result is shown: the radios it found and the line for the other VM; not its OK lines" bash -c 'grep -q "| DONE  the radios are detected and named" "$1/out" && grep -q "zradio-sync trust --sync-key" "$1/out" && ! grep -q "keepalived 2.3.3 installed" "$1/out" && grep -q "the kit is installed in zr2" "$1/out"' _ "$T/c"
 check "the VM's addresses are shown; without --start it is NOT put into the pair" bash -c 'grep -q "addresses: eth0 192.0.2.44, eth1 10.20.30.6" "$1/out" && grep -q "NOT in the pair yet" "$1/out" && ! grep -q "guest: systemctl start zradio.target" "$1/calls"' _ "$T/c"
 
 echo "-- options"
@@ -150,6 +150,21 @@ node "$T/m5" none; zvm "$T/m5" create "${BASE[@]}" --run
 check "no stick at all: refused, nothing changed" bash -c '[ "$2" = 1 ] && grep -q "no stick on nodea" "$1/out" && [ ! -s "$1/calls" ]' _ "$T/m5" "$RC"
 zvm "$T/m5" create "${BASE[@]}" --run --allow-no-radios
 check "--allow-no-radios (a drill): the VM is built without a USB line" bash -c '[ "$2" = 0 ] && grep -q "^qm create" "$1/calls" && ! grep -q "usb0" "$1/calls"' _ "$T/m5" "$RC"
+
+echo "-- --no-usb: a drill on a node whose sticks are in use"
+node "$T/d"; echo '[{"id":"zwave","map":["node=nodea,id=10c4:ea70"]},{"id":"zigbee","map":["node=nodea,id=10c4:ea60"]}]' > "$T/d/usbmap.json"; echo '[{"vmid":101,"name":"live1","node":"nodea","status":"running"}]' > "$T/d/vms.json"
+vmconf "$T/d" nodea/101 "usb0: mapping=zwave" "usb1: mapping=zigbee" "ipconfig1: ip=10.20.30.5/24"
+echo 1 > "$T/d/install.rc"; printf 'DONE  keepalived 2.3.3 installed\n    FAIL  no Z-Wave or Zigbee stick found on this VM\nFAIL  zradio-detect did not end clean — read its lines above\n' > "$T/d/install.log"
+zvm "$T/d" create --name zr-drill --self 10.20.30.77/24 --peer 10.20.30.78 --vip 10.20.30.79/24 --pair-bridge vmbrpair --no-usb --run
+check "the live VM holds both sticks; --no-usb builds beside it without a USB line and without touching a mapping" bash -c '[ "$2" = 0 ] && grep -q "^qm create 109 --name zr-drill" "$1/calls" && ! grep -q "usb0" "$1/calls" && ! grep -q "^pvesh" "$1/calls"' _ "$T/d" "$RC"
+check "the installer's \"no stick\" end is the drill's expected end: said so, exit 0, and how to remove the drill" bash -c 'grep -q "the drill went as far as a VM without a stick can" "$1/out" && grep -q "To remove it: ha-manager remove vm:109; ha-manager rules remove zr-drill-on-nodea; qm stop 109; qm destroy 109 --purge" "$1/out"' _ "$T/d" "$RC"
+check "the drill is under Proxmox HA like the real thing (the rule and the restart are what it is for)" bash -c 'grep -q "^ha-manager rules add node-affinity zr-drill-on-nodea .*--strict 1" "$1/calls" && grep -q "^ha-manager set vm:109 --state started" "$1/calls"' _ "$T/d"
+echo 1 > "$T/d/install.rc"; printf 'FAIL  apt-get install keepalived failed\n' > "$T/d/install.log"; echo '[{"vmid":101,"name":"live1","node":"nodea","status":"running"}]' > "$T/d/vms.json"
+zvm "$T/d" create --name zr-drill2 --self 10.20.30.77/24 --peer 10.20.30.78 --vip 10.20.30.79/24 --pair-bridge vmbrpair --no-usb --run
+check "the line the drill is recognised by is the one the kit's installer really prints when the detection fails" bash -c 'grep -q "bad \"zradio-detect did not end clean" "$1/guest/install.sh" && grep -q "printf .FAIL  %s" "$1/guest/install.sh"' _ "$KIT"
+check "a drill whose installer failed for ANOTHER reason is a failure" bash -c '[ "$2" = 1 ] && grep -q "install.sh ended 1 in zr-drill2" "$1/out"' _ "$T/d" "$RC"
+zvm "$T/d" create --name zr-drill3 --self 10.20.30.77/24 --peer 10.20.30.78 --vip 10.20.30.79/24 --pair-bridge vmbrpair --no-usb --start
+check "--no-usb with --start, or with --usb-mapping: refused" bash -c '[ "$2" = 2 ] && grep -q "is a drill" "$1/out"' _ "$T/d" "$RC"
 
 echo "-- refused before anything is changed"
 node "$T/x"; echo '[{"vmid":101,"name":"zr2","node":"nodeb","status":"stopped"}]' > "$T/x/vms.json"; zvm "$T/x" create "${BASE[@]}" --run
@@ -198,7 +213,7 @@ node "$T/f3"; : > "$T/f3/agent-down"; zvm "$T/f3" create "${BASE[@]}" --run
 check "the guest agent never answers: exit 1, where to look" bash -c '[ "$2" = 1 ] && grep -q "no guest agent in" "$1/out" && grep -q "qm terminal 109" "$1/out"' _ "$T/f3" "$RC"
 node "$T/f4"; echo error > "$T/f4/ci-status"; zvm "$T/f4" create "${BASE[@]}" --run --start
 check "cloud-init ends in error: exit 1, the VM is not put into the pair" bash -c '[ "$2" = 1 ] && grep -q "cloud-init ended .error." "$1/out" && ! grep -q "guest: systemctl start" "$1/calls"' _ "$T/f4" "$RC"
-node "$T/f5"; echo 1 > "$T/f5/install.rc"; printf '   FAIL  zradio-detect did not end clean\n== 1 FAIL ==\n' > "$T/f5/install.log"; zvm "$T/f5" create "${BASE[@]}" --run --start
+node "$T/f5"; echo 1 > "$T/f5/install.rc"; printf 'FAIL  zradio-detect did not end clean\n== 1 FAIL ==\n' > "$T/f5/install.log"; zvm "$T/f5" create "${BASE[@]}" --run --start
 check "the kit's installer failed in the VM: its FAIL line is shown, exit 1, the VM is not put into the pair" bash -c '[ "$2" = 1 ] && grep -q "| *FAIL  zradio-detect did not end clean" "$1/out" && grep -q "install.sh ended 1 in zr2" "$1/out" && ! grep -q "guest: systemctl start" "$1/calls"' _ "$T/f5" "$RC"
 
 echo "-- help"
