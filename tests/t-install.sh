@@ -81,7 +81,31 @@ check "the sync key is the same one" cmp -s "$T/w/key1" "$(R "$T/w" /etc/zradio/
 inst "$T/w" --run --detect --use zigbee=/dev/ttyUSB3
 check "--detect looks again, --use is passed on" has "$T/w/calls" "zradio-detect --write --use zigbee=/dev/ttyUSB3"
 
-echo "-- a new standby with blank sticks is marked 'not filled'; --first lifts that"
+echo "-- --role: the primary's sticks stay as they are; the standby does not serve before the primary's first sync"
+vm "$T/rs" both; inst "$T/rs" --conf "$T/rs/my.conf" --role standby --run
+check "standby whose sticks HOLD a network (an old copy, another house's): marked NOT FILLED all the same, and told what will be overwritten" bash -c '[ "$2" = 0 ] && [ -e "$1/root/var/lib/zradio/standby-dirty" ] && grep -q "WARN  this VM is the STANDBY: it is marked NOT FILLED" "$1/out" && grep -q "the zigbee zwave stick(s) hold a network today: it will be OVERWRITTEN" "$1/out"' _ "$T/rs" "$RC"
+sc0() { : > "$1/tty"; ZRADIO_RADIOS="$1/root/etc/zradio/radios.conf" ZRADIO_SERVE_STATE="$1/root/var/lib/zradio" ZRADIO_SERVE_RUN="$1/run" ZRADIO_SERVE_ZWAVE_TTY="$1/tty" ZRADIO_SERVE_ZIGBEE_TTY="$1/tty" bash "$KIT/guest/sbin/zradio-serve" check; }
+sc0 "$T/rs"; check "…zradio-serve check refuses to serve: that network cannot reach the air from here" eq "$?" 1
+echo '{"gen":"g1"}' > "$T/rs/root/var/lib/zradio/synced.json"; rm -f "$T/rs/root/var/lib/zradio/standby-dirty"; inst "$T/rs" --role standby --detect --run
+check "…a standby that a sync has filled is not marked again by a later install.sh --detect" bash -c '[ "$2" = 0 ] && [ ! -e "$1/root/var/lib/zradio/standby-dirty" ] && grep -q "filled by a sync before" "$1/out"' _ "$T/rs" "$RC"
+vm "$T/rs2" blank; inst "$T/rs2" --conf "$T/rs2/my.conf" --role standby --run
+check "standby with empty sticks: marked the same way" bash -c '[ "$2" = 0 ] && [ -e "$1/root/var/lib/zradio/standby-dirty" ] && grep -q "(the zigbee zwave stick(s) are empty)" "$1/out"' _ "$T/rs2" "$RC"
+vm "$T/rp" both; inst "$T/rp" --conf "$T/rp/my.conf" --role primary --run
+check "primary whose sticks hold the networks: not marked, said" bash -c '[ "$2" = 0 ] && [ ! -e "$1/root/var/lib/zradio/standby-dirty" ] && grep -q "OK    this VM is the PRIMARY: its zigbee zwave stick(s) hold the networks and stay as they are" "$1/out"' _ "$T/rp" "$RC"
+vm "$T/rp2" blank; inst "$T/rp2" --conf "$T/rp2/my.conf" --role primary --run
+check "primary whose sticks are EMPTY: refused — a new house says --first; devices on the other node means this one is the standby" bash -c '[ "$2" = 1 ] && grep -q "FAIL  this VM is to be the PRIMARY, but its zigbee zwave stick(s) hold no network" "$1/out" && grep -q "then that node is the primary and this one the standby" "$1/out" && ! grep -q "enable.*zradio.target" "$1/calls"' _ "$T/rp2" "$RC"
+check "…and it is left marked NOT FILLED: started by hand all the same, it does not serve the empty sticks" bash -c '[ -e "$1/root/var/lib/zradio/standby-dirty" ] && ! grep -q "this VM is the PRIMARY" "$1/out"' _ "$T/rp2"
+sc0 "$T/rp2"; check "…zradio-serve check says no" eq "$?" 1
+inst "$T/rp2" --role primary --first --detect --run
+check "…the same with --first (a new house): accepted, may serve" bash -c '[ "$2" = 0 ] && [ ! -e "$1/root/var/lib/zradio/standby-dirty" ] && grep -q "PRIMARY: --first: the zigbee zwave stick(s) hold no network yet" "$1/out"' _ "$T/rp2" "$RC"
+inst "$T/rp" --role standby --run
+check "a later run WITHOUT --detect does not change the role: said, the primary is not marked" bash -c '[ "$2" = 0 ] && grep -q "role standby is applied when the radios are looked at: nothing about the role was changed" "$1/out" && [ ! -e "$1/root/var/lib/zradio/standby-dirty" ]' _ "$T/rp" "$RC"
+vm "$T/rx"; inst "$T/rx" --conf "$T/rx/my.conf" --role standby --first --run
+check "--role standby --first: refused before anything" bash -c '[ "$2" = 2 ] && [ ! -s "$1/calls" ]' _ "$T/rx" "$RC"
+inst "$T/rx" --conf "$T/rx/my.conf" --role master --run
+check "--role that is neither primary nor standby: refused before anything" bash -c '[ "$2" = 2 ] && [ ! -s "$1/calls" ]' _ "$T/rx" "$RC"
+
+echo "-- without --role (as before): a new standby with blank sticks is marked 'not filled'; --first lifts that"
 vm "$T/b" blank; inst "$T/b" --conf "$T/b/my.conf" --run
 check "exit 0, the marker is there, and the reason is said" bash -c '[ "$2" = 0 ] && [ -e "$1/root/var/lib/zradio/standby-dirty" ] && grep -q "WARN  the zigbee zwave stick(s) here hold no network: this VM is marked NOT FILLED" "$1/out"' _ "$T/b" "$RC"
 sc() { : > "$1/tty"; ZRADIO_RADIOS="$1/root/etc/zradio/radios.conf" ZRADIO_SERVE_STATE="$1/root/var/lib/zradio" ZRADIO_SERVE_RUN="$1/run" ZRADIO_SERVE_ZWAVE_TTY="$1/tty" ZRADIO_SERVE_ZIGBEE_TTY="$1/tty" bash "$KIT/guest/sbin/zradio-serve" check; }

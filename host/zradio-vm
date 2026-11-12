@@ -8,14 +8,20 @@
 #       what is plugged into this node that the kit knows (read-only): the USB devices in guest/lib/usb-ids.json,
 #       and which USB mapping of the cluster names each on this node.
 #
-#   zradio-vm create --self A.B.C.D/NN --peer A.B.C.D --vip A.B.C.D/NN [--name NAME] [--run] [options]
+#   zradio-vm create --role primary|standby --self A.B.C.D/NN --peer A.B.C.D --vip A.B.C.D/NN [--name NAME] [--run] [options]
+#       --role primary      this node's radios are configured: its sticks hold your networks. They stay as they are
+#                           and this VM serves them. (A new house with no network yet: --role primary --first.)
+#       --role standby      this node's radios WILL BE WIPED: its sticks are overwritten with the primary's networks
+#                           at the first sync, whatever they hold now, and the VM does not serve before that.
+#                           Without --role the tool asks; with nobody to ask it refuses to guess.
 #       --name NAME         the VM's name and hostname (and NAME in its zradio.conf): yours to choose. Without it the
 #                           tool asks, offering the first of zradio1, zradio2, … that no VM in the cluster has (and
 #                           takes that one when nobody is there to ask).
 #       --self A.B.C.D/NN   this VM's own address on the network the pair talks over
 #       --peer A.B.C.D      the other radio VM's address there
 #       --vip A.B.C.D/NN    the floating address Home Assistant connects to
-#       --vrid N            the pair's virtual router id, 1-255 (default 50)      --priority N   1-254 (default 100)
+#       --vrid N            the pair's virtual router id, 1-255 (default 50)
+#       --priority N        1-254 (default: 110 for the primary, 100 for the standby; it only decides a tie)
 #       --bridge BR         net0: the LAN bridge (default vmbr0)
 #       --pair-bridge BR    a bridge of its own for the pair (a dedicated link between the nodes): net1 = --self there,
 #                           net0 = DHCP on --bridge. Without it the pair talks over the LAN: net0 = --self, and
@@ -31,7 +37,7 @@
 #       --hookscript VOLID  a hookscript of yours for the VM (for example one that switches the sticks' USB ports)
 #       --ssh-keys FILE     the public keys for root in the VM (default: this node's /root/.ssh/authorized_keys)
 #       --conf KEY=VALUE    one more line for the VM's zradio.conf (repeatable; zradio.conf.example names them)
-#       --first             this VM may serve sticks that hold no network yet (a brand-new pair; install.sh --first)
+#       --first             with --role primary: the sticks hold no network yet (Home Assistant forms it)
 #       --start             join the pair right away (systemctl start zradio.target in the VM). Without it the VM is
 #                           installed and stops there: it joins at `systemctl start zradio.target` or its next boot.
 #       --no-ha             do not make it a Proxmox HA resource (a node that is in no cluster needs this)
@@ -144,13 +150,13 @@ if [ "$MODE" = sticks ]; then
 fi
 
 # ---------------------------------------------------------------------------------------------------------- create
-NAME="" SELF="" PEER="" VIP="" VRID=50 PRIORITY=100 BRIDGE=vmbr0 PAIR_BRIDGE="" GATEWAY="" PAIR_MAC="" VMID="" STORAGE="" SNIP=local
+NAME="" ROLE="" SELF="" PEER="" VIP="" VRID=50 PRIORITY="" BRIDGE=vmbr0 PAIR_BRIDGE="" GATEWAY="" PAIR_MAC="" VMID="" STORAGE="" SNIP=local
 MEMORY=2048 CORES=2 DISK=8G HOOK="" KEYS=${ZRADIO_VM_KEYS:-/root/.ssh/authorized_keys} FIRST=0 START=0 HA=1 NORADIOS=0 NOUSB=0
 IMAGE_DIR=https://cloud.debian.org/images/cloud/trixie/latest
 USBMAPS=() EXTRA=()
 while [ $# -gt 0 ]; do case "$1" in
   --run) RUN=1; shift;; --first) FIRST=1; shift;; --start) START=1; shift;; --no-ha) HA=0; shift;; --allow-no-radios) NORADIOS=1; shift;; --no-usb) NOUSB=1; shift;;
-  --name) NAME=$2; shift 2;; --self) SELF=$2; shift 2;; --peer) PEER=$2; shift 2;; --vip) VIP=$2; shift 2;; --vrid) VRID=$2; shift 2;;
+  --name) NAME=$2; shift 2;; --role) ROLE=$2; shift 2;; --self) SELF=$2; shift 2;; --peer) PEER=$2; shift 2;; --vip) VIP=$2; shift 2;; --vrid) VRID=$2; shift 2;;
   --priority) PRIORITY=$2; shift 2;; --bridge) BRIDGE=$2; shift 2;; --pair-bridge) PAIR_BRIDGE=$2; shift 2;; --gateway) GATEWAY=$2; shift 2;;
   --pair-mac) PAIR_MAC=$2; shift 2;; --vmid) VMID=$2; shift 2;; --storage) STORAGE=$2; shift 2;; --snippets) SNIP=$2; shift 2;;
   --memory) MEMORY=$2; shift 2;; --cores) CORES=$2; shift 2;; --disk) DISK=$2; shift 2;; --hookscript) HOOK=$2; shift 2;;
@@ -164,7 +170,9 @@ ip4 "$PEER" || die "--peer '$PEER': the other radio VM's address"
 cidr "$VIP" || die "--vip '$VIP': the floating address as A.B.C.D/prefix"
 [ "${SELF%/*}" != "$PEER" ] && [ "${SELF%/*}" != "${VIP%/*}" ] && [ "$PEER" != "${VIP%/*}" ] || die "--self, --peer and --vip are three different addresses"
 [[ "$VRID" =~ ^[0-9]+$ ]] && [ "$VRID" -ge 1 ] && [ "$VRID" -le 255 ] || die "--vrid '$VRID': 1-255"
-[[ "$PRIORITY" =~ ^[0-9]+$ ]] && [ "$PRIORITY" -ge 1 ] && [ "$PRIORITY" -le 254 ] || die "--priority '$PRIORITY': 1-254"
+[ -z "$PRIORITY" ] || { [[ "$PRIORITY" =~ ^[0-9]+$ ]] && [ "$PRIORITY" -ge 1 ] && [ "$PRIORITY" -le 254 ]; } || die "--priority '$PRIORITY': 1-254"
+case "$ROLE" in ""|primary|standby) ;; *) die "--role '$ROLE': primary (this node's radios are configured) or standby (this node's radios will be wiped)";; esac
+[ "$ROLE" != standby ] || [ $FIRST = 0 ] || die "--first is for the primary of a new house: a standby's sticks are filled by the primary's sync"
 [[ "$BRIDGE" =~ ^[a-zA-Z][a-zA-Z0-9._-]{0,14}$ ]] || die "--bridge '$BRIDGE'"
 [ -z "$PAIR_BRIDGE" ] || [[ "$PAIR_BRIDGE" =~ ^[a-zA-Z][a-zA-Z0-9._-]{0,14}$ ]] || die "--pair-bridge '$PAIR_BRIDGE'"
 if [ -z "$PAIR_BRIDGE" ]; then ip4 "$GATEWAY" || die "without --pair-bridge the pair talks over the LAN on net0: --gateway A.B.C.D is needed with --self"; fi
@@ -175,6 +183,7 @@ if [ -z "$PAIR_BRIDGE" ]; then ip4 "$GATEWAY" || die "without --pair-bridge the 
 for m in ${USBMAPS[@]+"${USBMAPS[@]}"}; do [[ "$m" =~ ^[A-Za-z][A-Za-z0-9_-]{0,60}$ ]] || die "--usb-mapping '$m'"; done
 [ $NOUSB = 0 ] || [ ${#USBMAPS[@]} -eq 0 ] || die "--no-usb and --usb-mapping contradict each other"
 [ $NOUSB = 0 ] || [ $START = 0 ] || die "--no-usb is a drill: a VM without a stick is not put into a pair (--start)"
+[ $NOUSB = 0 ] || [ -n "$ROLE" ] || ROLE=standby          # a drill has no radios: the harmless role
 for e in ${EXTRA[@]+"${EXTRA[@]}"}; do
   [[ "$e" =~ ^[A-Z][A-Z0-9_]*=[A-Za-z0-9./:_@+-]*$ ]] || die "--conf '$e': KEY=value"
   case "${e%%=*}" in NAME|SELF|PEER|VIP|VRID|PRIORITY) die "--conf ${e%%=*}: that one has its own option";; esac
@@ -183,7 +192,27 @@ done
 command -v qm >/dev/null 2>&1 && command -v pvesh >/dev/null 2>&1 || die "no qm / pvesh here: this runs on a Proxmox VE node"
 for f in install.sh sbin/zradio-serve lib/zradio-common.sh units/zradio.target; do [ -r "$KIT/guest/$f" ] || die "the kit's guest/$f is missing next to this tool"; done
 
+ASK=0; if { [ -t 0 ] && [ -t 1 ]; } || [ "${ZRADIO_VM_ASK:-0}" = 1 ]; then ASK=1; fi
+if [ -z "$ROLE" ]; then                  # the one question nobody can answer for the user
+  [ $ASK = 1 ] || die "say which this node is: --role primary (its radios are configured: the sticks here hold your networks) or --role standby (its radios will be wiped: the sticks here are overwritten with the primary's networks)"
+  echo "   Is this node the PRIMARY or the STANDBY of the pair?"
+  echo "      primary  its radios are configured: the sticks here hold your networks. They stay as they are."
+  echo "      standby  its radios WILL BE WIPED: the sticks here are overwritten with the primary's networks."
+  while :; do
+    printf '   primary or standby: '; read -r ans || die "no answer: --role primary or --role standby"
+    case "${ans,,}" in primary|p) ROLE=primary; break;; standby|s) ROLE=standby; break;; esac
+  done
+  if [ "$ROLE" = primary ] && [ $FIRST = 0 ]; then
+    printf '   Do the sticks here already hold your Z-Wave / Zigbee networks? [Y/n] (n: a new house, nothing paired yet): '; read -r ans || ans=""
+    case "${ans,,}" in n|no) FIRST=1;; esac
+  fi
+fi
+[ -n "$PRIORITY" ] || { [ "$ROLE" = primary ] && PRIORITY=110 || PRIORITY=100; }
 echo "== 0. checks ($NODE; $([ $RUN = 1 ] && echo RUN || echo "report only: nothing is changed")) =="
+case "$ROLE" in
+  primary) ok "this node is the PRIMARY: $([ $FIRST = 1 ] && echo "a new house — its sticks hold no network yet, Home Assistant forms it" || echo "its sticks hold your networks and stay as they are (the installer in the VM checks that they do)")";;
+  standby) [ $NOUSB = 1 ] || warn "this node is the STANDBY: its sticks WILL BE OVERWRITTEN with the primary's networks at the first sync, whatever they hold now; the VM does not serve before that";;
+esac
 VMS=$(vm_lines)
 [ -n "$VMS" ] || warn "the cluster lists no VM at all (pvesh get /cluster/resources): the name and address checks have nothing to look at"
 if [ -z "$NAME" ]; then                 # the name is the user's: offered, asked for when someone is there
@@ -191,7 +220,7 @@ if [ -z "$NAME" ]; then                 # the name is the user's: offered, asked
     printf '%s\n' "$VMS" | awk -v n="zradio$i" '$2 == n { f = 1 } END { exit !f }' || { NAME="zradio$i"; break; }
   done
   [ -n "$NAME" ] || die "zradio1 … zradio9 are all taken: name this VM with --name"
-  if { [ -t 0 ] && [ -t 1 ]; } || [ "${ZRADIO_VM_ASK:-0}" = 1 ]; then
+  if [ $ASK = 1 ]; then
     while :; do
       printf '   the name of this node'"'"'s radio VM [%s]: ' "$NAME"; read -r ans || ans=""
       [ -n "$ans" ] || break
@@ -328,7 +357,7 @@ else would "download $IMAGE_DIR/$IMAGE_NAME and SHA512SUMS, check, keep under $C
 
 echo "== 3. the cloud-init file $SNIPDIR/$NAME-zradio.yaml =="
 mk_user_data() {
-  local kit64 inst="bash /opt/zradio/kit/guest/install.sh --conf /root/zradio.conf --run --detect"
+  local kit64 inst="bash /opt/zradio/kit/guest/install.sh --conf /root/zradio.conf --run --detect --role $ROLE"
   [ $FIRST = 0 ] || inst="$inst --first"
   kit64=$(tar -C "$KIT" --owner=0 --group=0 --sort=name -czf - guest zradio.conf.example | base64 -w 76 | sed 's/^/      /')
   cat <<EOF
@@ -370,9 +399,9 @@ EOF
 }
 if [ $RUN = 1 ]; then
   mkdir -p "$SNIPDIR" && mk_user_data > "$SNIPDIR/$NAME-zradio.yaml.tmp" && mv -f "$SNIPDIR/$NAME-zradio.yaml.tmp" "$SNIPDIR/$NAME-zradio.yaml" \
-    && done_ "$SNIPDIR/$NAME-zradio.yaml ($(wc -c < "$SNIPDIR/$NAME-zradio.yaml" | tr -d ' ') bytes: the kit's guest folder, zradio.conf, install.sh --run --detect$([ $FIRST = 1 ] && echo ' --first'))" \
+    && done_ "$SNIPDIR/$NAME-zradio.yaml ($(wc -c < "$SNIPDIR/$NAME-zradio.yaml" | tr -d ' ') bytes: the kit's guest folder, zradio.conf, install.sh --run --detect --role $ROLE$([ $FIRST = 1 ] && echo ' --first'))" \
     || { bad "could not write $SNIPDIR/$NAME-zradio.yaml"; exit 1; }
-else would "write $SNIPDIR/$NAME-zradio.yaml: root's keys, qemu-guest-agent, the kit's guest folder, zradio.conf (NAME=$NAME SELF=${SELF%/*} PEER=$PEER VIP=$VIP VRID=$VRID PRIORITY=$PRIORITY${EXTRA[*]:+ ${EXTRA[*]}}), install.sh --run --detect$([ $FIRST = 1 ] && echo ' --first')"; fi
+else would "write $SNIPDIR/$NAME-zradio.yaml: root's keys, qemu-guest-agent, the kit's guest folder, zradio.conf (NAME=$NAME SELF=${SELF%/*} PEER=$PEER VIP=$VIP VRID=$VRID PRIORITY=$PRIORITY${EXTRA[*]:+ ${EXTRA[*]}}), install.sh --run --detect --role $ROLE$([ $FIRST = 1 ] && echo ' --first')"; fi
 
 echo "== 4. the VM $NAME ($VMID) =="
 NETS=(--net0 "virtio,bridge=$BRIDGE")
@@ -419,12 +448,12 @@ case "$st" in done|degraded) ok "cloud-init finished ($st)";; *) bad "cloud-init
 rc=$(gx 20 cat /root/zradio-install.rc | tr -dc 0-9)
 echo "   the installer's lines that are not OK (all of it: /var/log/zradio-install.log in the VM):"
 gx 30 cat /var/log/zradio-install.log | grep -vE '^ *OK ' | sed 's/^/      | /'
-if [ "$rc" = 0 ]; then ok "the kit is installed in $NAME"
+if [ "$rc" = 0 ]; then ok "the kit is installed in $NAME, as the $ROLE"
 elif [ $NOUSB = 1 ] && gx 30 cat /var/log/zradio-install.log | grep -q "FAIL  zradio-detect did not end clean"; then
   ok "the drill went as far as a VM without a stick can: the VM, cloud-init, the kit unpacked, its packages — and the installer stopped at the detection, with no stick to find"
   echo "== a drill. To remove it: $([ $HA = 1 ] && echo "ha-manager rules remove $NAME-on-$NODE; ha-manager remove vm:$VMID; ")qm stop $VMID; qm destroy $VMID --purge; and the file $SNIPDIR/$NAME-zradio.yaml =="
   exit 0
-else bad "install.sh ended ${rc:-without a code} in $NAME — nothing was started there; fix, then in the VM: bash /opt/zradio/kit/guest/install.sh --run --detect"; exit 1; fi
+else bad "install.sh ended ${rc:-without a code} in $NAME — nothing was started there; fix, then in the VM: bash /opt/zradio/kit/guest/install.sh --run --detect --role $ROLE$([ "$ROLE" = primary ] && echo " (with --first when its sticks hold no network yet)")"; exit 1; fi
 addr=$(qm guest cmd "$VMID" network-get-interfaces 2>/dev/null | python3 -c '
 import json, sys
 try: ifs = json.load(sys.stdin)

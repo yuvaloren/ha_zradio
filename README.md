@@ -64,7 +64,14 @@ docs/DESIGN.md            how it works and why; what is not built
 You need two Proxmox nodes in one cluster, each with its own set of sticks; three free addresses on a network both
 radio VMs and Home Assistant are on (one per VM, one floating); and this repository on each node (`git clone`, as root).
 
-**1. On the first node** — the one whose sticks hold your networks today, if any do:
+Each node is installed as one of two things, and the installer asks which:
+
+| | its radios | what happens to them |
+|---|---|---|
+| **primary** | are configured: the sticks on this node hold your networks | nothing. They stay as they are, and this VM serves them |
+| **standby** | **will be wiped** | the first sync overwrites them with the primary's networks, whatever they hold. Until then this VM does not serve |
+
+**1. On the primary's node** — the one whose sticks your devices are paired to:
 
 ```
 cd ha_zradio
@@ -72,35 +79,46 @@ host/zradio-vm sticks
 host/zradio-vm create --self 192.0.2.11/24 --peer 192.0.2.12 --vip 192.0.2.10/24 --gateway 192.0.2.1
 ```
 
-`sticks` lists the Z-Wave and Zigbee sticks it sees and changes nothing. `create` asks what the VM shall be called
-(Enter takes `zradio1`; `--name` says it up front) and then reports every step it would take. Read it, then run the
-same line with `--run`. Some minutes later it shows what the installer in the VM found — which stick is what, and
-whether each will be *synced* or only *served* — and one `zradio-sync trust …` line.
+`sticks` lists the Z-Wave and Zigbee sticks it sees and changes nothing. `create` asks **primary or standby** (answer
+`primary` here; `--role primary` says it up front) and what the VM shall be called (Enter takes `zradio1`; `--name`
+says it up front), and then reports every step it would take. Read it, then run the same line with `--run`. Some
+minutes later it shows what the installer in the VM found — which stick is what, and whether each will be *synced* or
+only *served* — and one `zradio-sync trust …` line.
+
+The installer in the VM checks the answer against the sticks: a primary whose sticks turn out to hold no network is
+refused and left unable to serve, because that answer was meant for the other node (or the house is new, below).
+It cannot check the other mistake — `standby` said on the node that holds your networks. It names the sticks that
+hold a network and says they will be overwritten; read that line before the pair is started.
 
 - The pair on a link of its own between the nodes instead of the LAN: `--pair-bridge <bridge>` in place of `--gateway`.
 - A VM that has the sticks today (a Z-Wave JS or Zigbee2MQTT VM, Home Assistant itself) must be shut down or have the
   sticks taken out of it first; the tool refuses while a running VM holds them.
-- Sticks that hold **no** network yet (a new house): add `--first` on this node only.
+- A new house, no device paired yet: still `primary`, and answer `n` when it asks whether the sticks hold your
+  networks (`--role primary --first`). Home Assistant forms the networks on this node's sticks.
 
-**2. On the second node**, the same with the two addresses swapped and a lower priority:
+**2. On the standby's node**, the same with the two addresses swapped:
 
 ```
-host/zradio-vm create --self 192.0.2.12/24 --peer 192.0.2.11 --vip 192.0.2.10/24 --gateway 192.0.2.1 --priority 90 --run
+host/zradio-vm create --role standby --self 192.0.2.12/24 --peer 192.0.2.11 --vip 192.0.2.10/24 --gateway 192.0.2.1 --run
 ```
+
+When nobody is there to answer (a script, a pipe), `--role` must be said: the tool does not guess it.
 
 **3. Introduce the two VMs to each other.** Each `create` ended with a `zradio-sync trust …` line: run the first VM's
 line in the second VM and the second's in the first. A command gets into a VM by `ssh root@<its address>` (root's keys
 are the node's own `authorized_keys`) or, on its node, as `qm guest exec <id> -- <the command>`.
 
-**4. Start the pair**, in the VM whose sticks hold your networks first, then in the other:
+**4. Start the pair**, in each VM:
 
 ```
 systemctl start zradio.target
 zradio-serve status
 ```
 
-The first serves; within 15 minutes it writes its networks onto the second VM's sticks (`zradio-sync run` does it
-now). A VM with blank sticks cannot take the radios before that.
+The primary serves; within 15 minutes it writes its networks onto the standby's sticks (`zradio-sync run` on the
+primary does it now). The standby cannot take the radios before that, in whichever order the two are started. After
+that first sync the two are equals: either serves, and "primary" was only the word for who held the networks on
+the day of the install (it also starts with the higher priority, 110 against 100, so it wins a tie).
 
 **5. Point Home Assistant at the floating address:** Z-Wave JS `tcp://192.0.2.10:6639`, ZHA `socket://192.0.2.10:6638`.
 
@@ -113,8 +131,9 @@ On any two Debian 13 machines that have the sticks (the *generic* cloud image if
 no USB), a fixed address each, and a network shared with each other and with Home Assistant:
 
 1. Copy `zradio.conf.example`, fill it in (two addresses, the floating address, a name) — once per machine.
-2. On **each**, as root: `bash guest/install.sh --conf zradio.conf` reads back what it would do; add `--run` to do
-   it. It installs the packages, detects the sticks, and starts nothing.
+2. On **each**, as root: `bash guest/install.sh --conf zradio.conf --role primary` (or `--role standby`, the table
+   above) reads back what it would do; add `--run` to do it. It installs the packages, detects the sticks, and
+   starts nothing.
 3. Then steps 3 to 5 above.
 
 ## Day to day (on a radio VM, as root)
@@ -150,7 +169,8 @@ tried with devices.**
 It makes the VM from Debian 13's cloud image, passes this node's sticks through (Proxmox USB mappings; the VM finds
 out by itself which stick is what), installs the kit inside by cloud-init, makes the VM a Proxmox HA resource with a
 **strict** node rule — Proxmox restarts it here and never moves it onto the other node's sticks — and only then starts
-it. The VM joins the pair at `systemctl start zradio.target` (or with `--start`). `--usb-mapping ID` uses USB mappings
+it. The VM joins the pair at `systemctl start zradio.target` (or with `--start`). `--role primary|standby` is the
+question above, answered up front; `--priority` overrides what the role gives. `--usb-mapping ID` uses USB mappings
 you already have; `--hookscript` attaches a hookscript of yours; `--vmid`, `--storage`, `--memory`, `--cores`, `--disk`
 are what they say; `--no-usb` builds a VM without sticks, to try the tool beside a running setup.
 
