@@ -8,8 +8,10 @@
 #       what is plugged into this node that the kit knows (read-only): the USB devices in guest/lib/usb-ids.json,
 #       and which USB mapping of the cluster names each on this node.
 #
-#   zradio-vm create --name NAME --self A.B.C.D/NN --peer A.B.C.D --vip A.B.C.D/NN [--run] [options]
-#       --name NAME         the VM's name and hostname (and NAME in its zradio.conf)
+#   zradio-vm create --self A.B.C.D/NN --peer A.B.C.D --vip A.B.C.D/NN [--name NAME] [--run] [options]
+#       --name NAME         the VM's name and hostname (and NAME in its zradio.conf): yours to choose. Without it the
+#                           tool asks, offering the first of zradio1, zradio2, … that no VM in the cluster has (and
+#                           takes that one when nobody is there to ask).
 #       --self A.B.C.D/NN   this VM's own address on the network the pair talks over
 #       --peer A.B.C.D      the other radio VM's address there
 #       --vip A.B.C.D/NN    the floating address Home Assistant connects to
@@ -155,7 +157,8 @@ while [ $# -gt 0 ]; do case "$1" in
   --ssh-keys) KEYS=$2; shift 2;; --image-dir) IMAGE_DIR=$2; shift 2;; --usb-mapping) USBMAPS+=("$2"); shift 2;; --conf) EXTRA+=("$2"); shift 2;;
   *) echo "unknown arg: $1 (zradio-vm --help)" >&2; exit 2;; esac; done
 die() { echo "die: $*" >&2; exit 2; }
-[[ "$NAME" =~ ^[a-z][a-z0-9-]{0,30}$ ]] || die "--name '$NAME': a short lower-case name"
+name_ok() { [[ "$1" =~ ^[a-z][a-z0-9-]{0,30}$ ]]; }
+[ -z "$NAME" ] || name_ok "$NAME" || die "--name '$NAME': a short lower-case name (letters, digits, -)"
 cidr "$SELF" || die "--self '$SELF': this VM's address as A.B.C.D/prefix"
 ip4 "$PEER" || die "--peer '$PEER': the other radio VM's address"
 cidr "$VIP" || die "--vip '$VIP': the floating address as A.B.C.D/prefix"
@@ -183,6 +186,20 @@ for f in install.sh sbin/zradio-serve lib/zradio-common.sh units/zradio.target; 
 echo "== 0. checks ($NODE; $([ $RUN = 1 ] && echo RUN || echo "report only: nothing is changed")) =="
 VMS=$(vm_lines)
 [ -n "$VMS" ] || warn "the cluster lists no VM at all (pvesh get /cluster/resources): the name and address checks have nothing to look at"
+if [ -z "$NAME" ]; then                 # the name is the user's: offered, asked for when someone is there
+  for i in 1 2 3 4 5 6 7 8 9; do
+    printf '%s\n' "$VMS" | awk -v n="zradio$i" '$2 == n { f = 1 } END { exit !f }' || { NAME="zradio$i"; break; }
+  done
+  [ -n "$NAME" ] || die "zradio1 … zradio9 are all taken: name this VM with --name"
+  if { [ -t 0 ] && [ -t 1 ]; } || [ "${ZRADIO_VM_ASK:-0}" = 1 ]; then
+    while :; do
+      printf '   the name of this node'"'"'s radio VM [%s]: ' "$NAME"; read -r ans || ans=""
+      [ -n "$ans" ] || break
+      if name_ok "$ans"; then NAME=$ans; break; fi
+      echo "         a short lower-case name (letters, digits, -), please"
+    done
+  else warn "no --name: this VM is called $NAME (the first free of zradio1, zradio2, …)"; fi
+fi
 if printf '%s\n' "$VMS" | awk -v n="$NAME" '$2 == n { f = 1 } END { exit !f }'; then
   bad "a VM named $NAME exists already ($(printf '%s\n' "$VMS" | awk -v n="$NAME" '$2 == n { print "on " $3 ", " $4 }')). This tool builds a new VM and never rebuilds one: pick another name, or remove that VM yourself first"
 else ok "no VM is named $NAME"; fi

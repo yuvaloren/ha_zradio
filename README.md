@@ -59,20 +59,63 @@ tools/                    maintenance (the USB list)
 docs/DESIGN.md            how it works and why; what is not built
 ```
 
-## Installing by hand (until the Proxmox helper exists)
+## Installing
 
-You need two Proxmox nodes, each with its own set of sticks, and on each node a Debian 13 VM (the *generic* cloud
-image: the `-cloud` kernel has no USB) with the node's sticks passed through, a fixed address, and a network it shares
-with the other VM and with Home Assistant.
+You need two Proxmox nodes in one cluster, each with its own set of sticks; three free addresses on a network both
+radio VMs and Home Assistant are on (one per VM, one floating); and this repository on each node (`git clone`, as root).
 
-1. Copy `zradio.conf.example`, fill it in (two addresses, the floating address, a name) — once per VM.
-2. On **each** VM, as root: `bash guest/install.sh --conf zradio.conf` reads back what it would do; add `--run` to do
+**1. On the first node** — the one whose sticks hold your networks today, if any do:
+
+```
+cd ha_zradio
+host/zradio-vm sticks
+host/zradio-vm create --self 192.0.2.11/24 --peer 192.0.2.12 --vip 192.0.2.10/24 --gateway 192.0.2.1
+```
+
+`sticks` lists the Z-Wave and Zigbee sticks it sees and changes nothing. `create` asks what the VM shall be called
+(Enter takes `zradio1`; `--name` says it up front) and then reports every step it would take. Read it, then run the
+same line with `--run`. Some minutes later it shows what the installer in the VM found — which stick is what, and
+whether each will be *synced* or only *served* — and one `zradio-sync trust …` line.
+
+- The pair on a link of its own between the nodes instead of the LAN: `--pair-bridge <bridge>` in place of `--gateway`.
+- A VM that has the sticks today (a Z-Wave JS or Zigbee2MQTT VM, Home Assistant itself) must be shut down or have the
+  sticks taken out of it first; the tool refuses while a running VM holds them.
+- Sticks that hold **no** network yet (a new house): add `--first` on this node only.
+
+**2. On the second node**, the same with the two addresses swapped and a lower priority:
+
+```
+host/zradio-vm create --self 192.0.2.12/24 --peer 192.0.2.11 --vip 192.0.2.10/24 --gateway 192.0.2.1 --priority 90 --run
+```
+
+**3. Introduce the two VMs to each other.** Each `create` ended with a `zradio-sync trust …` line: run the first VM's
+line in the second VM and the second's in the first. A command gets into a VM by `ssh root@<its address>` (root's keys
+are the node's own `authorized_keys`) or, on its node, as `qm guest exec <id> -- <the command>`.
+
+**4. Start the pair**, in the VM whose sticks hold your networks first, then in the other:
+
+```
+systemctl start zradio.target
+zradio-serve status
+```
+
+The first serves; within 15 minutes it writes its networks onto the second VM's sticks (`zradio-sync run` does it
+now). A VM with blank sticks cannot take the radios before that.
+
+**5. Point Home Assistant at the floating address:** Z-Wave JS `tcp://192.0.2.10:6639`, ZHA `socket://192.0.2.10:6638`.
+
+What this leaves to you today, and is meant to go away (see "Not built yet"): choosing the three addresses, typing them
+on both nodes, and step 3.
+
+### Without Proxmox's help
+
+On any two Debian 13 machines that have the sticks (the *generic* cloud image if it is a VM: the `-cloud` kernel has
+no USB), a fixed address each, and a network shared with each other and with Home Assistant:
+
+1. Copy `zradio.conf.example`, fill it in (two addresses, the floating address, a name) — once per machine.
+2. On **each**, as root: `bash guest/install.sh --conf zradio.conf` reads back what it would do; add `--run` to do
    it. It installs the packages, detects the sticks, and starts nothing.
-3. Each run ends by printing a `zradio-sync trust …` line. Run VM A's line on VM B and B's on A.
-4. `systemctl start zradio.target` on the VM whose sticks hold your networks **first**; then on the other. The first
-   serves; its 15-minute tick fills the second VM's sticks. A new VM with blank sticks cannot take the radios before
-   it is filled (the installer marks it; `--first` is for a pair that starts with no network at all).
-5. Point Home Assistant at the floating address: Z-Wave JS `tcp://<VIP>:6639`, ZHA `socket://<VIP>:6638`.
+3. Then steps 3 to 5 above.
 
 ## Day to day (on a radio VM, as root)
 
@@ -102,22 +145,14 @@ know what it costs — a VM that boots with nobody answering serves after `ELECT
 instead of after 4 s, and a VM with an older copy whose peer disappears after that wait plus up to half a minute. **It has not run on a radio VM, and its handling of the Zigbee frame counter has not been
 tried with devices.**
 
-## A radio VM from nothing: `host/zradio-vm`
-
-On each Proxmox node, as root, from a checkout of this repository:
-
-```
-host/zradio-vm sticks                     # what is plugged into this node that the kit knows; changes nothing
-host/zradio-vm create --name zradio1 --self 192.0.2.11/24 --peer 192.0.2.12 --vip 192.0.2.10/24 --gateway 192.0.2.1
-host/zradio-vm create …the same… --run    # without --run it only says what it would do
-```
+## What `host/zradio-vm create` does
 
 It makes the VM from Debian 13's cloud image, passes this node's sticks through (Proxmox USB mappings; the VM finds
 out by itself which stick is what), installs the kit inside by cloud-init, makes the VM a Proxmox HA resource with a
 **strict** node rule — Proxmox restarts it here and never moves it onto the other node's sticks — and only then starts
-it. It ends by showing what the installer found and the `zradio-sync trust` line for the other VM. The VM joins the
-pair at `systemctl start zradio.target` (or with `--start`). `--pair-bridge BR` puts the pair's traffic on a link of
-its own; `--usb-mapping ID` uses mappings you already have; `--hookscript` attaches a hookscript of yours.
+it. The VM joins the pair at `systemctl start zradio.target` (or with `--start`). `--usb-mapping ID` uses USB mappings
+you already have; `--hookscript` attaches a hookscript of yours; `--vmid`, `--storage`, `--memory`, `--cores`, `--disk`
+are what they say; `--no-usb` builds a VM without sticks, to try the tool beside a running setup.
 
 It refuses, before anything is changed, a name or id that is taken, a **running** VM that already uses the address or
 one of the sticks, a missing key for root, and a node without Proxmox HA unless `--no-ha` is said. It never rebuilds
@@ -126,7 +161,8 @@ a site with a hub that can switch ports brings its own hookscript for now).
 
 ## Not built yet
 
-- **One command per node and a pairing code** instead of the config file and the two `trust` lines (phase 2).
+- **Nothing typed twice, nothing pasted** (phase 2): the first node proposes free addresses, the second node finds
+  the first VM in the cluster and takes everything from it, and the two VMs are introduced without the `trust` lines.
 - **The Home Assistant integration**: status, "sync now", "switch", a sync without the pause, repair notices (phase 3).
 - **More families synced**: Silicon Labs EZSP first; Zigbee2MQTT (phase 4). These need hardware this project does
   not have: reports are what moves a family from "served" to "synced".

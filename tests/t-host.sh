@@ -129,6 +129,17 @@ check "--no-ha: a plain qm start, no ha-manager call" bash -c 'grep -q "^qm star
 zvm "$T/o2" create --name zr3 --self 192.0.2.6/24 --peer 192.0.2.5 --vip 192.0.2.50/24
 check "no --pair-bridge and no --gateway: refused before anything (exit 2)" bash -c '[ "$2" = 2 ] && grep -q "gateway A.B.C.D is needed" "$1/out"' _ "$T/o2" "$RC"
 
+echo "-- the VM's name is the user's: a flag, a question, or the first free default"
+NONAME=(--self 10.20.30.6/24 --peer 10.20.30.5 --vip 10.20.30.50/24 --pair-bridge vmbrpair)
+node "$T/n1"; zvm "$T/n1" create "${NONAME[@]}" --run
+check "no --name and nobody to ask: zradio1, said" bash -c '[ "$2" = 0 ] && grep -q "NOTE  no --name: this VM is called zradio1" "$1/out" && grep -q "^qm create 109 --name zradio1 " "$1/calls" && [ -f "$1/store/snippets/zradio1-zradio.yaml" ] && grep -q "^      NAME=zradio1$" "$1/store/snippets/zradio1-zradio.yaml"' _ "$T/n1" "$RC"
+node "$T/n2"; echo '[{"vmid":105,"name":"zradio1","node":"nodeb","status":"running"}]' > "$T/n2/vms.json"; zvm "$T/n2" create "${NONAME[@]}" --run
+check "…the second node of a pair: zradio1 exists in the cluster, this one is zradio2" bash -c '[ "$2" = 0 ] && grep -q "^qm create 109 --name zradio2 " "$1/calls"' _ "$T/n2" "$RC"
+node "$T/n3"; printf 'Kitchen Radio\nattic-radio\n' | PATH="$T/n3/bin:$PATH" ZRADIO_VM_ASK=1 ZRADIO_VM_SYS="$T/n3/sys" ZRADIO_VM_PVE="$T/n3/pve" ZRADIO_VM_CACHE="$T/n3/cache" ZRADIO_VM_WAIT=0 ZRADIO_VM_KEYS="$T/n3/keys" bash "$TOOL" create "${NONAME[@]}" --run > "$T/n3/out" 2>&1; RC=$?
+check "someone is there: asked, with the default shown; a name that will not do is asked again; the answer is the name everywhere" bash -c '[ "$2" = 0 ] && grep -q "the name of this node.s radio VM \[zradio1\]: " "$1/out" && grep -q "a short lower-case name" "$1/out" && grep -q "^qm create 109 --name attic-radio " "$1/calls" && grep -q "^hostname: attic-radio$" "$1/store/snippets/attic-radio-zradio.yaml" && grep -q "rules add node-affinity attic-radio-on-nodea" "$1/calls"' _ "$T/n3" "$RC"
+node "$T/n4"; printf '\n' | PATH="$T/n4/bin:$PATH" ZRADIO_VM_ASK=1 ZRADIO_VM_SYS="$T/n4/sys" ZRADIO_VM_PVE="$T/n4/pve" ZRADIO_VM_CACHE="$T/n4/cache" ZRADIO_VM_WAIT=0 ZRADIO_VM_KEYS="$T/n4/keys" bash "$TOOL" create "${NONAME[@]}" > "$T/n4/out" 2>&1; RC=$?
+check "…Enter takes the default; in report mode nothing is made" bash -c '[ "$2" = 0 ] && grep -q "WOULD qm create 109 --name zradio1 " "$1/out" && [ ! -s "$1/calls" ]' _ "$T/n4" "$RC"
+
 echo "-- USB mappings: yours, the cluster's, twins"
 # (the JSON as a PVE 9.2 cluster prints it: description, digest and type beside id and map; resources with their other fields)
 node "$T/m"; echo '[{"description":"a Zigbee stick; per-node entry","digest":"bebca8ef7d2cfaacc993da4be2368544977c2c14","id":"zigbee","map":["node=nodea,id=10c4:ea60"],"type":"usb"},{"description":"a Z-Wave stick","digest":"bebca8ef7d2cfaacc993da4be2368544977c2c14","id":"zwave","map":["node=nodea,id=10c4:ea70","node=nodeb,id=10c4:ea70"],"type":"usb"}]' > "$T/m/usbmap.json"
@@ -217,5 +228,5 @@ node "$T/f5"; echo 1 > "$T/f5/install.rc"; printf 'FAIL  zradio-detect did not e
 check "the kit's installer failed in the VM: its FAIL line is shown, exit 1, the VM is not put into the pair" bash -c '[ "$2" = 1 ] && grep -q "| *FAIL  zradio-detect did not end clean" "$1/out" && grep -q "install.sh ended 1 in zr2" "$1/out" && ! grep -q "guest: systemctl start" "$1/calls"' _ "$T/f5" "$RC"
 
 echo "-- help"
-check "--help names both commands and says that nothing is changed without --run" bash -c 'bash "$1" --help | grep -q "zradio-vm sticks" && bash "$1" --help | grep -q "zradio-vm create --name NAME" && bash "$1" --help | grep -q "Report mode unless --run" && ! bash "$1" --help | grep -q "^set -uo"' _ "$TOOL"
+check "--help names both commands and says that nothing is changed without --run" bash -c 'bash "$1" --help | grep -q "zradio-vm sticks" && bash "$1" --help | grep -q "zradio-vm create --self A.B.C.D/NN" && bash "$1" --help | grep -q "name NAME .*yours to choose" && bash "$1" --help | grep -q "Report mode unless --run" && ! bash "$1" --help | grep -q "^set -uo"' _ "$TOOL"
 finish
