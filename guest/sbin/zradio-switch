@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# zradio-switch — the planned switch of the radio pair: this VM (the active) hands the radios to the standby. Runs
+# INSIDE the ACTIVE radio VM as root; /usr/local/sbin/zradio-switch. Report mode unless --run.
+#
+#   zradio-switch [--run] [--sync]
+#
+# Steps with --run:
+#   0. checks: this VM serves (ser2net active, keepalived's last word MASTER); the standby answers hello as BACKUP, not
+#      serving, not dirty, not applying.
+#   1. the standby's copy: when it does not hold this VM's last sync (or --sync), one `zradio-sync run --reason switch`
+#      first — that sync is its own short pause for Home Assistant; a standby that holds the last sync is taken as it is.
+#   2. systemctl stop keepalived here: its last advert has priority 0, the standby takes the floating address at once
+#      and serves (its receiver on, ser2net); this VM's serving stops with keepalived (the unit's ExecStopPost) and its
+#      sticks go silent.
+#   3. wait (20 s at most) until the standby says MASTER and serving; then keepalived is started here again: this VM is
+#      the standby now (nopreempt: it does not take the role back).
+#   If the standby did not take the role in 20 s: keepalived is started here anyway — with no other MASTER this VM takes
+#   the address back after ~4 s — and the exit is 1.
+# Afterwards the new active's tick (every 15 min) syncs this VM once: the copy of a VM that just gave the role away has
+# a Zigbee frame counter BELOW the new active's, and only a sync raises it.
+# [V reference pair 2026-11-11: Home Assistant's Z-Wave back after 1.3 s, Zigbee after 7 s.]
+# Journal lines: `zradio: event=switch result=…`. Tests: tests/t-switch.sh. Env: ZRADIO_SWITCH_*.
+set -uo pipefail
+RUN=0 SYNC=0
+while [ $# -gt 0 ]; do case "$1" in --run) RUN=1; shift;; --sync) SYNC=1; shift;;
+  -h|--help) sed -n '2,/^set -uo pipefail$/{/^set -uo pipefail$/!p}' "$0"; exit 0;; *) echo "unknown arg: $1" >&2; exit 2;; esac; done
+SYNCCMD=${ZRADIO_SWITCH_SYNC:-/usr/local/sbin/zradio-sync}
+SYSTEMCTL=${ZRADIO_SWITCH_SYSTEMCTL:-systemctl}
+LOGGER=${ZRADIO_SWITCH_LOGGER:-logger}
+STATE=${ZRADIO_SWITCH_STATE:-/var/lib/zradio}
+RUNDIR=${ZRADIO_SWITCH_RUN:-/run/zradio}
+WAIT=${ZRADIO_SWITCH_WAIT:-20}
+FAILS=0
+ok()   { printf 'OK    %s\n' "$*"; }
+bad()  { printf 'FAIL  %s\n' "$*"; FAILS=$((FAILS + 1)); }
+done_(){ printf 'DONE  %s\n' "$*"; }
+would(){ printf 'WOULD %s\n' "$*"; }
+log()  { "$LOGGER" -t zradio "event=switch result=$1 $(printf '%s' "$2" | tr '\n"' ' _' | cut -c1-300)" 2>/dev/null || true; }
+field() { printf '%s\n' "$1" | tr ' ' '\n' | sed -n "s/^$2=//p" | head -1; }
+now() { printf '%s' "${EPOCHREALTIME:-$(date +%s)}"; }
+since() { awk -v a="$1" -v b="$(now)" 'BEGIN { printf "%.1f", b - a }'; }
+peer_hello() { "$SYNCCMD" peer-hello 2>/dev/null | tail -1; }
+[ "$(id -u)" = 0 ] || { bad "not root"; exit 1; }
+
+echo "== 0. checks ($([ $RUN = 1 ] && echo RUN || echo REPORT) mode) =="
+role=$([ -f "$RUNDIR/role" ] && cut -d' ' -f1 < "$RUNDIR/role" || echo none)
+"$SYSTEMCTL" is-active --quiet ser2net 2>/dev/null && [ "$role" = MASTER ] && ok "this VM is the active (ser2net active, keepalived's last word MASTER)" \
+  || bad "this VM is not the active (ser2net $("$SYSTEMCTL" is-active ser2net 2>/dev/null | head -1), keepalived's last word $role): run zradio-switch on the VM that serves"
+H=$(peer_hello) || true
+case "$H" in
+  HELLO\ *)
+    if [ "$(field "$H" role)" = BACKUP ] && [ "$(field "$H" serving)" = no ] && [ "$(field "$H" dirty)" = no ] && [ "$(field "$H" applying)" = no ]; then ok "the standby is ready: $H"
+    else bad "the standby is not ready to take the role: $H"; fi;;
+  *) bad "the standby does not answer (zradio-sync peer-hello): no switch into the dark";;
+esac
+MINE=$(python3 -c 'import json,sys
+try: print(json.load(open(sys.argv[1])).get("gen") or "")
+except Exception: print("")' "$STATE/last-sync.json")
+THEIRS=$(field "${H:-}" gen)
+NEED_SYNC=0
+if [ $SYNC = 1 ]; then NEED_SYNC=1; ok "--sync: one sync before the switch"
+elif [ -n "$MINE" ] && [ "$MINE" = "$THEIRS" ]; then ok "the standby holds this VM's last sync ($MINE): taken as it is"
+else NEED_SYNC=1; ok "the standby holds '${THEIRS:-nothing}', this VM's last sync is '${MINE:-none}': one sync first"; fi
+echo "== checks: $FAILS FAIL =="
+[ $FAILS -eq 0 ] || { echo "REFUSED: fix the FAIL lines; nothing was changed"; exit 1; }
+if [ $RUN = 0 ]; then
+  [ $NEED_SYNC = 1 ] && would "zradio-sync run --reason switch (its own short pause for Home Assistant)"
+  would "systemctl stop keepalived (the standby takes the floating address and serves); wait for it; systemctl start keepalived (this VM becomes the standby)"
+  echo "REPORT ONLY — nothing changed. Re-run with --run."; exit 0
+fi
+
+if [ $NEED_SYNC = 1 ]; then
+  echo "== 1. the sync first =="
+  "$SYNCCMD" run --reason switch 2>&1 | sed 's/^/    /'
+  [ "${PIPESTATUS[0]}" = 0 ] || { bad "the sync did not end clean — no switch onto a copy that was not confirmed (this VM still serves)"; log failed "step=sync"; exit 1; }
+  done_ "the standby holds a fresh copy"
+fi
+echo "== 2. the switch =="
+T0=$(now)
+"$SYSTEMCTL" stop keepalived || { bad "systemctl stop keepalived failed — this VM still serves"; log failed "step=stop"; exit 1; }
+done_ "keepalived stopped here after $(since "$T0") s (priority-0 advert sent; this VM's serving stops with it)"
+took=""
+for _ in $(seq 1 $((WAIT * 2))); do
+  H=$(peer_hello) || true
+  if [ "$(field "$H" role)" = MASTER ] && [ "$(field "$H" serving)" = yes ]; then took=$(since "$T0"); break; fi
+  sleep 0.5
+done
+"$SYSTEMCTL" start keepalived || bad "systemctl start keepalived failed here — this VM is out of the pair until it runs"
+if [ -n "$took" ]; then
+  done_ "the standby says MASTER and serving $took s after the stop; keepalived runs here again (this VM is the standby)"
+  log ok "took_s=$took — the peer serves; this VM is the standby (the peer's tick syncs it within 15 min)"
+  [ $FAILS -eq 0 ] || exit 1
+  exit 0
+fi
+bad "the standby did not say MASTER and serving within $WAIT s (last answer: ${H:-nothing}) — keepalived is started here again: with no other MASTER this VM takes the address back"
+log failed "step=takeover — the peer did not take the role in $WAIT s; keepalived restarted here"
+exit 1

@@ -1,0 +1,17 @@
+{
+ "_comment": "Z-Wave JS UI store for the container zradio-apply runs while it writes a copied Z-Wave network onto this VM's stick: the stick at /dev/zwave inside the container, no MQTT, no gateway, no RF settings (the written image's RF config is the truth), no Home Assistant server. The live radios are served by ser2net, never by this.",
+ "mqtt": {
+  "disabled": true
+ },
+ "gateway": {
+  "disabled": true
+ },
+ "zwave": {
+  "port": "/dev/zwave",
+  "enabled": true,
+  "logLevel": "info",
+  "logEnabled": true,
+  "logToFile": false,
+  "serverEnabled": false
+ }
+}

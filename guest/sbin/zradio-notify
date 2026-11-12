@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# zradio-notify — keepalived's notify script for the radio pair. Installed at /usr/local/sbin/zradio-notify inside each
+# radio VM. keepalived calls it on every state change of the instance with
+#   $1 = INSTANCE   $2 = the instance's name   $3 = MASTER | BACKUP | FAULT | STOP   $4 = the priority
+#
+# It does one thing: it asks systemd for the role. MASTER starts zradio-serve.service; anything else stops it.
+# --no-block: keepalived is not held up, and systemd's job queue is the serializer — a stop that arrives while a start
+# still runs is queued behind it and wins, so the last word from keepalived is the state the unit ends in. Nothing here
+# touches a stick or an address (zradio-serve does the sticks; the address is keepalived's own).
+# keepalived's own notify at a stop is not reliable, and a crashed keepalived runs none: the installer's drop-in for
+# keepalived.service calls this script with STOP from ExecStopPost as well. Tests: tests/t-serve.sh.
+set -uo pipefail
+SYSTEMCTL=${ZRADIO_NOTIFY_SYSTEMCTL:-systemctl}
+LOGGER=${ZRADIO_NOTIFY_LOGGER:-logger}
+RUN=${ZRADIO_NOTIFY_RUN:-/run/zradio}
+UNIT=zradio-serve.service
+state=${3:-}; prio=${4:-?}; name=${2:-?}
+case "$state" in
+  MASTER) verb=start;;
+  BACKUP|FAULT|STOP) verb=stop;;
+  *) echo "zradio-notify: unexpected state '${state}' (args: $*)" >&2
+     "$LOGGER" -t zradio "event=role result=ignored state=${state:-none} — not MASTER, BACKUP, FAULT or STOP" 2>/dev/null || true
+     exit 2;;
+esac
+mkdir -p "$RUN" && printf '%s %s priority=%s\n' "$state" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$prio" > "$RUN/role.tmp" && mv -f "$RUN/role.tmp" "$RUN/role"
+"$LOGGER" -t zradio "event=role state=$state instance=$name priority=$prio — $verb $UNIT" 2>/dev/null || true
+# BACKUP is also what keepalived says when a stick's tty is back after a FAULT: such a stick listens again, so the
+# standby is hushed (zradio-hush.service: zradio-serve hush; it waits for a `down` that is still running).
+if [ "$state" = BACKUP ]; then "$SYSTEMCTL" "$verb" --no-block "$UNIT" || true; exec "$SYSTEMCTL" start --no-block zradio-hush.service; fi
+exec "$SYSTEMCTL" "$verb" --no-block "$UNIT"

@@ -1,0 +1,9 @@
+# zradio-hush.service — zradio-serve hush: the standby's sticks made silent again. Started by zradio-notify whenever
+# keepalived says BACKUP (after a FAULT a stick may have come back listening). Never enabled; a no-op on a VM that serves.
+# Installed by guest/install.sh.
+[Unit]
+Description=zradio: the standby's sticks silent again
+After=zradio-serve.service
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/zradio-serve hush

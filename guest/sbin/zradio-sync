@@ -1,0 +1,503 @@
+#!/usr/bin/env bash
+# zradio-sync — keeps the STANDBY radio VM's sticks a copy of the ACTIVE's. Runs INSIDE each radio VM as root, installed
+# at /usr/local/sbin/zradio-sync on both; the two VMs talk by ssh with one key that may run nothing but
+# `zradio-sync serve-ssh` on the other side. No host, no NAS and no Home Assistant is part of it.
+#
+# What is synced: the radios that are "synced" in /etc/zradio/radios.conf on BOTH VMs, with the same family (the
+# standby says what it has in its hello). Today that is a Z-Wave 800-series stick (NVM read / restore) and a TI Z-Stack
+# coordinator (zigpy's open coordinator backup). A "served" radio is never read or written here.
+#
+#   zradio-sync run [--only zwave|zigbee] [--reason TEXT] [--rehearse]
+#       on the ACTIVE (ser2net active, keepalived's last word MASTER): one sync —
+#         1. ask the standby (hello): reachable, not serving. Not reachable = nothing is read (no pause for nothing).
+#         2. read: ser2net stopped; then both sticks at once: Z-Wave receiver off -> NVM read (Open/Read/Close) ->
+#            receiver on [zwave-js's own backup order]; zigpy's backup of the coordinator; ser2net started again. This is
+#            the one pause Home Assistant sees [V reference pair 2026-11-11: NVM read 6.7 s, zigpy backup 11.7 s].
+#            A receiver that does not come back on = $RUN/serve-failed: keepalived hands the role to the standby.
+#         3. send + apply: manifest.json + the two files over ssh into the standby's `receive`, which writes them onto
+#            its sticks (zradio-apply: the two Z-Wave passes, zigpy restore with the frame counter raised by $BUMP),
+#            verifies both identities, silences the sticks again (zradio-serve down) and answers SYNCED.
+#            Retried (the pauses: $RETRY_PAUSES s) without a second read.
+#         4. the record: $STATE/last-sync.json. A sync that did not end in SYNCED leaves $STATE/sync-pending.json and
+#            the read set (0700, under $SECRETS/out): `tick` sends it again.
+#       On a VM that is not the active: exit 0, nothing done (the timers run on both).
+#       --rehearse: on a VM that does NOT serve — its own sticks are read and left silent; for a build's proof on the
+#            standby with ZRADIO_SYNC_PEER pointed at itself. Refused on a VM that serves.
+#   zradio-sync tick     every 15 min by timer. Active: the standby does not hold this VM's last sync (a failed sync, a
+#                       takeover, a rebuilt standby) -> run; after a failed attempt the next waits 15 min, doubling,
+#                       6 h at most (each read is a pause for Home Assistant). Standby: a set not written to the end
+#                       (standby-dirty) -> reapply; a read set or pending mark left from an earlier turn as the active
+#                       is dropped; the sticks are hushed (zradio-serve hush).
+#   zradio-sync reapply  standby: write the last received set again
+#   zradio-sync hello    one line: name, role, serving, the set this VM holds, dirty, and its radios' levels
+#   zradio-sync beat     the same facts as one journal line, `zradio: event=state …`, every minute by timer on both
+#                       VMs: what monitoring counts ("no active", "both active", "the standby is not ready")
+#   zradio-sync peer-hello   the other VM's hello line, over the sync's ssh (zradio-switch asks with it)
+#   zradio-sync status   the records, readable
+#   zradio-sync keys     make this VM's sync key if missing; print its PUBLIC half and this VM's ssh host key
+#   zradio-sync trust --sync-key 'ssh-ed25519 AAAA…' --host-key 'ssh-ed25519 AAAA…' [--peer ADDR]
+#                       the peer's two public keys: its host key pinned for PEER, its sync key allowed to run
+#                       `zradio-sync serve-ssh` from PEER and nothing else (authorized_keys: command=, from=, restrict)
+#   zradio-sync serve-ssh   the forced command: hello | receive (from SSH_ORIGINAL_COMMAND); anything else is refused
+#
+# What never happens: a set applied on a VM that serves; a set older than the one the standby holds; a key, an NVM byte
+# or the Zigbee network key on stdout or in the journal. The Zigbee counter: the standby's copy starts $BUMP frames
+# above the active's reading [V reference network, 11 nightly copies: the live counter grew 20–30 thousand a day].
+# Journal lines: `zradio: event=sync result=…` (the active) and `event=sync-apply result=…` (the standby).
+# Tests: tests/t-sync.sh. Env: ZRADIO_SYNC_*, ZRADIO_CONF, ZRADIO_RADIOS.
+set -uo pipefail
+HERE=$(cd "$(dirname "$0")" && pwd)
+LIB=${ZRADIO_LIB:-$HERE/../lib}; [ -r "$LIB/zradio-common.sh" ] || LIB=/usr/local/lib/zradio
+# shellcheck source=../lib/zradio-common.sh
+. "$LIB/zradio-common.sh" || exit 2
+KEYF=${ZRADIO_SYNC_KEY:-/etc/zradio/sync.key}
+KNOWN=${ZRADIO_SYNC_KNOWN:-/etc/zradio/sync.known_hosts}
+AUTH=${ZRADIO_SYNC_AUTH:-/root/.ssh/authorized_keys}
+HOSTKEY=${ZRADIO_SYNC_HOSTKEY:-/etc/ssh/ssh_host_ed25519_key.pub}
+SECRETS=${ZRADIO_SYNC_SECRETS:-/etc/zradio/.secrets/sync}
+STATE=${ZRADIO_SYNC_STATE:-/var/lib/zradio}
+RUN=${ZRADIO_SYNC_RUN:-/run/zradio}
+PROBE=${ZRADIO_SYNC_PROBE:-$LIB/zradio-probe.py}
+ZIGPY=${ZRADIO_SYNC_ZIGPY:-/opt/zradio/zigpy/bin/zigpy}
+RESTORE=${ZRADIO_SYNC_RESTORE:-/usr/local/sbin/zradio-apply}
+SERVE=${ZRADIO_SYNC_SERVE:-/usr/local/sbin/zradio-serve}
+SELFCMD=${ZRADIO_SYNC_SELFCMD:-/usr/local/sbin/zradio-sync}
+SYSTEMCTL=${ZRADIO_SYNC_SYSTEMCTL:-systemctl}
+SSH=${ZRADIO_SYNC_SSH:-ssh}
+LOGGER=${ZRADIO_SYNC_LOGGER:-logger}
+BUMP=${ZRADIO_SYNC_BUMP:-1000000}
+RETRY_PAUSES=${ZRADIO_SYNC_RETRY_PAUSES:-30 120}
+KEEP_S=${ZRADIO_SYNC_KEEP_S:-72000}        # a read set is sent again for 20 h; older = read again
+TRIES=${ZRADIO_SYNC_TRIES:-4}; PAUSE=${ZRADIO_SYNC_PAUSE:-3}
+APPLY_TIMEOUT=${ZRADIO_SYNC_APPLY_TIMEOUT:-420}
+OUTD="$SECRETS/out"; IND="$SECRETS/in"
+DIRTY="$STATE/standby-dirty"; APPLYING="$RUN/applying"; FAILED="$RUN/serve-failed"
+PENDING="$STATE/sync-pending.json"; LAST="$STATE/last-sync.json"; SYNCED="$STATE/synced.json"
+
+load_conf() { # the pair's conf and this VM's radios; ZW / ZB = the ttys
+  zr_load_conf || { echo "zradio-sync: $ZR_ERR" >&2; exit 2; }
+  PEER=${ZRADIO_SYNC_PEER:-$PEER}
+  zr_load_radios || true          # no radios.conf = both "none": nothing here is synced, hello says so
+  ZW=${ZRADIO_SYNC_ZWAVE_TTY:-$ZWAVE_TTY}
+  ZB=${ZRADIO_SYNC_ZIGBEE_TTY:-$ZIGBEE_TTY}
+}
+synced_here() { # the kinds this VM can sync, as "zwave:<family> zigbee:<family>" words (the family is part of the match)
+  local out=""
+  zr_has zwave synced && out="zwave:${ZWAVE_FAMILY:-?}"
+  zr_has zigbee synced && out="${out:+$out }zigbee:${ZIGBEE_FAMILY:-?}"
+  printf '%s' "$out"
+}
+log() { # log <event> <result> <text>: one line on stdout, one for the journal
+  printf '%s  %s\n' "$2" "$3"
+  "$LOGGER" -t zradio "event=$1 result=$2 $(printf '%s' "$3" | tr '\n"' ' _' | cut -c1-400)" 2>/dev/null || true
+}
+now() { printf '%s' "${EPOCHREALTIME:-$(date +%s)}"; }
+since() { awk -v a="$1" -v b="$(now)" 'BEGIN { printf "%.1f", b - a }'; }
+jget() { python3 -c 'import json,sys
+try: d = json.load(open(sys.argv[1]))
+except Exception: d = None
+for k in sys.argv[2].split("."):
+    d = d.get(k) if isinstance(d, dict) else None
+print("" if d is None else d)' "$1" "$2" 2>/dev/null; }
+serving() { "$SYSTEMCTL" is-active --quiet ser2net 2>/dev/null; }
+role() { [ -f "$RUN/role" ] && cut -d' ' -f1 < "$RUN/role" || echo none; }
+is_active() { serving && [ "$(role)" = MASTER ]; }
+need_root() { [ "$(id -u)" = 0 ] || { echo "die: run as root" >&2; exit 2; }; }
+receiver() { # receiver on|off <errfile>: SetRFReceiveMode, retried; 0 when the stick answered success
+  local want=$1 err=$2 word i
+  word=$(printf '%s' "$want" | tr 'a-z' 'A-Z')
+  for i in $(seq 1 "$TRIES"); do
+    if python3 "$PROBE" --zwave "$ZW" --rf-receive "$want" --json >/dev/null 2>"$err" && grep -q "RF receive mode $word" "$err"; then return 0; fi
+    [ "$i" = "$TRIES" ] || sleep "$PAUSE"
+  done
+  return 1
+}
+peer_ssh() { # peer_ssh <timeout s> <remote command>: stdin passes through
+  timeout "$1" "$SSH" -i "$KEYF" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes \
+    -o UserKnownHostsFile="$KNOWN" -o GlobalKnownHostsFile=/dev/null -o ConnectTimeout=5 \
+    -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -b "$SELF" "root@$PEER" "$2"
+}
+field() { printf '%s\n' "$1" | tr ' ' '\n' | sed -n "s/^$2=//p" | head -1; }   # field "<k=v k=v …>" <k>
+
+# ---------------------------------------------------------------- the standby's side
+hello_line() {
+  local s=no d=no a=no g
+  serving && s=yes; [ -e "$DIRTY" ] && d=yes; [ -e "$APPLYING" ] && a=yes
+  g=$(jget "$SYNCED" gen); [ -n "$g" ] || g=none
+  printf 'HELLO name=%s role=%s serving=%s gen=%s dirty=%s applying=%s zwave=%s zigbee=%s\n' "$NAME" "$(role)" "$s" "$g" "$d" "$a" \
+    "$ZWAVE${ZWAVE_FAMILY:+:$ZWAVE_FAMILY}" "$ZIGBEE${ZIGBEE_FAMILY:+:$ZIGBEE_FAMILY}"
+}
+prep_set() { # prep_set <dir>: the manifest and the files checked; fetch.json + zha-backup-restore.json written.
+  # stdout: "gen=<gen> only=<only> id=<the identities, for the lines>" — or a line starting with BAD
+  python3 - "$1" "$BUMP" <<'PY'
+import hashlib, json, os, re, sys
+d, bump = sys.argv[1], int(sys.argv[2])
+def bad(why): print("BAD " + why); sys.exit(1)
+names = set(os.listdir(d))
+extra = names - {"manifest.json", "zwave-nvm.bin", "zha-backup.json", "zha-backup-restore.json", "fetch.json"}
+if extra: bad("unexpected file(s) in the set: " + ", ".join(sorted(extra))[:120])
+for n in names:
+    p = os.path.join(d, n)
+    if os.path.islink(p) or not os.path.isfile(p): bad("%s is not a regular file" % n)
+try: m = json.load(open(os.path.join(d, "manifest.json")))
+except Exception as e: bad("manifest.json: %s" % e)
+if m.get("format") != "zradio sync v1": bad("manifest format %r" % m.get("format"))
+gen = str(m.get("gen") or "")
+if not re.fullmatch(r"\d{8}T\d{6}Z", gen): bad("gen %r" % gen)
+only = m.get("only") or ""
+if only not in ("", "zwave", "zigbee"): bad("only %r" % only)
+sha = lambda n: hashlib.sha256(open(os.path.join(d, n), "rb").read()).hexdigest()
+fetch = {"format": "zradio sync v1", "sets": {}, "identities": {}}
+ident = []
+if only in ("", "zwave"):
+    z = m.get("zwave") or {}
+    if "zwave-nvm.bin" not in names: bad("no zwave-nvm.bin")
+    if sha("zwave-nvm.bin") != z.get("sha256"): bad("zwave-nvm.bin does not match the manifest's sha256")
+    if not re.fullmatch(r"0x[0-9a-fA-F]{8}", str(z.get("home_id") or "")) or not isinstance(z.get("nodes"), int) or z["nodes"] < 1: bad("Z-Wave identity in the manifest")
+    if not isinstance(z.get("rf_region"), int) or not isinstance(z.get("tx_power_dbm"), (int, float)): bad("Z-Wave RF config in the manifest")
+    fetch["sets"]["zwave"] = "sync-" + gen
+    fetch["identities"]["zwave"] = {"home_id": z["home_id"].lower(), "nodes": z["nodes"], "rf_region": z["rf_region"], "tx_power_dbm": z["tx_power_dbm"]}
+    ident.append("zwave=%s/%d" % (z["home_id"].lower(), z["nodes"]))
+if only in ("", "zigbee"):
+    b = m.get("zigbee") or {}
+    if "zha-backup.json" not in names: bad("no zha-backup.json")
+    if sha("zha-backup.json") != b.get("sha256"): bad("zha-backup.json does not match the manifest's sha256")
+    try: j = json.load(open(os.path.join(d, "zha-backup.json")))
+    except Exception as e: bad("zha-backup.json: %s" % type(e).__name__)
+    nk = j.get("network_key") or {}
+    fc = nk.get("frame_counter")
+    if not isinstance(fc, int) or fc < 0 or not re.fullmatch(r"[0-9a-fA-F]{32}", str(nk.get("key") or "")): bad("zha-backup.json holds no network key / frame counter")
+    ieee = str(j.get("coordinator_ieee") or "").lower()
+    if not re.fullmatch(r"[0-9a-f]{16}", ieee): bad("coordinator_ieee in zha-backup.json")
+    ieee_c = ":".join(ieee[i:i + 2] for i in range(0, 16, 2))
+    pan = str(j.get("pan_id") or "").lower(); ch = j.get("channel")
+    if not re.fullmatch(r"[0-9a-f]{4}", pan) or not isinstance(ch, int): bad("pan_id / channel in zha-backup.json")
+    if (b.get("ieee"), str(b.get("pan_id")).lower(), b.get("channel")) != (ieee_c, pan, ch): bad("the manifest's Zigbee identity is not the backup's")
+    to = fc + bump
+    if to > 0xFFFFFFFF - bump: bad("the Zigbee frame counter %d leaves no room for the raise" % fc)
+    nk["frame_counter"] = to
+    fd = os.open(os.path.join(d, "zha-backup-restore.json"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f: json.dump(j, f)
+    fetch["sets"]["zigbee"] = "sync-" + gen
+    fetch["identities"]["zigbee"] = {"ieee": ieee_c, "channel": ch, "pan_id": pan}
+    fetch["bump"] = {"from": fc, "to": to, "how": "zradio-sync: the active's reading + %d" % bump}
+    ident.append("zigbee=%s/%s/%d counter=%d" % (ieee_c, pan, ch, to))
+fd = os.open(os.path.join(d, "fetch.json"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as f: json.dump(fetch, f, indent=1)
+print("gen=%s only=%s id=%s" % (gen, only or "both", ",".join(ident).replace(" ", ",")))
+PY
+}
+apply_set() { # apply_set <dir> <gen> <only|both> <id>: onto this VM's sticks; the answer's last line on stdout
+  local d=$1 gen=$2 only=$3 id=$4 t0 rc
+  t0=$(now); mkdir -p "$STATE" "$RUN"
+  : > "$DIRTY"; : > "$APPLYING"
+  local args=(--run --from "$d"); [ "$only" = both ] || args+=(--only "$only")
+  bash "$RESTORE" "${args[@]}" > "$STATE/sync-apply.log" 2>&1; rc=$?
+  if [ $rc != 0 ]; then
+    rm -f "$APPLYING"
+    log sync-apply failed "gen=$gen step=restore rc=$rc — $(grep -E '^FAIL' "$STATE/sync-apply.log" | head -1 | cut -c1-200) (log: $STATE/sync-apply.log; standby-dirty stays: this VM does not serve until a set is written to the end)" >&2
+    echo "FAILED gen=$gen step=restore"; return 1
+  fi
+  if "$SERVE" down >> "$STATE/sync-apply.log" 2>&1; then :
+  else
+    rm -f "$APPLYING"
+    log sync-apply failed "gen=$gen step=silence — zradio-serve down did not end clean after the restore (log: $STATE/sync-apply.log; standby-dirty stays)" >&2
+    echo "FAILED gen=$gen step=silence"; return 1
+  fi
+  python3 - "$SYNCED" "$gen" "$only" "$id" "$(since "$t0")" <<'PY'
+import json, os, sys, time
+p, gen, only, ident, secs = sys.argv[1:6]
+old = {}
+try: old = json.load(open(p))
+except Exception: pass
+rec = {"gen": gen, "only": only, "identities": ident, "apply_s": float(secs), "applied_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+       "gens": dict(old.get("gens") or {})}
+for net in (("zwave", "zigbee") if only == "both" else (only,)): rec["gens"][net] = gen
+json.dump(rec, open(p + ".tmp", "w"), indent=1); os.replace(p + ".tmp", p)
+PY
+  rm -f "$DIRTY" "$APPLYING"
+  rm -f "$d/zwave-nvm.bin" "$d/zha-backup.json" "$d/zha-backup-restore.json"   # written and verified: no image stays at rest
+  log sync-apply ok "gen=$gen $id apply_s=$(since "$t0") — the sticks hold the set and are silent" >&2
+  echo "SYNCED gen=$gen $id apply_s=$(since "$t0")"
+}
+drop_out() { rm -rf "$OUTD"; rm -f "$PENDING"; }   # a read set from an earlier turn as the active is never sent later
+cmd_receive() {
+  need_root; mkdir -p "$RUN" "$IND"; chmod 700 "$SECRETS" "$IND" 2>/dev/null
+  exec 8>"$RUN/sync-in.lock"; flock -n 8 || { echo "FAILED busy — another set is being applied"; exit 75; }
+  if serving || [ "$(role)" = MASTER ]; then cat >/dev/null; echo "REFUSED this VM serves (ser2net active or MASTER): nothing is written onto an active's sticks"; exit 1; fi
+  drop_out
+  local tmp="$IND/incoming" p gen only id cur
+  rm -rf "$tmp"; mkdir -m 700 "$tmp" || { echo "FAILED no $tmp"; exit 1; }
+  ( umask 077; tar -C "$tmp" -xf - --no-same-owner --no-same-permissions ) 2>/dev/null || { rm -rf "$tmp"; echo "FAILED the stream was not a tar"; exit 1; }
+  p=$(prep_set "$tmp") || { rm -rf "$tmp"; log sync-apply refused "${p:-the set did not check}" >&2; echo "REFUSED ${p:-the set did not check}"; exit 1; }
+  gen=$(field "$p" gen); only=$(field "$p" only); id=$(field "$p" id)
+  local k
+  for k in zwave zigbee; do
+    if { [ "$only" = both ] || [ "$only" = "$k" ]; } && ! zr_has "$k" synced; then
+      rm -rf "$tmp"; log sync-apply refused "gen=$gen — the set holds a $k image and this VM has no synced $k stick (radios.conf)" >&2
+      echo "REFUSED no synced $k stick here"; exit 1
+    fi
+  done
+  cur=$(jget "$SYNCED" gen)
+  if [ -n "$cur" ] && [[ "$gen" < "$cur" ]]; then rm -rf "$tmp"; echo "REFUSED stale: this VM holds $cur, the set is $gen"; exit 1; fi
+  rm -rf "$IND/current"; mv "$tmp" "$IND/current"
+  apply_set "$IND/current" "$gen" "$only" "$id"
+}
+cmd_reapply() {
+  need_root; mkdir -p "$RUN"
+  exec 8>"$RUN/sync-in.lock"; flock -n 8 || { echo "busy — a set is being applied"; exit 75; }
+  if serving || [ "$(role)" = MASTER ]; then echo "REFUSED this VM serves"; exit 1; fi
+  [ -f "$IND/current/manifest.json" ] || { echo "no received set under $IND/current — nothing to write again (the next sync brings one)"; exit 1; }
+  local p; p=$(prep_set "$IND/current") || { echo "REFUSED ${p:-the kept set did not check} (a set written to the end keeps no image: only a set that failed can be written again)"; exit 1; }
+  apply_set "$IND/current" "$(field "$p" gen)" "$(field "$p" only)" "$(field "$p" id)"
+}
+
+# ---------------------------------------------------------------- the active's side
+STOPPED=0
+resume_serving() { # after the read: ser2net back — unless this VM lost the role meanwhile (then keepalived's notify silences it)
+  [ $STOPPED = 1 ] || return 0
+  STOPPED=0
+  if [ "$(role)" = MASTER ]; then "$SYSTEMCTL" start ser2net || { : > "$FAILED"; log sync loud "step=ser2net — ser2net did not start after the read: out of the election, the standby takes the role"; return 1; }
+  else log sync note "this VM lost the role during the read: ser2net is left stopped (keepalived's notify silences the sticks)"; fi
+}
+read_sticks() { # read_sticks <dir> <only|""> <serving: 1|0> — the pause; sets PAUSE_S
+  local d=$1 only=$2 live=$3 t0 zrc=0 brc=0 zp="" bp=""
+  rm -rf "$d"; mkdir -p "$d" && chmod 700 "$SECRETS" "$d" || return 1
+  t0=$(now)
+  if [ "$live" = 1 ]; then "$SYSTEMCTL" stop ser2net || true; STOPPED=1; fi
+  if [ -z "$only" ] || [ "$only" = zwave ]; then
+    ( rc=0
+      receiver off "$d/rf-off.err" || { echo "the receiver did not answer 'off' ($(grep -E 'FAIL' "$d/rf-off.err" | head -1 | cut -c1-120))" > "$d/zwave.why"; rc=1; }
+      if [ $rc = 0 ]; then
+        ( cd "$d" && timeout 90 python3 "$PROBE" --zwave "$ZW" --budget 300 --nvm-dump zwave-nvm.bin --json > zw-probe.json 2> zw-probe.err ) \
+          || { echo "the NVM read failed ($(grep -E 'FAIL' "$d/zw-probe.err" | head -1 | cut -c1-120))" > "$d/zwave.why"; rc=1; }
+      fi
+      if [ "$live" = 1 ]; then
+        receiver on "$d/rf-on.err" || { echo "RECEIVER-OFF" > "$d/zwave.deaf"; rc=1; }
+      else receiver off "$d/rf-off2.err" || rc=1; fi
+      exit $rc ) & zp=$!
+  fi
+  if [ -z "$only" ] || [ "$only" = zigbee ]; then
+    ( umask 077; timeout 90 "$ZIGPY" radio znp "$ZB" backup "$d/zha-backup.json" > "$d/zigpy-backup.log" 2>&1 ) & bp=$!
+  fi
+  [ -z "$zp" ] || { wait "$zp" || zrc=1; }
+  [ -z "$bp" ] || { wait "$bp" || brc=1; }
+  if [ -e "$d/zwave.deaf" ]; then
+    : > "$FAILED"; STOPPED=0   # ser2net stays stopped: Home Assistant is not handed a deaf stick; keepalived's check fails on serve-failed
+    log sync loud "step=zwave-receiver — the receiver did not come back ON after the NVM read: this stick may be deaf; ser2net stays stopped, out of the election (serve-failed), the standby takes the role"
+  fi
+  resume_serving || true
+  PAUSE_S=$(since "$t0")
+  [ $zrc = 0 ] || { log sync failed "step=read-zwave — $(cat "$d/zwave.why" 2>/dev/null || echo 'see the lines above') (pause ${PAUSE_S} s)"; return 1; }
+  [ $brc = 0 ] || { log sync failed "step=read-zigbee — zigpy backup did not end clean (log kept in the read set, not shown; pause ${PAUSE_S} s)"; return 1; }
+  return 0
+}
+mk_manifest() { # mk_manifest <dir> <gen> <only|""> <reason> <pause_s>: manifest.json; stdout the identities, or BAD …
+  python3 - "$1" "$2" "$3" "$4" "$5" "$NAME" <<'PY'
+import hashlib, json, os, re, sys
+d, gen, only, reason, pause, name = sys.argv[1:7]
+def bad(why): print("BAD " + why); sys.exit(1)
+sha = lambda n: hashlib.sha256(open(os.path.join(d, n), "rb").read()).hexdigest()
+m = {"format": "zradio sync v1", "gen": gen, "from": name, "reason": reason, "only": only, "pause_s": float(pause)}
+ident = []
+if only in ("", "zwave"):
+    try: z = json.load(open(os.path.join(d, "zw-probe.json"))).get("zwave") or {}
+    except Exception as e: bad("the probe's JSON: %s" % type(e).__name__)
+    dump = z.get("nvm_dump") or {}; rf = z.get("rf") or {}
+    p = os.path.join(d, "zwave-nvm.bin")
+    size = os.path.getsize(p) if os.path.isfile(p) else 0
+    if not z.get("ok") or not re.fullmatch(r"0x[0-9a-fA-F]{8}", str(z.get("home_id_hex") or "")) or not isinstance(z.get("node_count"), int): bad("the Z-Wave read gave no identity")
+    if size < 4096 or dump.get("bytes") != size or dump.get("size") != size: bad("the NVM read is short: %s of %s bytes" % (dump.get("bytes"), dump.get("size")))
+    if not isinstance(rf.get("region"), int) or not isinstance(rf.get("tx_power_dbm"), (int, float)): bad("the Z-Wave read gave no RF config")
+    m["zwave"] = {"home_id": z["home_id_hex"].lower(), "nodes": z["node_count"], "rf_region": rf["region"], "tx_power_dbm": rf["tx_power_dbm"], "bytes": size, "sha256": sha("zwave-nvm.bin")}
+    ident.append("zwave=%s/%d" % (m["zwave"]["home_id"], m["zwave"]["nodes"]))
+if only in ("", "zigbee"):
+    try: j = json.load(open(os.path.join(d, "zha-backup.json")))
+    except Exception as e: bad("zigpy's backup: %s" % type(e).__name__)
+    nk = j.get("network_key") or {}
+    ieee = str(j.get("coordinator_ieee") or "").lower(); pan = str(j.get("pan_id") or "").lower(); ch = j.get("channel")
+    if not re.fullmatch(r"[0-9a-f]{16}", ieee) or not re.fullmatch(r"[0-9a-f]{4}", pan) or not isinstance(ch, int): bad("zigpy's backup holds no network identity")
+    if not isinstance(nk.get("frame_counter"), int) or not re.fullmatch(r"[0-9a-fA-F]{32}", str(nk.get("key") or "")): bad("zigpy's backup holds no network key / frame counter")
+    if set(str(nk["key"]).lower()) <= {"0"} or pan in ("ffff", "fffe"): bad("the coordinator is not on a network (blank key or PAN)")
+    m["zigbee"] = {"ieee": ":".join(ieee[i:i + 2] for i in range(0, 16, 2)), "pan_id": pan, "channel": ch, "frame_counter": nk["frame_counter"],
+                   "devices": len(j.get("devices") or []), "sha256": sha("zha-backup.json")}
+    ident.append("zigbee=%s/%s/%d" % (m["zigbee"]["ieee"], pan, ch))
+fd = os.open(os.path.join(d, "manifest.json"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as f: json.dump(m, f, indent=1)
+print(",".join(ident))
+PY
+}
+send_set() { # send_set <dir>: tar over ssh into the peer's receive; ANSWER = its last line
+  local d=$1 files=(manifest.json)
+  [ -f "$d/zwave-nvm.bin" ] && files+=(zwave-nvm.bin); [ -f "$d/zha-backup.json" ] && files+=(zha-backup.json)
+  ANSWER=$(tar -C "$d" -cf - "${files[@]}" | peer_ssh "$APPLY_TIMEOUT" receive 2>/dev/null | tail -1) || true
+  case "$ANSWER" in SYNCED\ gen=*) return 0;; *) return 1;; esac
+}
+write_pending() { # write_pending <gen> <why> [count: 1|0] — count 0: an attempt that cost Home Assistant nothing
+  python3 - "$PENDING" "$1" "$2" "${3:-1}" <<'PY'
+import json, os, sys, time
+p, gen, why, count = sys.argv[1:5]
+old = {}
+try: old = json.load(open(p))
+except Exception: pass
+rec = {"gen": gen, "why": why, "since_utc": old.get("since_utc") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "attempts": int(old.get("attempts") or 0) + int(count)}
+os.makedirs(os.path.dirname(p), exist_ok=True); json.dump(rec, open(p + ".tmp", "w"), indent=1); os.replace(p + ".tmp", p)
+PY
+}
+cmd_run() {
+  local only="" reason=manual rehearse=0
+  while [ $# -gt 0 ]; do case "$1" in
+    --only) only=$2; shift 2;; --reason) reason=$(printf '%s' "$2" | tr -c 'A-Za-z0-9_-' '_'); shift 2;; --rehearse) rehearse=1; shift;;
+    *) echo "unknown arg: $1" >&2; exit 2;; esac; done
+  case "$only" in ""|zwave|zigbee) ;; *) echo "die: --only zwave|zigbee" >&2; exit 2;; esac
+  need_root; mkdir -p "$RUN" "$STATE"
+  HERE_SYNCED=$(synced_here)
+  [ -n "$HERE_SYNCED" ] || { echo "no radio on this VM is at level 'synced' (radios.conf: zwave=$ZWAVE zigbee=$ZIGBEE) — nothing to sync"; exit 0; }
+  if [ $rehearse = 1 ]; then
+    if serving || [ "$(role)" = MASTER ]; then echo "REFUSED: --rehearse on a VM that serves (it reads the sticks without giving them back to Home Assistant)"; exit 1; fi
+  elif ! is_active; then echo "not the active (ser2net $(serving && echo active || echo 'not active'), keepalived's last word $(role)) — nothing to do"; exit 0; fi
+  exec 9>"$RUN/sync-out.lock"; flock -n 9 || { echo "a sync is running already — nothing done"; exit 0; }
+  [ -r "$KEYF" ] && [ -s "$KNOWN" ] || { log sync failed "step=keys — no $KEYF or no $KNOWN: the pair is not paired (zradio-sync keys / trust)"; exit 1; }
+  local t0 h gen id tries=0 pause
+  t0=$(now)
+  h=$(peer_ssh 15 hello 2>/dev/null | tail -1) || true
+  case "$h" in HELLO\ *) ;; *)
+    write_pending none "the standby did not answer" 0
+    log sync failed "step=hello reason=$reason — the standby ($PEER) did not answer: nothing was read, Home Assistant saw no pause; tick tries again"; exit 1;; esac
+  if [ "$(field "$h" serving)" = yes ] || [ "$(field "$h" role)" = MASTER ]; then
+    log sync failed "step=hello reason=$reason — the peer says it serves ($h): two actives; nothing read, nothing sent"; exit 1; fi
+  # what can be synced: the kinds "synced" on both VMs with the same family
+  local both="" k mine theirs
+  for k in zwave zigbee; do
+    mine=$(printf '%s\n' "$HERE_SYNCED" | tr ' ' '\n' | sed -n "s/^$k://p"); theirs=$(field "$h" "$k")
+    [ -n "$mine" ] && [ "$theirs" = "synced:$mine" ] && both="${both:+$both }$k"
+  done
+  if [ -n "$only" ]; then
+    case " $both " in *" $only "*) ;; *) log sync failed "step=radios reason=$reason — --only $only, but $only is not synced on both VMs (here: ${HERE_SYNCED:-nothing}; the standby: zwave=$(field "$h" zwave) zigbee=$(field "$h" zigbee))"; exit 1;; esac
+  else
+    case "$both" in
+      "zwave zigbee") only="";;
+      zwave|zigbee) only=$both
+        [ "$(printf '%s\n' "$HERE_SYNCED" | wc -w)" = 1 ] || log sync note "only $both is synced on both VMs (here: $HERE_SYNCED; the standby: zwave=$(field "$h" zwave) zigbee=$(field "$h" zigbee)): the other network is not copied";;
+      *) rm -f "$PENDING"
+        log sync mismatch "reason=$reason — no radio is synced on both VMs with the same family (here: ${HERE_SYNCED:-nothing}; the standby: zwave=$(field "$h" zwave) zigbee=$(field "$h" zigbee)): nothing read, nothing sent"; exit 1;;
+    esac
+  fi
+  # a read set kept from a sync that did not get through is sent again — the same networks, not older than $KEEP_S s
+  gen=""
+  if [ $rehearse = 0 ] && [ -f "$PENDING" ] && [ -f "$OUTD/manifest.json" ] && [ "$(jget "$OUTD/manifest.json" only)" = "$only" ] \
+     && [ $(( $(date +%s) - $(stat -c %Y "$OUTD/manifest.json") )) -lt "$KEEP_S" ]; then
+    gen=$(jget "$OUTD/manifest.json" gen); PAUSE_S=0; id="kept-set"
+    log sync note "gen=$gen — the read set of the last attempt is sent again (no second read, no pause)"
+  else
+    gen=$(date -u +%Y%m%dT%H%M%SZ)
+    trap 'resume_serving' EXIT
+    if read_sticks "$OUTD" "$only" $((1 - rehearse)); then :; else write_pending "$gen" "the read failed"; exit 1; fi
+    trap - EXIT
+    id=$(mk_manifest "$OUTD" "$gen" "$only" "$reason" "$PAUSE_S") || { write_pending "$gen" "the read did not check"; log sync failed "step=check gen=$gen — ${id:-the read set did not check} (pause ${PAUSE_S} s)"; rm -rf "$OUTD"; exit 1; }
+    rm -f "$OUTD"/zw-probe.json "$OUTD"/*.err "$OUTD"/zigpy-backup.log
+    log sync note "gen=$gen reason=$reason read: $id pause_s=$PAUSE_S"
+  fi
+  write_pending "$gen" "sending"
+  for pause in 0 $RETRY_PAUSES; do
+    [ "$pause" = 0 ] || sleep "$pause"
+    tries=$((tries + 1))
+    if send_set "$OUTD"; then
+      python3 - "$LAST" "$gen" "$reason" "$PEER" "$PAUSE_S" "$(since "$t0")" "$tries" "$ANSWER" <<'PY'
+import json, os, sys, time
+p, gen, reason, peer, pause, total, tries, answer = sys.argv[1:9]
+rec = {"gen": gen, "reason": reason, "peer": peer, "pause_s": float(pause), "total_s": float(total), "tries": int(tries), "answer": answer,
+       "ok_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+json.dump(rec, open(p + ".tmp", "w"), indent=1); os.replace(p + ".tmp", p)
+PY
+      rm -rf "$OUTD"; rm -f "$PENDING"
+      log sync ok "gen=$gen reason=$reason pause_s=$PAUSE_S total_s=$(since "$t0") tries=$tries — the standby answered: $ANSWER"
+      exit 0
+    fi
+    log sync retry "gen=$gen try=$tries — the standby answered: ${ANSWER:-nothing}"
+    case "$ANSWER" in REFUSED*) break;; esac   # a refusal does not change by asking again
+  done
+  log sync failed "step=apply gen=$gen reason=$reason tries=$tries — not confirmed by the standby (last answer: ${ANSWER:-nothing}); the read set is kept, tick sends it again"
+  exit 1
+}
+may_retry() { # 0 = a pending sync may be tried now: 15 min after the first failed attempt, doubling, 6 h at most
+  local a age wait
+  a=$(jget "$PENDING" attempts); [[ "$a" =~ ^[0-9]+$ ]] || a=0
+  [ "$a" -ge 1 ] || return 0
+  age=$(( $(date +%s) - $(stat -c %Y "$PENDING" 2>/dev/null || echo 0) ))
+  wait=$(( 900 * (1 << (a > 5 ? 5 : a - 1)) )); [ "$wait" -le 21600 ] || wait=21600
+  [ "$age" -ge $(( wait - 60 )) ]
+}
+cmd_tick() {
+  need_root; mkdir -p "$RUN" "$STATE"
+  if is_active; then
+    local h mine
+    [ -n "$(synced_here)" ] || { echo "no radio on this VM is at level 'synced' — nothing to sync"; exit 0; }
+    h=$(peer_ssh 15 hello 2>/dev/null | tail -1) || true
+    case "$h" in HELLO\ *) ;; *) [ -f "$PENDING" ] && log sync waiting "the standby ($PEER) does not answer and a sync is pending since $(jget "$PENDING" since_utc)"; exit 0;; esac
+    mine=$(jget "$LAST" gen)
+    if [ -f "$PENDING" ] || [ "$(field "$h" dirty)" = yes ] || [ -z "$mine" ] || [ "$(field "$h" gen)" != "$mine" ]; then
+      if [ -f "$PENDING" ] && ! may_retry; then echo "a sync is pending (attempt $(jget "$PENDING" attempts)) — the next try waits its turn"; exit 0; fi
+      exec "$SELFCMD" run --reason catch-up
+    fi
+    echo "the standby holds this VM's last sync ($mine) — nothing to do"; exit 0
+  fi
+  if serving || [ "$(role)" = MASTER ]; then echo "between roles (ser2net $(serving && echo active || echo 'not active'), $(role)) — nothing done"; exit 0; fi
+  { [ -e "$OUTD" ] || [ -f "$PENDING" ]; } && { drop_out; echo "a read set / pending mark from an earlier turn as the active: dropped"; }
+  if [ -e "$DIRTY" ] && [ ! -e "$APPLYING" ] && [ -f "$IND/current/manifest.json" ]; then exec "$SELFCMD" reapply; fi
+  if [ ! -e "$APPLYING" ] && [ ! -e "$DIRTY" ]; then
+    exec 8>"$RUN/sync-in.lock"; flock -n 8 || { echo "standby — a set is being written, nothing done"; exit 0; }
+    "$SERVE" hush || true     # a stick that came back listening is silenced within one tick
+  fi
+  echo "standby — nothing else to do"; exit 0
+}
+cmd_keys() {
+  need_root
+  if [ ! -f "$KEYF" ]; then ( umask 077; mkdir -p "$(dirname "$KEYF")"; ssh-keygen -q -t ed25519 -N '' -C "zradio-sync@$NAME" -f "$KEYF" ) || { echo "ssh-keygen failed" >&2; exit 1; }; fi
+  printf 'SYNCKEY %s\n' "$(cut -d' ' -f1,2 < "$KEYF.pub")"
+  printf 'HOSTKEY %s\n' "$(cut -d' ' -f1,2 < "$HOSTKEY")"
+}
+cmd_trust() {
+  local sk="" hk="" peer=$PEER
+  while [ $# -gt 0 ]; do case "$1" in --sync-key) sk=$2; shift 2;; --host-key) hk=$2; shift 2;; --peer) peer=$2; shift 2;; *) echo "unknown arg: $1" >&2; exit 2;; esac; done
+  need_root
+  local re='^ssh-ed25519 [A-Za-z0-9+/=]{60,80}$'
+  [[ "$sk" =~ $re ]] && [[ "$hk" =~ $re ]] || { echo "die: --sync-key and --host-key are each 'ssh-ed25519 AAAA…' (two words, the public halves zradio-sync keys prints)" >&2; exit 2; }
+  zr_ip4 "$peer" || { echo "die: --peer is the other radio VM's IPv4 address" >&2; exit 2; }
+  ( umask 077; mkdir -p "$(dirname "$AUTH")" "$(dirname "$KNOWN")"; touch "$AUTH"
+    printf '%s %s\n' "$peer" "$hk" > "$KNOWN.tmp" && mv -f "$KNOWN.tmp" "$KNOWN"
+    { grep -v ' zradio-sync-peer$' "$AUTH" || true; printf 'command="%s serve-ssh",from="%s",restrict %s zradio-sync-peer\n' "$SELFCMD" "$peer" "$sk"; } > "$AUTH.tmp" && chmod 600 "$AUTH.tmp" && mv -f "$AUTH.tmp" "$AUTH" ) || { echo "trust: not written" >&2; exit 1; }
+  chmod 644 "$KNOWN"
+  echo "trusted: $peer's host key pinned in $KNOWN; its sync key may run '$SELFCMD serve-ssh' from $peer and nothing else ($AUTH)"
+}
+cmd_status() {
+  hello_line
+  for f in "$LAST" "$SYNCED" "$PENDING"; do [ -f "$f" ] && { echo "-- $f"; cat "$f"; echo; }; done
+  [ -e "$DIRTY" ] && echo "-- $DIRTY: a set was not written to the end — this VM does not serve until one is"
+  [ -e "$OUTD/manifest.json" ] && echo "-- a read set waits under $OUTD (gen $(jget "$OUTD/manifest.json" gen))"
+  exit 0
+}
+
+MODE=${1:-}; [ $# -gt 0 ] && shift
+case "$MODE" in
+  -h|--help|"") sed -n '2,/^set -uo pipefail$/{/^set -uo pipefail$/!p}' "$0"; [ -n "$MODE" ] && exit 0 || exit 2;;
+esac
+load_conf
+case "$MODE" in
+  run) cmd_run "$@";;
+  tick) cmd_tick;;
+  reapply) cmd_reapply;;
+  hello) hello_line;;
+  beat) h=$(hello_line); "$LOGGER" -t zradio "event=state ${h#HELLO } last=$(v=$(jget "$LAST" gen); echo "${v:-none}")"; echo "$h";;
+  peer-hello) need_root; peer_ssh 15 hello;;
+  status) cmd_status;;
+  keys) cmd_keys;;
+  trust) cmd_trust "$@";;
+  serve-ssh)
+    case "${SSH_ORIGINAL_COMMAND:-}" in
+      hello) hello_line;;
+      receive) cmd_receive;;
+      *) echo "REFUSED: this key runs hello or receive, nothing else" >&2; exit 1;;
+    esac;;
+  *) echo "usage: zradio-sync run|tick|reapply|hello|beat|peer-hello|status|keys|trust|serve-ssh (--help)" >&2; exit 2;;
+esac

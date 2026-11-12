@@ -1,0 +1,368 @@
+#!/usr/bin/env python3
+"""zradio-change-watch — notices that a Z-Wave or Zigbee device is being added or removed, and syncs the standby five
+quiet minutes later. Runs INSIDE both radio VMs as root (zradio-change-watch.service); only the ACTIVE ever sees
+anything.
+
+How it notices, with nothing but this VM: Home Assistant talks to the sticks over TCP to the floating address, ports
+ZWAVE_PORT and ZIGBEE_PORT of /etc/zradio/zradio.conf. This watcher reads those packets as they arrive on the pair's
+interface (a packet socket: it never connects to a port, never touches ser2net or a tty) and looks, in the direction
+HOST -> STICK only, for the requests that change a network's membership:
+
+  Z-Wave Serial API (frame: 01 LEN 00 FUNC … CHECKSUM, checksum verified)
+    0x4A AddNodeToNetwork      mode 1-4 (any / controller / end node / existing) or 8 (SmartStart by home ID)
+                               — not 5/6 (stop) and not 9 (the SmartStart listening the driver switches on at start)
+    0x4B RemoveNodeFromNetwork mode 1-3 — not 5 (stop)
+    0x61 RemoveFailedNode, 0x63 ReplaceFailedNode
+  Z-Stack ZNP (frame: FE LEN CMD0 CMD1 DATA FCS, FCS verified) — only when radios.conf says ZIGBEE_FAMILY=znp
+    25 36 ZDO_MGMT_PERMIT_JOIN_REQ with a duration > 0 (the network opened for joining; 0 = closed, ignored)
+    25 34 ZDO_MGMT_LEAVE_REQ (a device told to leave)
+  A Zigbee stick of another family is not parsed: its changes reach the standby with the nightly sync, if at all.
+
+A request seen = $STATE/change-seen is touched (on disk: a reboot inside the five minutes does not forget it) and one
+journal line. When change-seen is $QUIET s old, this VM is the active and no sync ran for it yet:
+`zradio-sync run --reason device-change`. A sync that fails leaves zradio-sync's own pending mark: its tick retries.
+At most $MAX_PER_DAY device-change syncs start in 24 h (each is a pause for Home Assistant): past that, one loud line
+and the nightly sync covers it. Over-triggering (an inclusion started and cancelled) costs one sync; a missed request
+costs nothing the nightly sync does not repair.
+
+A second job, with the same packets: A STICK THAT STOPPED ANSWERING while its tty is still there (hung firmware). The
+health check of keepalived only asks whether the ttys exist, so such a stick would be served for ever. Here: every
+request Home Assistant sends to a port (Z-Wave payloads of 2+ bytes — its one-byte ACKs do not count; ZNP frames) is
+counted until the stick sends anything back. $WEDGE_MIN or more requests unanswered, the first of them $WEDGE_AFTER s
+ago, on the VM that serves = the stick is declared wedged: $STATE/stick-wedged is written and one loud line;
+zradio-serve check fails on that file, keepalived hands the radios to the other VM within seconds. The file stays until
+the sticks answer a probe again (zradio-serve hush, at every BACKUP and every 15 min). At most $WEDGE_MAX_PER_DAY
+declarations in 24 h per VM: if both VMs' sticks "stop answering" the cause is not a stick.
+Two guards, from a real outage (2026-11-11: a first version could not see the sticks' answers, called two healthy
+sticks silent in turn, and no VM served for 2 min 22 s): a stick is judged only after this process has seen it answer
+at least once, and the default is OBSERVE — the line `result=would-wedge` and nothing else.
+ZRADIO_CHANGE_WEDGE=act in the unit's environment arms it; read a day of observe lines first.
+
+  zradio-change-watch run            the service
+  zradio-change-watch parse-test     stdin: lines "zwave|zigbee <hex bytes>" (host->stick payloads) -> the events, one
+                                     per line (the tests' door; no socket)
+  zradio-change-watch wedge-test     stdin: lines "<t> host <zwave|zigbee> <bytes>", "<t> stick <kind>", "<t> check"
+                                     -> what a check at <t> would declare (the tests' door to the counting)
+  zradio-change-watch declare-test <kind> <count> <age>   the tests' door to the declaration (marker, limit, line)
+  zradio-change-watch conf-test      the ports, the interface and the parsers this VM would use, as one line
+
+Journal lines: `zradio: event=change …`. Tests: tests/t-change-watch.sh. Env: ZRADIO_CHANGE_*, ZRADIO_CONF, ZRADIO_RADIOS.
+"""
+import os, re, socket, struct, subprocess, sys, time
+
+STATE = os.environ.get("ZRADIO_CHANGE_STATE", "/var/lib/zradio")
+RUN = os.environ.get("ZRADIO_CHANGE_RUN", "/run/zradio")
+CONF = os.environ.get("ZRADIO_CONF", "/etc/zradio/zradio.conf")
+RADIOS = os.environ.get("ZRADIO_RADIOS", "/etc/zradio/radios.conf")
+IP = os.environ.get("ZRADIO_IP", "ip")
+SYNC = os.environ.get("ZRADIO_CHANGE_SYNC", "/usr/local/sbin/zradio-sync")
+LOGGER = os.environ.get("ZRADIO_CHANGE_LOGGER", "logger")
+QUIET = int(os.environ.get("ZRADIO_CHANGE_QUIET", "300"))
+MAX_PER_DAY = int(os.environ.get("ZRADIO_CHANGE_MAX_PER_DAY", "6"))
+WEDGE_AFTER = int(os.environ.get("ZRADIO_CHANGE_WEDGE_AFTER", "180"))
+WEDGE_MIN = int(os.environ.get("ZRADIO_CHANGE_WEDGE_MIN", "5"))
+WEDGE_MAX_PER_DAY = int(os.environ.get("ZRADIO_CHANGE_WEDGE_MAX_PER_DAY", "2"))
+WEDGE_TRACE = os.environ.get("ZRADIO_CHANGE_WEDGE_TRACE") == "1"     # print the worst unanswered run seen, change nothing
+WEDGE_MODE = os.environ.get("ZRADIO_CHANGE_WEDGE", "observe")        # observe: say what would be declared, change nothing;
+                                                                    # act: write the marker (keepalived then hands over)
+PORTS = {6639: "zwave", 6638: "zigbee"}          # the defaults; setup() takes the conf's
+MIN_REQUEST = {"zwave": 2, "zigbee": 5}          # a one-byte Z-Wave ACK/NAK/CAN asks for no answer; a ZNP frame is 5+ bytes
+ZIGBEE_PARSED = True                             # False for a Zigbee family whose frames this watcher does not know
+SEEN = os.path.join(STATE, "change-seen")
+STARTS = os.path.join(STATE, "change-syncs")      # one epoch per line: the device-change syncs started in the last 24 h
+WEDGED = os.path.join(STATE, "stick-wedged")      # zradio-serve check fails while this exists; zradio-serve hush clears it
+WEDGE_LOG = os.path.join(STATE, "wedge-declared") # one epoch per line: the declarations of the last 24 h
+
+
+def log(text):
+    print(text, flush=True)
+    try: subprocess.run([LOGGER, "-t", "zradio", "event=change " + text[:300]], timeout=5)
+    except Exception: pass
+
+
+class ZWave:
+    """Host -> controller byte stream: Serial API frames, checksum-verified."""
+    NAMES = {0x4A: "add-node", 0x4B: "remove-node", 0x61: "remove-failed-node", 0x63: "replace-failed-node"}
+
+    def __init__(self): self.buf = bytearray()
+
+    def feed(self, data):
+        out = []; b = self.buf; b += data
+        while b:
+            if b[0] != 0x01: del b[0]; continue          # ACK/NAK/CAN and anything between frames
+            if len(b) < 2: break
+            ln = b[1]
+            if ln < 3: del b[0]; continue                 # not a frame start
+            if len(b) < ln + 2: break                     # the rest comes with the next packet
+            frame = bytes(b[:ln + 2])
+            cs = 0xFF
+            for x in frame[1:-1]: cs ^= x
+            if cs != frame[-1]: del b[0]; continue        # a 0x01 inside other bytes: resync one byte on
+            del b[:ln + 2]
+            typ, func = frame[2], frame[3]
+            if typ != 0x00 or func not in self.NAMES: continue
+            if func in (0x4A, 0x4B):
+                mode = frame[4] & 0x0F if len(frame) > 5 else 0
+                if func == 0x4A and mode not in (1, 2, 3, 4, 8): continue
+                if func == 0x4B and mode not in (1, 2, 3): continue
+                out.append("zwave %s mode=%d" % (self.NAMES[func], mode))
+            else:
+                out.append("zwave %s" % self.NAMES[func])
+        if len(b) > 4096: del b[:-64]
+        return out
+
+
+class Zigbee:
+    """Host -> coordinator byte stream: ZNP frames, FCS-verified."""
+
+    def __init__(self): self.buf = bytearray()
+
+    def feed(self, data):
+        out = []; b = self.buf; b += data
+        while b:
+            if b[0] != 0xFE: del b[0]; continue
+            if len(b) < 2: break
+            ln = b[1]
+            if ln > 250: del b[0]; continue
+            if len(b) < ln + 5: break
+            frame = bytes(b[:ln + 5])
+            fcs = 0
+            for x in frame[1:-1]: fcs ^= x
+            if fcs != frame[-1]: del b[0]; continue
+            del b[:ln + 5]
+            cmd0, cmd1, data_ = frame[2], frame[3], frame[4:-1]
+            if cmd0 != 0x25: continue                     # SREQ to the ZDO subsystem only
+            if cmd1 == 0x36 and len(data_) >= 4:
+                dur = data_[3]
+                if dur > 0: out.append("zigbee permit-join duration=%d" % dur)
+            elif cmd1 == 0x34:
+                out.append("zigbee leave-request")
+        if len(b) > 4096: del b[:-64]
+        return out
+
+
+class Wedge:
+    """Requests from the host that a stick has not answered: per kind, how many and since when."""
+
+    def __init__(self, after=None, need=None):
+        self.after = WEDGE_AFTER if after is None else after; self.need = WEDGE_MIN if need is None else need
+        self.count = {}; self.first = {}; self.worst = {}; self.heard = set()
+
+    def host(self, kind, now, nbytes):
+        if nbytes < MIN_REQUEST[kind]: return
+        if not self.count.get(kind): self.first[kind] = now
+        self.count[kind] = self.count.get(kind, 0) + 1
+
+    def stick(self, kind, now=None):
+        if now is not None: self.heard.add(kind)      # this process has seen this stick answer: only then can silence mean anything
+        if now is not None and self.count.get(kind, 0) >= self.need:
+            self.worst[kind] = max(self.worst.get(kind, 0), now - self.first[kind])
+        self.count[kind] = 0; self.first.pop(kind, None)
+
+    def reset(self): self.count.clear(); self.first.clear()
+
+    def wedged(self, now):
+        return [(k, n, now - self.first[k]) for k, n in sorted(self.count.items())
+                if k in self.heard and n >= self.need and now - self.first[k] >= self.after]
+
+
+def wedge_test():
+    w = Wedge()
+    for line in sys.stdin:
+        f = line.split()
+        if not f or f[0].startswith("#"): continue
+        t = float(f[0])
+        if f[1] == "host": w.host(f[2], t, int(f[3]))
+        elif f[1] == "stick": w.stick(f[2], t)
+        elif f[1] == "check":
+            got = w.wedged(t)
+            print("%g: %s" % (t, "; ".join("%s wedged, %d unanswered for %d s" % (k, n, a) for k, n, a in got) or "nothing"))
+    return 0
+
+
+def declare_wedged(now, kind, count, age):
+    """The active gives the radios up: the marker zradio-serve check fails on, one loud line. False when held back."""
+    if not (role() == "MASTER" and serving()): return False
+    if WEDGE_MODE != "act":
+        log("result=would-wedge stick=%s — %d requests unanswered for %d s; observe mode (ZRADIO_CHANGE_WEDGE is not 'act'): nothing is changed" % (kind, count, age))
+        return False
+    try: xs = [float(x) for x in open(WEDGE_LOG).read().split()]
+    except Exception: xs = []
+    xs = [x for x in xs if now - x < 86400]
+    if len(xs) >= WEDGE_MAX_PER_DAY:
+        log("result=loud wedged-not-declared stick=%s — %d requests unanswered for %d s, but this VM declared a wedged stick %d times in the last 24 h (the limit): the cause may not be a stick; nothing is changed" % (kind, count, age, len(xs)))
+        return False
+    xs.append(now); open(WEDGE_LOG + ".tmp", "w").write("\n".join("%d" % x for x in xs) + "\n"); os.replace(WEDGE_LOG + ".tmp", WEDGE_LOG)
+    open(WEDGED + ".tmp", "w").write("%s %s\n" % (kind, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)))); os.replace(WEDGED + ".tmp", WEDGED)
+    log("result=loud wedged stick=%s — Home Assistant sent %d requests in %d s and the stick answered nothing, with its tty still there: this VM gives the radios up (%s); the other VM takes over. The stick usually needs a power cycle (stop and start this VM)" % (kind, count, age, WEDGED))
+    return True
+
+
+def parse_test():
+    p = {"zwave": ZWave(), "zigbee": Zigbee()}
+    for line in sys.stdin:
+        line = line.strip()
+        if not line or line.startswith("#"): continue
+        kind, _, hexs = line.partition(" ")
+        for ev in p[kind].feed(bytes.fromhex(hexs)): print(ev)
+    return 0
+
+
+def read_kv(path):
+    """KEY=value lines of a conf file (the same strict shape the shell tools accept); anything else is skipped."""
+    out = {}
+    try:
+        for line in open(path):
+            k, sep, v = line.strip().partition("=")
+            if sep and re.fullmatch(r"[A-Z][A-Z0-9_]*", k) and re.fullmatch(r"[A-Za-z0-9./:_@+-]*", v): out[k] = v
+    except OSError: pass
+    return out
+
+
+def setup():
+    """The ports, the Zigbee parser and the interface, from zradio.conf and radios.conf. Returns the interface name."""
+    global PORTS, ZIGBEE_PARSED
+    c, r = read_kv(CONF), read_kv(RADIOS)
+    try: zw, zb = int(c.get("ZWAVE_PORT", "6639")), int(c.get("ZIGBEE_PORT", "6638"))
+    except ValueError: raise SystemExit("zradio-change-watch: ZWAVE_PORT / ZIGBEE_PORT in %s are not numbers" % CONF)
+    PORTS = {}
+    if r.get("ZWAVE", "none") != "none": PORTS[zw] = "zwave"
+    if r.get("ZIGBEE", "none") != "none": PORTS[zb] = "zigbee"
+    ZIGBEE_PARSED = r.get("ZIGBEE_FAMILY") == "znp"
+    if not ZIGBEE_PARSED: MIN_REQUEST["zigbee"] = 1
+    if c.get("IFACE"): return c["IFACE"]
+    me = c.get("SELF")
+    if not me: raise SystemExit("zradio-change-watch: no SELF in %s" % CONF)
+    try: out = subprocess.run([IP, "-o", "-4", "addr", "show"], capture_output=True, text=True, timeout=10).stdout
+    except Exception as e: raise SystemExit("zradio-change-watch: `ip` did not run: %s" % e)
+    for line in out.splitlines():
+        f = line.split()
+        if len(f) >= 4 and f[3].split("/")[0] == me: return f[1]
+    raise SystemExit("zradio-change-watch: no interface holds SELF %s (set IFACE in %s)" % (me, CONF))
+
+
+class Unparsed:
+    """A Zigbee family whose serial protocol this watcher does not read: bytes are counted (the silent-stick check),
+    no add/remove request is ever seen."""
+
+    def __init__(self): self.buf = bytearray()
+
+    def feed(self, data): return []
+
+
+def parser(kind):
+    if kind == "zwave": return ZWave()
+    return Zigbee() if ZIGBEE_PARSED else Unparsed()
+
+
+def role():
+    try: return open(os.path.join(RUN, "role")).read().split()[0]
+    except Exception: return "none"
+
+
+def serving():
+    return subprocess.run(["systemctl", "is-active", "--quiet", "ser2net"]).returncode == 0
+
+
+def starts_last_day(now):
+    try: xs = [float(x) for x in open(STARTS).read().split()]
+    except Exception: xs = []
+    return [x for x in xs if now - x < 86400]
+
+
+def maybe_sync(now, state):
+    """change-seen old enough -> one sync. state: {'warned': epoch of the last over-the-limit line}."""
+    try: age = now - os.stat(SEEN).st_mtime
+    except OSError: return
+    if age < QUIET: return
+    if not (role() == "MASTER" and serving()):
+        try: os.unlink(SEEN)
+        except OSError: pass
+        log("result=dropped this VM is not the active any more: the mark is dropped (the new active's sync covers it)")
+        return
+    xs = starts_last_day(now)
+    if len(xs) >= MAX_PER_DAY:
+        if now - state.get("warned", 0) > 21600:
+            state["warned"] = now
+            log("result=loud %d device-change syncs started in the last 24 h (the limit): no more until one ages out — the nightly sync covers the change" % len(xs))
+        return
+    mark = os.stat(SEEN).st_mtime
+    xs.append(now); open(STARTS + ".tmp", "w").write("\n".join("%d" % x for x in xs) + "\n"); os.replace(STARTS + ".tmp", STARTS)
+    log("result=sync %d s quiet since the last add/remove request: zradio-sync run --reason device-change" % age)
+    rc = subprocess.run([SYNC, "run", "--reason", "device-change"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
+    try:
+        if os.stat(SEEN).st_mtime == mark: os.unlink(SEEN)     # a request seen DURING the sync keeps its own five minutes
+    except OSError: pass
+    log("result=%s zradio-sync run ended rc=%d%s" % ("synced" if rc == 0 else "sync-failed", rc, "" if rc == 0 else " (its pending mark stays: the tick tries again)"))
+
+
+def run():
+    os.makedirs(STATE, exist_ok=True)
+    dev = setup()
+    if not PORTS: raise SystemExit("zradio-change-watch: %s names no radio — nothing to watch" % RADIOS)
+    # ETH_P_ALL, not ETH_P_IP: the kernel hands the packets this machine SENDS only to all-protocol packet sockets. With
+    # ETH_P_IP the sticks' answers were never seen, every request looked unanswered, and both VMs declared a healthy
+    # stick wedged in turn (the outage of 2026-11-11: 2 min 22 s with no radio VM serving).
+    s = socket.socket(socket.AF_PACKET, socket.SOCK_DGRAM, socket.htons(0x0003))    # link header stripped; receive only
+    s.bind((dev, 0x0003)); s.settimeout(5)
+    log("result=started watching %s for add/remove requests to ports %s%s (quiet %d s, at most %d syncs a day); silent sticks: %s after %d requests unanswered for %d s" % (dev, "/".join("%d (%s)" % (p, PORTS[p]) for p in sorted(PORTS)), "" if ZIGBEE_PARSED or "zigbee" not in PORTS.values() else "; this Zigbee family is not parsed", QUIET, MAX_PER_DAY, WEDGE_MODE, WEDGE_MIN, WEDGE_AFTER))
+    parsers = {}        # (src ip, src port, dst port) -> [parser, next seq]
+    state = {}; last_check = 0; wedge = Wedge()
+    while True:
+        try: pkt, addr = s.recvfrom(65535)
+        except socket.timeout: pkt = None
+        now = time.time()
+        if pkt is not None and addr[1] != 0x0800: pkt = None      # IPv4 only (ARP, VRRP's own frames and the rest pass by)
+        if pkt is not None and addr[2] == socket.PACKET_OUTGOING and len(pkt) >= 40 and pkt[9] == 6:
+            ihl = (pkt[0] & 0x0F) * 4                          # what this VM sends: a stick's bytes on their way to the host
+            sport = struct.unpack("!H", pkt[ihl:ihl + 2])[0]
+            if sport in PORTS and struct.unpack("!H", pkt[2:4])[0] > ihl + (pkt[ihl + 12] >> 4) * 4:
+                wedge.stick(PORTS[sport], now)
+        elif pkt is not None and len(pkt) >= 40 and pkt[9] == 6:
+            ihl = (pkt[0] & 0x0F) * 4
+            sport, dport, seq = struct.unpack("!HHI", pkt[ihl:ihl + 8])
+            if dport in PORTS:
+                flags = pkt[ihl + 13]; off = (pkt[ihl + 12] >> 4) * 4
+                total = struct.unpack("!H", pkt[2:4])[0]
+                payload = pkt[ihl + off:total]
+                key = (pkt[12:16], sport, dport)
+                if flags & 0x02:                               # SYN: a new connection, a new stream
+                    parsers[key] = [parser(PORTS[dport]), (seq + 1) & 0xFFFFFFFF]
+                    if len(parsers) > 16: parsers.pop(next(iter(parsers)))
+                elif payload:
+                    st = parsers.get(key)
+                    if st is None: st = parsers[key] = [parser(PORTS[dport]), seq]
+                    if seq == st[1] or ((seq - st[1]) & 0xFFFFFFFF) < 0x7FFFFFFF:      # in order, or after a gap (then: a fresh buffer)
+                        if seq != st[1]: st[0].buf.clear()
+                        st[1] = (seq + len(payload)) & 0xFFFFFFFF
+                        wedge.host(PORTS[dport], now, len(payload))
+                        for ev in st[0].feed(payload):
+                            open(SEEN, "a").close(); os.utime(SEEN, None)
+                            log("result=seen %s — the standby is synced after %d quiet s" % (ev, QUIET))
+                    # else: a retransmission of bytes already read
+        if now - last_check >= 5:
+            last_check = now
+            try: maybe_sync(now, state)
+            except Exception as e: log("result=error %s: %s" % (type(e).__name__, str(e)[:120]))
+            try:
+                if WEDGE_TRACE:
+                    print("trace: heard %s, unanswered now %s, worst answered run %s" % (sorted(wedge.heard), dict(wedge.count), {k: round(v, 1) for k, v in wedge.worst.items()}), flush=True)
+                elif not (role() == "MASTER" and serving()): wedge.reset()       # only a VM that serves can have a wedged stick
+                else:
+                    for kind, count, age in wedge.wedged(now):
+                        declare_wedged(now, kind, count, age); wedge.stick(kind)
+            except Exception as e: log("result=error wedge %s: %s" % (type(e).__name__, str(e)[:120]))
+
+
+if __name__ == "__main__":
+    mode = sys.argv[1] if len(sys.argv) > 1 else ""
+    if mode == "run": run()
+    elif mode == "parse-test": sys.exit(parse_test())
+    elif mode == "wedge-test": sys.exit(wedge_test())
+    elif mode == "declare-test": print(declare_wedged(time.time(), sys.argv[2], int(sys.argv[3]), int(sys.argv[4]))); sys.exit(0)
+    elif mode == "conf-test":
+        dev = setup(); print("iface=%s ports=%s zigbee_parsed=%s" % (dev, ",".join("%d:%s" % (p, PORTS[p]) for p in sorted(PORTS)), ZIGBEE_PARSED)); sys.exit(0)
+    elif mode == "check-test":      # the tests' door to maybe_sync: one pass at the given epoch offset
+        maybe_sync(time.time(), {}); sys.exit(0)
+    else:
+        print(__doc__); sys.exit(0 if mode in ("-h", "--help") else 2)

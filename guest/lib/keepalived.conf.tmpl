@@ -1,0 +1,39 @@
+# /etc/keepalived/keepalived.conf — the radio pair's floating address.
+# Rendered by zradio-render from /etc/zradio/zradio.conf for @NAME@; do not edit here: edit that file and render.
+#
+# Both radio VMs run this with state BACKUP and nopreempt: whoever holds @VIP@ keeps it until it stops, dies or fails
+# its health check; a VM that comes back stays the standby. Adverts go unicast between the two VMs. A graceful stop
+# sends a priority-0 advert, so the peer takes over at once; a peer that vanishes is noticed after three missed adverts.
+global_defs {
+    router_id @NAME@
+    enable_script_security
+    script_user root
+}
+
+vrrp_script radio_health {
+    script "/usr/local/sbin/zradio-serve check"
+    interval 3
+    timeout 2
+    fall 2
+    rise 2
+}
+
+vrrp_instance RADIO {
+    state BACKUP
+    nopreempt
+    interface @IFACE@
+    virtual_router_id @VRID@
+    priority @PRIORITY@
+    advert_int 1
+    unicast_src_ip @SELF@
+    unicast_peer {
+        @PEER@
+    }
+    virtual_ipaddress {
+        @VIP@ dev @IFACE@
+    }
+    track_script {
+        radio_health
+    }
+    notify "/usr/local/sbin/zradio-notify"
+}

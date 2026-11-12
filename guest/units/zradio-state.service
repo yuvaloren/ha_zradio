@@ -1,0 +1,8 @@
+# zradio-state.service — zradio-sync beat: one `zradio: event=state name=… role=… serving=… gen=… dirty=…`
+# journal line a minute from each radio VM (zradio-state.timer). Monitoring can count these lines: no VM serving,
+# both serving, a standby that could not take over. Installed by guest/install.sh.
+[Unit]
+Description=zradio: the state line for monitoring
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/zradio-sync beat

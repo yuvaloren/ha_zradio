@@ -1,0 +1,42 @@
+# /etc/zradio/zradio.conf — the one file a radio pair is described in. Each radio VM has its own copy; between the
+# two VMs only NAME, SELF, PEER and PRIORITY differ. Shell assignments and nothing else: KEY=value, no spaces, no
+# quotes (the file is read by root; any other line refuses the whole file).
+#
+# Give it to the installer:   guest/install.sh --conf zradio.conf --run
+# Change it later:            edit /etc/zradio/zradio.conf, then run guest/install.sh --run again.
+
+# This VM's name in the pair (lower case; shown in every journal line).
+NAME=radio1
+
+# This VM's own address, and the other radio VM's, on the network the two VMs and Home Assistant share. Any IPv4
+# network works: the ordinary LAN, or a dedicated link between the nodes. Both must be fixed addresses.
+SELF=10.20.30.5
+PEER=10.20.30.6
+
+# The floating address, with its prefix length: the one address Home Assistant connects to. Whichever VM serves
+# holds it. It must be free and must stay free (reserve it on the router when it is a LAN address).
+VIP=10.20.30.50/24
+
+# The pair's VRRP id (1-255): the same on both VMs, and different from every other VRRP router on that network.
+VRID=50
+
+# 1-254. It only decides who serves when both VMs start in the same second; a VM that comes back never takes the
+# radios away from the one that serves. Give the two VMs different numbers.
+PRIORITY=110
+
+# Optional. The interface the floating address lives on. Empty = the interface that holds SELF.
+IFACE=
+
+# Optional. The TCP ports the sticks are served on (Home Assistant: Z-Wave JS tcp://VIP:ZWAVE_PORT,
+# ZHA socket://VIP:ZIGBEE_PORT).
+ZWAVE_PORT=6639
+ZIGBEE_PORT=6638
+
+# Optional. When the nightly sync of the standby's sticks runs (HH:MM), and in which time zone (empty = the VM's
+# own). A sync pauses the radios for about 12 seconds: pick a quiet time, away from other nightly jobs that use them.
+SYNC_AT=04:30
+SYNC_TZ=
+
+# Optional. The Z-Wave JS UI container image that writes a copied Z-Wave network onto the standby's stick. A pinned
+# tag: the installer pulls exactly this, once.
+ZUI_IMAGE=docker.io/zwavejs/zwave-js-ui:11.25.2

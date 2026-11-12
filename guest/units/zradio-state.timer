@@ -1,0 +1,8 @@
+# zradio-state.timer — every minute (zradio-sync beat). Enabled on both radio VMs by install.sh --live.
+[Unit]
+Description=zradio: the state line every minute
+[Timer]
+OnCalendar=minutely
+AccuracySec=5s
+[Install]
+WantedBy=timers.target

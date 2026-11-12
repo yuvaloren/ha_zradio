@@ -1,0 +1,9 @@
+# zradio-sync-tick.timer — every 15 min, first 10 min after boot (zradio-sync tick). Enabled on both radio VMs.
+[Unit]
+Description=zradio: catch-up tick every 15 min
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=15min
+AccuracySec=10s
+[Install]
+WantedBy=timers.target

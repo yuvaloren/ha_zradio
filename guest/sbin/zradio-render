@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# zradio-render — the three files that are made from /etc/zradio/zradio.conf (and radios.conf), on stdout. Runs INSIDE
+# a radio VM; the installer writes the output where it belongs. It changes nothing itself.
+#
+#   zradio-render [--keepalived]     /etc/keepalived/keepalived.conf (the default)
+#   zradio-render --ser2net          /etc/ser2net.yaml: one raw TCP port per radio of radios.conf, on the floating address
+#   zradio-render --timer            zradio-sync.timer with the conf's SYNC_AT / SYNC_TZ
+#   [--conf /etc/zradio/zradio.conf] [--template FILE]
+#
+# What it takes from the conf (see zradio.conf.example for the whole file):
+#   NAME=radio2            this VM (router_id)
+#   SELF=10.20.30.6        this VM's own address on the network the pair talks over (unicast source)
+#   PEER=10.20.30.5        the other radio VM's address
+#   VIP=10.20.30.50/24     the floating address Home Assistant connects to
+#   VRID=50                the pair's virtual router id (1-255); unique among VRRP routers on that network
+#   PRIORITY=100           1-254; with nopreempt it only decides who wins when both start at the same moment
+#   IFACE=                 optional: the interface for the adverts and the address. Empty = the one that holds SELF.
+#   ZWAVE_PORT / ZIGBEE_PORT, SYNC_AT / SYNC_TZ
+# Refused (exit 1, nothing printed on stdout): a missing or malformed value, SELF = PEER, SELF or PEER = the VIP, no
+# interface that holds SELF; --ser2net without a radios.conf that names a radio.
+#
+# The ser2net ports are raw TCP: no telnet, no RFC 2217 — ZHA's socket:// and zwave-js's tcp:// both speak the plain
+# byte stream. No banner (it would land in the radio protocol). kickolduser: a reconnecting Home Assistant takes the
+# port over from its own stale session. max-connections 1: two clients on one radio would interleave frames.
+# nouucplock, nobreak, local: no lock files, the break line left alone, the modem-control lines ignored
+# [V ser2net 4.6 with both reference sticks]. Flow control other than "none" (rtscts / xonxoff) is written as
+# radios.conf says and is NOT yet verified on a stick. ser2net started while the floating address is on no interface
+# stays up without a listener and binds by itself once the address appears [V].
+# Tests: tests/t-serve.sh. Env: ZRADIO_CONF, ZRADIO_RADIOS, ZRADIO_RENDER_TEMPLATE, ZRADIO_IP.
+set -uo pipefail
+HERE=$(cd "$(dirname "$0")" && pwd)
+LIB=${ZRADIO_LIB:-$HERE/../lib}; [ -r "$LIB/zradio-common.sh" ] || LIB=/usr/local/lib/zradio
+TMPL=${ZRADIO_RENDER_TEMPLATE:-}
+WHAT=keepalived
+while [ $# -gt 0 ]; do case "$1" in
+  --conf) ZRADIO_CONF=$2; shift 2;; --template) TMPL=$2; shift 2;;
+  --keepalived) WHAT=keepalived; shift;; --ser2net) WHAT=ser2net; shift;; --timer) WHAT=timer; shift;;
+  -h|--help) sed -n '2,/^set -uo pipefail$/{/^set -uo pipefail$/!p}' "$0"; exit 0;; *) echo "unknown arg: $1" >&2; exit 2;; esac; done
+# shellcheck source=../lib/zradio-common.sh
+. "$LIB/zradio-common.sh" || exit 2
+die() { echo "zradio-render: $*" >&2; exit 1; }
+zr_load_conf || die "$ZR_ERR"
+case "$WHAT" in
+timer)
+  : "${TMPL:=$LIB/zradio-sync.timer}"; [ -r "$TMPL" ] || die "no template $TMPL"
+  sed -e "s|@SYNC_AT@|$SYNC_AT|g" -e "s|@SYNC_TZ@|${SYNC_TZ:+ $SYNC_TZ}|g" "$TMPL" || die "sed failed"
+  exit 0;;
+ser2net)
+  zr_load_radios || die "$ZR_ERR"
+  zr_has zwave || zr_has zigbee || die "$ZR_RADIOS names no radio"
+  conn() { # conn <kind> <port> <tty> <baud> <flow>
+    local opts="nobreak,local"
+    case "$5" in hardware) opts="$opts,rtscts";; software) opts="$opts,xonxoff";; esac
+    printf '\nconnection: &%s\n    accepter: tcp,%s,%s\n    enable: on\n    options:\n      kickolduser: true\n      max-connections: 1\n    connector: serialdev(nouucplock=true),%s,%sn81,%s\n' \
+      "$1" "${VIP%/*}" "$2" "$3" "$4" "$opts"
+  }
+  printf '%%YAML 1.1\n---\n# /etc/ser2net.yaml — the sticks of this radio VM on the network, written by the zradio installer (zradio-render --ser2net)\n'
+  printf '# from /etc/zradio/zradio.conf and radios.conf. Do not edit here: edit those and run the installer again.\n'
+  printf '# ser2net.service is NOT enabled at boot: only zradio-serve.service starts it, when this VM holds %s.\n' "${VIP%/*}"
+  printf '#   Home Assistant: ZHA device path socket://%s:%s   Z-Wave JS serial port tcp://%s:%s\n' "${VIP%/*}" "$ZIGBEE_PORT" "${VIP%/*}" "$ZWAVE_PORT"
+  zr_has zigbee && conn zigbee "$ZIGBEE_PORT" "$ZIGBEE_TTY" "$ZIGBEE_BAUD" "$ZIGBEE_FLOW"
+  zr_has zwave && conn zwave "$ZWAVE_PORT" "$ZWAVE_TTY" "$ZWAVE_BAUD" "$ZWAVE_FLOW"
+  exit 0;;
+esac
+: "${TMPL:=$LIB/keepalived.conf.tmpl}"
+[ -r "$TMPL" ] || die "no template $TMPL"
+zr_iface || die "$ZR_ERR"
+IFACE=$ZR_IFACE
+out=$(sed -e "s|@NAME@|$NAME|g" -e "s|@IFACE@|$IFACE|g" -e "s|@SELF@|$SELF|g" -e "s|@PEER@|$PEER|g" \
+          -e "s|@VIP@|$VIP|g" -e "s|@VRID@|$VRID|g" -e "s|@PRIORITY@|$PRIORITY|g" "$TMPL") || die "sed failed"
+case "$out" in *@[A-Z]*@*) die "the template has a placeholder this tool does not know";; esac
+printf '%s\n' "$out"

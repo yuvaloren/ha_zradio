@@ -1,0 +1,219 @@
+#!/usr/bin/env bash
+# zradio-apply — writes a synced set onto THIS VM's sticks: the standby's half of a sync. Runs INSIDE a radio VM as
+# root, called by zradio-sync's receive (and reapply) with the directory the set was unpacked into. Report mode unless
+# --run. Nothing here ever prints a key, an NVM byte or the Zigbee network key.
+#
+#   zradio-apply [--run] [--only zwave|zigbee] [--force] --from DIR
+#   --from DIR: the set, as zradio-sync prepared it: fetch.json (the set's id and the identities to verify: home ID,
+#            node count, RF region and transmit power; IEEE, PAN, channel), zwave-nvm.bin, zha-backup-restore.json
+#            (zigpy's open coordinator backup with the frame counter already raised).
+#   --force: both Z-Wave passes run even when the stick already verifies (what a newer set triggers by itself)
+#
+# Steps with --run, in order (OK / WARN / FAIL / DONE lines; a FAIL in the checks changes nothing):
+#   0. checks: root; the ttys of the networks asked for; ser2net NOT active (a VM that serves never writes over
+#      itself); the set's files; podman with the pinned Z-Wave JS UI image present (pulled at install — a sync must not
+#      depend on the internet); zigpy at $ZIGPY.
+#   1. the set: its identities read from fetch.json.
+#   2. Z-Wave, two passes, each in a Z-Wave JS UI container on the stick (store $ZUI_STORE: port /dev/zwave, no MQTT,
+#      no gateway, no RF settings) that is stopped THE MOMENT the call answers (a driver restarted on the restored
+#      image would interview the mesh next to the live controller), its log kept in DIR, then zradio-probe.py
+#      --soft-reset (the controller reloads its NVM) + read-only serial reads:
+#      (a) CONVERTING — restoreNVM(useRaw=false): zwave-js migrates the image into this stick's NVM; the stick takes
+#          the image's home ID + node table. Verified: home ID and node count == fetch.json. [V: a raw pass alone left
+#          a blank Aeotec Z-Stick 10 Pro on its own home ID with the image's node table.]
+#      (b) RAW — restoreNVM(useRaw=true): the image as it is, which repairs the RF config the converting pass misreads
+#          on that stick (region "unknown", 0 dBm). Verified: the set's RF region and power, home ID kept.
+#      A pass is skipped when its verification already holds (re-runs resume) — unless the set is another one than the
+#      last record's: then both run (the stick must hold THIS set). The stick's receiver is switched OFF right after
+#      each pass, the moment its container is stopped, and once more at the end (zradio-probe.py --rf-receive off):
+#      a powered copy with the live home ID otherwise receives and ACKs the mesh's frames next to the live controller
+#      [V: 2 of 121 routed commands on the live mesh took 14–16 s in the ~15 s a restored copy listened].
+#   3. Zigbee: zigpy radio znp <tty> restore zha-backup-restore.json (the coordinator forms the restored network:
+#      IEEE, PAN, channel, keys, the raised counter) → zigpy … info: IEEE, PAN, channel == fetch.json. The coordinator
+#      is on the air from the restore until the caller silences it — seconds (zradio-sync runs zradio-serve down next).
+#   4. the record: $STATE/last-restore.json (+ a dated copy) — the set, the identities, the verification; no secret.
+# Exit 0 = every asked network written and verified; 1 = a FAIL (what was already done stays done: a re-run resumes).
+# [V reference pair 2026-11-11: 90–97 s for both networks.] Tests: tests/t-apply.sh. Env: ZRADIO_APPLY_*.
+set -uo pipefail
+RUN=0 ONLY="" FORCE_ARG=0 FROM=""
+HERE=$(cd "$(dirname "$0")" && pwd)
+LIB=${ZRADIO_LIB:-$HERE/../lib}; [ -r "$LIB/zradio-common.sh" ] || LIB=/usr/local/lib/zradio
+# shellcheck source=../lib/zradio-common.sh
+. "$LIB/zradio-common.sh" || exit 2
+ZUI_IMAGE_ARG=${ZRADIO_APPLY_ZUI_IMAGE:-}
+while [ $# -gt 0 ]; do case "$1" in
+  --run) RUN=1; shift;; --only) ONLY=$2; shift 2;; --force) FORCE_ARG=1; shift;; --from) FROM=$2; shift 2;; --zui-image) ZUI_IMAGE_ARG=$2; shift 2;;
+  -h|--help) sed -n '2,/^set -uo pipefail$/{/^set -uo pipefail$/!p}' "$0"; exit 0;; *) echo "unknown arg: $1" >&2; exit 2;; esac; done
+case "$ONLY" in ""|zwave|zigbee) ;; *) echo "die: --only zwave|zigbee" >&2; exit 2;; esac
+[ -n "$FROM" ] || { echo "die: --from DIR (the set to write)" >&2; exit 2; }
+TOOLS=${ZRADIO_APPLY_TOOLS:-$LIB}
+STATE=${ZRADIO_APPLY_STATE:-/var/lib/zradio}
+ZUI_STORE=${ZRADIO_APPLY_ZUI_STORE:-/etc/zradio/zui}
+ZIGPY=${ZRADIO_APPLY_ZIGPY:-/opt/zradio/zigpy/bin/zigpy}
+ZUI_URL=${ZRADIO_APPLY_ZUI_URL:-http://127.0.0.1:8091}
+zr_load_radios || true
+ZWAVE_TTY=${ZRADIO_APPLY_ZWAVE_TTY:-$ZWAVE_TTY}
+ZIGBEE_TTY=${ZRADIO_APPLY_ZIGBEE_TTY:-$ZIGBEE_TTY}
+ZUI_IMAGE=docker.io/zwavejs/zwave-js-ui:11.25.2
+zr_load_conf 2>/dev/null || ZUI_IMAGE=docker.io/zwavejs/zwave-js-ui:11.25.2     # the conf's pin when there is a conf
+[ -z "$ZUI_IMAGE_ARG" ] || ZUI_IMAGE=$ZUI_IMAGE_ARG
+CT=zradio-zui
+FAILS=0
+ok()   { printf 'OK    %s\n' "$*"; }
+warn() { printf 'WARN  %s\n' "$*"; }
+bad()  { printf 'FAIL  %s\n' "$*"; FAILS=$((FAILS + 1)); }
+done_(){ printf 'DONE  %s\n' "$*"; }
+would(){ printf 'WOULD %s\n' "$*"; }
+want() { [ -z "$ONLY" ] || [ "$ONLY" = "$1" ]; }   # want <net>
+jq_()  { python3 -c 'import json,sys; d=json.load(open(sys.argv[1]))
+for k in sys.argv[2].split("."):
+    d = d.get(k) if isinstance(d, dict) else None
+print("" if d is None else d)' "$1" "$2"; }
+
+MODE=REPORT; [ $RUN = 1 ] && MODE=RUN
+echo "== 0. checks ($MODE mode) =="
+[ "$(id -u)" = 0 ] && ok "root" || bad "not root"
+for f in zradio-probe.py zui-restore.py; do [ -f "$TOOLS/$f" ] && ok "$TOOLS/$f" || bad "$TOOLS/$f missing"; done
+if want zwave; then [ -e "$ZWAVE_TTY" ] && ok "Z-Wave stick at $ZWAVE_TTY" || bad "no $ZWAVE_TTY (the udev rule zradio-detect wrote / the stick / the USB passthrough)"; fi
+if want zigbee; then [ -e "$ZIGBEE_TTY" ] && ok "Zigbee stick at $ZIGBEE_TTY" || bad "no $ZIGBEE_TTY (the udev rule zradio-detect wrote / the stick / the USB passthrough)"; fi
+systemctl is-active --quiet ser2net 2>/dev/null && bad "ser2net is active — a radio VM that serves never writes over itself (zradio-sync applies on the standby only)" || ok "ser2net not active"
+[ -f "$FROM/fetch.json" ] && ok "the set in $FROM: fetch.json" || bad "$FROM: no fetch.json there"
+if want zwave; then [ -s "$FROM/zwave-nvm.bin" ] && ok "the set: zwave-nvm.bin" || bad "$FROM: no zwave-nvm.bin"; fi
+if want zigbee; then [ -s "$FROM/zha-backup-restore.json" ] && ok "the set: zha-backup-restore.json" || bad "$FROM: no zha-backup-restore.json"; fi
+if want zwave; then
+  command -v podman >/dev/null && ok "podman $(podman --version 2>/dev/null | awk '{print $3}')" || bad "podman missing"
+  podman image exists "$ZUI_IMAGE" 2>/dev/null && ok "image $ZUI_IMAGE present" || bad "image $ZUI_IMAGE not present — the installer pulls it (podman pull $ZUI_IMAGE)"
+  podman container exists "$CT" 2>/dev/null && { podman rm -f "$CT" >/dev/null 2>&1 && warn "a stale $CT container removed"; }
+  [ -f "$ZUI_STORE/settings.json" ] && ok "Z-Wave JS UI store $ZUI_STORE (settings.json)" || bad "no $ZUI_STORE/settings.json"
+fi
+if want zigbee; then [ -x "$ZIGPY" ] && ok "zigpy at $ZIGPY" || bad "no zigpy at $ZIGPY"; fi
+echo "== checks: $FAILS FAIL =="
+[ $FAILS -eq 0 ] || { echo "REFUSED: fix the FAIL lines; nothing was changed"; exit 1; }
+DIR=$FROM
+ZW_HOME=$(jq_ "$DIR/fetch.json" identities.zwave.home_id); ZW_NODES=$(jq_ "$DIR/fetch.json" identities.zwave.nodes)
+EXPECT_REGION=$(jq_ "$DIR/fetch.json" identities.zwave.rf_region); EXPECT_POWER=$(jq_ "$DIR/fetch.json" identities.zwave.tx_power_dbm)
+[ -z "$EXPECT_POWER" ] || EXPECT_POWER=$(python3 -c 'import sys; print("%g" % float(sys.argv[1]))' "$EXPECT_POWER")
+ZB_IEEE=$(jq_ "$DIR/fetch.json" identities.zigbee.ieee); ZB_PAN=$(jq_ "$DIR/fetch.json" identities.zigbee.pan_id); ZB_CH=$(jq_ "$DIR/fetch.json" identities.zigbee.channel)
+if want zwave && { [ -z "$ZW_HOME" ] || [ -z "$ZW_NODES" ] || [ -z "$EXPECT_REGION" ] || [ -z "$EXPECT_POWER" ]; }; then
+  bad "fetch.json names no Z-Wave identity (home ID, nodes, RF region, power) — nothing to verify against, nothing written"; exit 1; fi
+if want zigbee && { [ -z "$ZB_IEEE" ] || [ -z "$ZB_PAN" ] || [ -z "$ZB_CH" ]; }; then
+  bad "fetch.json names no Zigbee identity (IEEE, PAN, channel) — nothing to verify against, nothing written"; exit 1; fi
+if [ $RUN = 0 ]; then
+  would "use the set in $FROM"
+  want zwave && would "Z-Wave: $ZUI_IMAGE on $ZWAVE_TTY → converting pass (home ID $ZW_HOME, $ZW_NODES nodes) → raw pass (RF $EXPECT_REGION at $EXPECT_POWER dBm), each: podman stop the instant it answers → the receiver off → zradio-probe.py --soft-reset"
+  want zigbee && would "Zigbee: $ZIGPY radio znp $ZIGBEE_TTY restore <zha-backup-restore.json> → info == fetch.json"
+  echo "REPORT ONLY — nothing changed. Re-run with --run."; exit 0
+fi
+
+TS=$(date -u +%Y%m%dT%H%M%SZ)
+echo "== 1. the set in $DIR =="
+want zwave && done_ "Z-Wave set $(jq_ "$DIR/fetch.json" sets.zwave): home ID $ZW_HOME, $ZW_NODES nodes, $(wc -c < "$DIR/zwave-nvm.bin" | tr -d ' ') bytes"
+want zigbee && done_ "Zigbee set $(jq_ "$DIR/fetch.json" sets.zigbee): IEEE $ZB_IEEE, PAN $ZB_PAN, channel $ZB_CH, counter $(jq_ "$DIR/fetch.json" bump.from) → $(jq_ "$DIR/fetch.json" bump.to)"
+mkdir -p "$STATE"; REC="$STATE/restore-$TS.json"
+python3 - "$REC" "$TS" "$DIR/fetch.json" <<'PY'
+import json, sys
+rec = {"ts": sys.argv[2], "fetch": json.load(open(sys.argv[3])), "zwave": None, "zigbee": None}
+json.dump(rec, open(sys.argv[1], "w"), indent=1)
+PY
+
+if want zwave; then
+  echo "== 2. Z-Wave: two passes through a local Z-Wave JS UI — converting (home ID + nodes), then raw (the RF config) =="
+  zw_pass() { # zw_pass <converting|raw> <extra zui args…>
+    local mode=$1; shift
+    local DEV; DEV=$(readlink -f "$ZWAVE_TTY")   # the udev symlink's target: podman maps the device node itself
+    podman container exists "$CT" 2>/dev/null && podman rm -f "$CT" >/dev/null 2>&1
+    if podman run -d --name "$CT" --device "$DEV:/dev/zwave" -p 127.0.0.1:8091:8091 -v "$ZUI_STORE:/usr/src/app/store" "$ZUI_IMAGE" >/dev/null 2>&1; then
+      ok "container $CT started on $ZWAVE_TTY ($DEV → /dev/zwave; $ZUI_IMAGE) for the $mode pass"
+    else bad "podman run $CT failed"; exit 1; fi
+    python3 "$TOOLS/zui-restore.py" restore --url "$ZUI_URL" --nvm "$DIR/zwave-nvm.bin" --mode "$mode" --expect-home-id "$ZW_HOME" --expect-nodes "$ZW_NODES" --wait 180 "$@" 2>&1 | sed 's/^/    /'
+    local rc=${PIPESTATUS[0]}
+    podman stop -t 2 "$CT" >/dev/null 2>&1
+    # the stick holds a network now and listens: its receiver off AT ONCE, before the logs, the SoftReset and the reads.
+    # The setting survives the SoftReset that follows.
+    local i quiet=0
+    for i in 1 2 3 4 5; do
+      if python3 "$TOOLS/zradio-probe.py" --zwave "$ZWAVE_TTY" --rf-receive off --json 2>"$DIR/probe-rf-off-$mode.err" >/dev/null && grep -q "RF receive mode OFF" "$DIR/probe-rf-off-$mode.err"; then quiet=1; break; fi
+      sleep 0.5
+    done
+    [ $quiet = 1 ] && ok "the receiver is off right after the $mode pass (try $i)" || warn "the receiver did not answer 'off' right after the $mode pass ($(grep -E 'FAIL' "$DIR/probe-rf-off-$mode.err" | head -1 | cut -c1-100)) — it is switched off after the reads"
+    podman logs "$CT" > "$DIR/zui-$mode.log" 2>&1; podman rm -f "$CT" >/dev/null 2>&1
+    ok "container $CT stopped and removed (no driver restart on the restored image); its log: $DIR/zui-$mode.log ($(wc -l < "$DIR/zui-$mode.log" | tr -d ' ') lines)"
+    [ "$rc" = 0 ] || { bad "the $mode pass did not succeed (rc $rc) — read its lines above and $DIR/zui-$mode.log"; exit 1; }
+    sleep 1
+  }
+  zw_read() { # zw_read [--soft-reset]: the stick by serial, into got_home/got_nodes/got_region/got_power and V
+    local try
+    for try in 1 2 3 4 5; do   # right after power-on the stick answers CAN for ~5 s
+      PROBE=$(python3 "$TOOLS/zradio-probe.py" --zwave "$ZWAVE_TTY" "$@" --json 2>"$DIR/probe.err")
+      printf '%s' "$PROBE" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("zwave",{}).get("ok") else 1)' 2>/dev/null && break
+      [ "$try" = 5 ] || { warn "serial read $try: $(grep FAIL "$DIR/probe.err" | head -1 | cut -c1-120) — 3 s, again"; sleep 3; }
+    done
+    grep -E "NOTE|FAIL" "$DIR/probe.err" | sed 's/^/    /'
+    V=$(printf '%s' "$PROBE" | python3 -c '
+import json, sys
+d = json.load(sys.stdin); z = d.get("zwave", d); rf = z.get("rf") or {}
+print(json.dumps({"ok": z.get("ok"), "home_id_hex": z.get("home_id_hex"), "node_count": z.get("node_count"),
+                  "rf_region": rf.get("region"), "tx_power_dbm": rf.get("tx_power_dbm"), "sdk": z.get("sdk"), "error": z.get("error")}))' 2>/dev/null || echo '{}')
+    got_home=$(printf '%s' "$V" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("home_id_hex") or "")')
+    got_nodes=$(printf '%s' "$V" | python3 -c 'import json,sys; v=json.load(sys.stdin).get("node_count"); print("" if v is None else v)')
+    got_region=$(printf '%s' "$V" | python3 -c 'import json,sys; v=json.load(sys.stdin).get("rf_region"); print("" if v is None else v)')
+    got_power=$(printf '%s' "$V" | python3 -c 'import json,sys; v=json.load(sys.stdin).get("tx_power_dbm"); print("" if v is None else ("%g" % v))')
+  }
+  same_home() { [ "$(printf '%s' "$got_home" | tr 'A-F' 'a-f')" = "$(printf '%s' "$ZW_HOME" | tr 'A-F' 'a-f')" ] && [ "$got_nodes" = "$ZW_NODES" ]; }
+  rf_right() { [ "$got_region" = "$EXPECT_REGION" ] && [ "$got_power" = "$EXPECT_POWER" ]; }
+  # another set than the last one written (a day's routes, a device added): both passes run even when the home ID
+  # already matches — the stick must hold THIS set; the same set id = resume where the last run stopped
+  NEW_SET=$(jq_ "$DIR/fetch.json" sets.zwave); LAST_SET=$(jq_ "$STATE/last-restore.json" fetch.sets.zwave 2>/dev/null || true)
+  FORCE=""; [ -n "$LAST_SET" ] && [ "$LAST_SET" != "$NEW_SET" ] && { FORCE=--force; warn "another set than the last one written ($LAST_SET → $NEW_SET): both passes run (--force)"; }
+  [ $FORCE_ARG = 1 ] && [ -z "$FORCE" ] && { FORCE=--force; warn "--force: both passes run whatever the stick holds"; }
+  zw_read
+  if [ -z "$FORCE" ] && same_home; then ok "the stick already holds home ID $got_home with $got_nodes nodes — the converting pass is skipped"
+  else
+    zw_pass converting $FORCE
+    zw_read --soft-reset
+    if same_home; then ok "after the converting pass + SoftReset: home ID $got_home with $got_nodes nodes (serial read, no driver)"
+    else bad "after the converting pass the stick reads home ID '$got_home' with '$got_nodes' nodes — expected $ZW_HOME with $ZW_NODES"; exit 1; fi
+  fi
+  if [ -z "$FORCE" ] && rf_right; then ok "RF region $got_region at $got_power dBm already — the raw pass is skipped"
+  else
+    rf_right || warn "RF before the raw pass: region '$got_region' at '$got_power' dBm (the converting pass can rewrite a stick's RF config; the raw pass repairs it)"
+    zw_pass raw --force
+    zw_read --soft-reset
+    if same_home && rf_right; then ok "after the raw pass + SoftReset: home ID $got_home with $got_nodes nodes, RF region $got_region at $got_power dBm"
+    else bad "after the raw pass the stick reads home ID '$got_home', '$got_nodes' nodes, RF '$got_region' at '$got_power' dBm — expected $ZW_HOME / $ZW_NODES / $EXPECT_REGION at $EXPECT_POWER"; exit 1; fi
+  fi
+  python3 - "$REC" "$V" <<'PY'
+import json, sys
+rec = json.load(open(sys.argv[1])); rec["zwave"] = json.loads(sys.argv[2]); json.dump(rec, open(sys.argv[1], "w"), indent=1)
+PY
+  # the written copy stays powered: its receiver OFF (it would ACK the live mesh's frames)
+  if python3 "$TOOLS/zradio-probe.py" --zwave "$ZWAVE_TTY" --rf-receive off --json 2>"$DIR/probe-rf-off.err" >/dev/null \
+     && grep -q "RF receive mode OFF" "$DIR/probe-rf-off.err"; then ok "the stick's RF receiver is off until its next power-up (a powered copy must not ACK the live mesh)"
+  else warn "could not switch the stick's RF receiver off ($(grep -E 'FAIL' "$DIR/probe-rf-off.err" | head -1 | cut -c1-120)) — zradio-serve down tries again next"; fi
+  [ $FAILS -eq 0 ] || exit 1
+fi
+
+if want zigbee; then
+  echo "== 3. Zigbee: zigpy restore onto the coordinator =="
+  if "$ZIGPY" radio znp "$ZIGBEE_TTY" restore "$DIR/zha-backup-restore.json" >"$DIR/zigpy-restore.log" 2>&1; then
+    done_ "zigpy restore done ($(wc -l < "$DIR/zigpy-restore.log" | tr -d ' ') log lines kept in $DIR, not shown — they can hold key material)"
+  else bad "zigpy restore failed (rc $?): $(grep -viE 'key' "$DIR/zigpy-restore.log" | tail -3 | tr '\n' ' ')"; exit 1; fi
+  INFO=$("$ZIGPY" radio znp "$ZIGBEE_TTY" info 2>/dev/null)
+  field() { printf '%s\n' "$INFO" | awk -v k="$1" 'tolower($0) ~ "^" k ":" {sub(/^[^:]*:[ \t]*/, ""); print tolower($0); exit}'; }   # the IEEE holds colons: strip up to the first one
+  got_ieee=$(field "device ieee"); got_pan=$(field "pan id"); got_ch=$(field "channel")
+  norm() { printf '%s' "$1" | tr 'A-F' 'a-f' | sed 's/^0x//'; }
+  if [ "$(norm "$got_ieee")" = "$(norm "$ZB_IEEE")" ] && [ "$(norm "$got_pan")" = "$(norm "$ZB_PAN")" ] && [ "$got_ch" = "$ZB_CH" ]; then
+    ok "the coordinator reads IEEE $got_ieee, PAN $got_pan, channel $got_ch (== the set)"
+  else bad "the coordinator reads IEEE '$got_ieee', PAN '$got_pan', channel '$got_ch' — expected $ZB_IEEE / $ZB_PAN / $ZB_CH"; fi
+  python3 - "$REC" "$got_ieee" "$got_pan" "$got_ch" <<'PY'
+import json, sys
+rec = json.load(open(sys.argv[1])); rec["zigbee"] = {"ieee": sys.argv[2], "pan_id": sys.argv[3], "channel": sys.argv[4]}
+json.dump(rec, open(sys.argv[1], "w"), indent=1)
+PY
+  [ $FAILS -eq 0 ] || exit 1
+fi
+
+cp -f "$REC" "$STATE/last-restore.json"
+find "$STATE" -maxdepth 1 -name 'restore-*.json' -mtime +30 -delete 2>/dev/null || true
+echo "== done: written and verified from the set in $DIR — record $STATE/last-restore.json; the caller puts the sticks to silent standby next =="
+exit 0

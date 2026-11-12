@@ -1,0 +1,165 @@
+{
+ "_comment": "What Home Assistant's USB lists do not say and the kit needs: which serial protocol a stick speaks (family), its serial settings, and on a two-port adapter which port is the radio. Keyed by 'VID:PID description-glob' exactly as the list has it. 'proven' = served, synced and failed over on real hardware by this project; everything else is taken from public documentation and NOT yet verified on a stick ('served only' until someone proves it). tools/update-usb-ids.py merges this into guest/lib/usb-ids.json. In 'add': confirm=true = a generic bridge chip, a radio only if it answers the probe; beside=<kind> = counts only when the same device's other port answered as that kind.",
+ "annotate": {
+  "10C4:EA60 *sonoff*plus*": {
+   "family": "znp",
+   "baud": 115200,
+   "flow": "none",
+   "proven": true,
+   "note": "SONOFF ZBDongle-P (CC2652P, Z-Stack). The -E model shares the product string family but has another USB id."
+  },
+  "10C4:EA60 *2652*": {
+   "family": "znp",
+   "baud": 115200,
+   "flow": "none"
+  },
+  "10C4:EA60 *tubeszb*": {
+   "family": "",
+   "baud": 115200,
+   "flow": "none",
+   "note": "CC2652 and EFR32 variants exist: the probe decides."
+  },
+  "1A86:7523 *tubeszb*": {
+   "family": "",
+   "baud": 115200,
+   "flow": "none",
+   "note": "CC2652 and EFR32 variants exist: the probe decides."
+  },
+  "1A86:7523 *zigstar*": {
+   "family": "znp",
+   "baud": 115200,
+   "flow": "none"
+  },
+  "1A86:55D4 *sonoff*plus*": {
+   "family": "ezsp",
+   "baud": 115200,
+   "flow": "none",
+   "note": "SONOFF ZBDongle-E (EFR32MG21)."
+  },
+  "10C4:EA60 *slzb-07*": {
+   "family": "ezsp",
+   "baud": 115200,
+   "flow": "none"
+  },
+  "10C4:EA60 *sonoff*max*": {
+   "family": "ezsp",
+   "baud": 115200,
+   "flow": "none"
+  },
+  "10C4:EA60 *sonoff*lite*mg21*": {
+   "family": "ezsp",
+   "baud": 115200,
+   "flow": "none"
+  },
+  "10C4:EA60 *skyconnect v1.0*": {
+   "family": "ezsp",
+   "baud": 115200,
+   "flow": "hardware"
+  },
+  "10C4:EA60 *home assistant connect zbt-1*": {
+   "family": "ezsp",
+   "baud": 115200,
+   "flow": "hardware"
+  },
+  "303A:4001 *zbt-2*": {
+   "family": "ezsp",
+   "baud": 460800,
+   "flow": "none"
+  },
+  "303A:831A *zbt-2*": {
+   "family": "ezsp",
+   "baud": 460800,
+   "flow": "none"
+  },
+  "10C4:8B34 *bv 2010/10*": {
+   "family": "ezsp",
+   "baud": 57600,
+   "flow": "software"
+  },
+  "10C4:8A2A *zigbee*": {
+   "family": "ezsp",
+   "baud": 57600,
+   "flow": "software",
+   "iface": "01",
+   "note": "Nortek HUSBZB-1: port 1 is the Zigbee radio."
+  },
+  "1CF1:0030 *conbee*": {
+   "family": "deconz",
+   "baud": 115200,
+   "flow": "none"
+  },
+  "0403:6015 *conbee*": {
+   "family": "deconz",
+   "baud": 115200,
+   "flow": "none"
+  },
+  "0403:6015 *zigate*": {
+   "family": "zigate",
+   "baud": 115200,
+   "flow": "none"
+  },
+  "10C4:EA60 *zigate*": {
+   "family": "zigate",
+   "baud": 115200,
+   "flow": "none"
+  },
+  "0658:0200 *": {
+   "family": "",
+   "baud": 115200,
+   "flow": "none",
+   "note": "500-series sticks (CDC ACM): the probe reads the chip."
+  },
+  "10C4:8A2A *z-wave*": {
+   "family": "",
+   "baud": 115200,
+   "flow": "none",
+   "iface": "00",
+   "note": "Nortek HUSBZB-1: port 0 is the Z-Wave radio."
+  },
+  "303A:4001 *nabu casa zwa-2*": {
+   "family": "",
+   "baud": 115200,
+   "flow": "none"
+  },
+  "10C4:EA60 *sonoff*zwave*": {
+   "family": "",
+   "baud": 115200,
+   "flow": "none"
+  }
+ },
+ "add": [
+  {
+   "vid": "10C4",
+   "pid": "EA70",
+   "description": "*",
+   "iface": "01",
+   "kind": "zwave",
+   "family": "",
+   "baud": 115200,
+   "flow": "none",
+   "proven": true,
+   "known_devices": [
+    "Aeotec Z-Stick 10 Pro (Z-Wave port)"
+   ],
+   "source": "zradio",
+   "note": "A CP2105 two-port bridge with a generic product string: port 1 is the Z-Wave controller. Any other CP2105 device matches too \u2014 the probe decides.",
+   "confirm": true
+  },
+  {
+   "vid": "10C4",
+   "pid": "EA70",
+   "description": "*",
+   "iface": "00",
+   "kind": "zigbee",
+   "family": "ezsp",
+   "baud": 115200,
+   "flow": "none",
+   "known_devices": [
+    "Aeotec Z-Stick 10 Pro (Zigbee port)"
+   ],
+   "source": "zradio",
+   "note": "Port 0 of the same bridge: the stick's Zigbee radio. Not probed (no EZSP probe yet): a Zigbee stick that answers a probe is preferred over it.",
+   "beside": "zwave"
+  }
+ ]
+}

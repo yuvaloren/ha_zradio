@@ -1,0 +1,285 @@
+#!/usr/bin/env python3
+"""zradio-detect — finds the Z-Wave and Zigbee sticks plugged into THIS radio VM, says what each one is and what the kit
+can do with it, and (with --write) records that for the other tools. Nobody types a radio's name, port or id.
+
+    zradio-detect                 the table: every USB serial port, what it is, the level it gets. Changes nothing.
+    zradio-detect --write         … and writes /etc/zradio/radios.conf (read by every zradio tool), radios.json (the
+                                  same with every detail) and /etc/udev/rules.d/99-zradio.rules (the stable names
+                                  /dev/zradio-zwave and /dev/zradio-zigbee), then reloads udev.
+    zradio-detect --use zigbee=/dev/ttyUSB3[:family]     overrule the choice for one kind (repeatable)
+    zradio-detect --no-probe      table lookups only: nothing is sent to any stick
+    zradio-detect --json          the result as JSON on stdout (the table goes to stderr)
+
+How a stick is recognised, in this order:
+  1. The list. Every /dev/ttyUSB* and /dev/ttyACM* is looked up by USB vendor:product, product string and port number
+     in guest/lib/usb-ids.json: the USB lists Home Assistant's own Zigbee and Z-Wave integrations ship, plus the kit's
+     annotations (which serial protocol, which port of a two-port adapter). A match gives a HINT, never the answer.
+  2. The probe, read-only (zradio-probe.py): a port hinted Z-Wave — or with no hint — is asked for its controller id
+     over the Z-Wave Serial API; a port hinted Zigbee without a family, hinted Z-Stack, or with no hint, is asked for
+     its version over TI's ZNP. Nothing is written, nothing is transmitted on the air. A port whose hint names a family
+     the kit has no probe for (EZSP, deCONZ, ZiGate) is not sent anything.
+  3. The level, per kind (one stick per kind is served):
+       synced   Z-Wave 800 series, and Zigbee on TI Z-Stack (ZNP): served, kept silent as a standby, and copied from
+                the active VM's stick — the two families this is proven on.
+       served   any other Z-Wave or Zigbee stick: served to Home Assistant and failed over. Not silenced, not copied:
+                the standby's stick of such a family must hold no network.
+     Two candidates for one kind: one that answered a probe beats one that could not be probed; of two that answered,
+     the one that holds a network beats a blank one; otherwise the choice is yours (--use).
+
+Refused: probing on a VM that serves (ser2net active — the ttys are in use; the table still prints with --no-probe).
+Exit 0 = at least one radio found (and written with --write); 1 = none, or an undecided choice; 2 = usage.
+Tests: tests/t-detect.sh. Env: ZRADIO_DETECT_* (DEV, UDEVADM, PROBE, IDS, ETC, UDEV_RULES), ZRADIO_LIB.
+"""
+import fnmatch, glob, json, os, re, subprocess, sys, time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+LIB = os.environ.get("ZRADIO_LIB") or os.path.join(HERE, "..", "lib")
+if not os.path.exists(os.path.join(LIB, "usb-ids.json")): LIB = "/usr/local/lib/zradio"
+E = os.environ.get
+DEV = E("ZRADIO_DETECT_DEV", "/dev")
+UDEVADM = E("ZRADIO_DETECT_UDEVADM", "udevadm")
+PROBE = E("ZRADIO_DETECT_PROBE", os.path.join(LIB, "zradio-probe.py"))
+IDS = E("ZRADIO_DETECT_IDS", os.path.join(LIB, "usb-ids.json"))
+ETC = E("ZRADIO_DETECT_ETC", "/etc/zradio")
+UDEV_RULES = E("ZRADIO_DETECT_UDEV_RULES", "/etc/udev/rules.d/99-zradio.rules")
+SYSTEMCTL = E("ZRADIO_DETECT_SYSTEMCTL", "systemctl")
+SYNCED = {"zwave": ("zwave-800",), "zigbee": ("znp",)}          # the families the kit silences and copies
+# Z-Wave chip type (GetSerialApiInitData) -> series [zwave-js packages/core/src/definitions/ZWaveChipTypes.ts]
+ZW_SERIES = {0x05: "zwave-500", 0x07: "zwave-700", 0x08: "zwave-800"}
+# products proven by this project whatever their chip byte says: (manufacturer id, product type, product id)
+ZW_PROVEN = {(0x0371, 0x0004, 0x003C): "zwave-800"}             # Aeotec Z-Stick 10 Pro
+KINDS = ("zwave", "zigbee")
+TEXT = {"zwave": "Z-Wave", "zigbee": "Zigbee"}
+
+
+def say(line): print(line, file=sys.stderr if "--json" in sys.argv else sys.stdout)
+
+
+def props(tty):
+    """udev's properties of a tty, as a dict (empty when udevadm does not know it)."""
+    try: out = subprocess.run([UDEVADM, "info", "-q", "property", "-n", tty], capture_output=True, text=True, timeout=10).stdout
+    except Exception: return {}
+    return dict(l.split("=", 1) for l in out.splitlines() if "=" in l)
+
+
+def lookup(ids, p):
+    """The list entries a port matches: vendor:product, the product-string glob, the manufacturer, the port number."""
+    vid, pid = p.get("ID_VENDOR_ID", "").upper(), p.get("ID_MODEL_ID", "").upper()
+    desc = p.get("ID_MODEL", "").replace("_", " ").lower(); man = p.get("ID_VENDOR", "").replace("_", " ").lower()
+    out = []
+    for e in ids:
+        if e["vid"] != vid or e["pid"] != pid: continue
+        if not fnmatch.fnmatch(desc, e.get("description", "*")): continue
+        if e.get("manufacturer") and not fnmatch.fnmatch(man, "*%s*" % e["manufacturer"]): continue
+        if e.get("iface") and e["iface"] != p.get("ID_USB_INTERFACE_NUM", ""): continue
+        out.append(e)
+    # the most specific description first: "*sonoff*plus*" before "*"
+    out.sort(key=lambda e: (-len(e.get("description", "*").replace("*", "")), not e.get("proven")))
+    return out
+
+
+def probe(kind, tty):
+    """One read-only probe; the probe's own dict for that kind, with ok true/false."""
+    try:
+        r = subprocess.run([sys.executable, PROBE, "--" + kind, tty, "--json", "--budget", "12", "--timeout", "3"],
+                           capture_output=True, text=True, timeout=40)
+        return (json.loads(r.stdout or "{}").get(kind) or {"ok": False, "error": (r.stderr.strip().splitlines() or ["no answer"])[-1][:160]})
+    except Exception as e:
+        return {"ok": False, "error": "%s: %s" % (type(e).__name__, str(e)[:120])}
+
+
+def zwave_family(r):
+    key = (r.get("manufacturer_id"), r.get("product_type"), r.get("product_id"))
+    if key in ZW_PROVEN: return ZW_PROVEN[key]
+    m = re.match(r"0x([0-9a-f]{2})/", str(r.get("chip") or ""))
+    return ZW_SERIES.get(int(m.group(1), 16), "zwave") if m else "zwave"
+
+
+def examine(tty, ids, do_probe):
+    """Everything about one port: its udev facts, the hint, the probes' answers, and what it is."""
+    p = props(tty)
+    c = {"tty": tty, "usb": "%s:%s" % (p.get("ID_VENDOR_ID", "?"), p.get("ID_MODEL_ID", "?")), "product": p.get("ID_MODEL", "").replace("_", " "),
+         "vendor": p.get("ID_VENDOR", "").replace("_", " "), "iface": p.get("ID_USB_INTERFACE_NUM", ""), "serial": p.get("ID_SERIAL_SHORT", ""),
+         "kind": None, "family": "", "probed": False, "holds_network": None, "baud": 115200, "flow": "none", "why": "", "hint": None, "identity": {}}
+    hits = lookup(ids, p)
+    if hits:
+        h = hits[0]
+        c["hint"] = {"kind": h["kind"], "family": h.get("family", ""), "name": ", ".join(h.get("known_devices", [])), "source": h.get("source", ""), "proven": bool(h.get("proven")),
+                     "confirm": bool(h.get("confirm")), "beside": h.get("beside", "")}
+        c["baud"], c["flow"] = h.get("baud", 115200), h.get("flow", "none")
+    hk, hf = (c["hint"]["kind"], c["hint"]["family"]) if c["hint"] else (None, "")
+    if hk == "zigbee" and hf not in ("", "znp"):
+        c.update(kind="zigbee", family=hf, why="the list says %s (%s); the kit has no probe for that family: not sent anything" % (c["hint"]["name"] or hf, hf))
+        return c
+    if not do_probe:
+        if hk: c.update(kind=hk, family=hf, why="the list says %s; not probed (--no-probe)" % (c["hint"]["name"] or hk))
+        else: c["why"] = "not in the list; not probed (--no-probe)"
+        return c
+    tries = [hk] if hk else list(KINDS)                # a hinted port gets its own protocol's probe only
+    errs = []
+    for k in tries:
+        r = probe(k, tty)
+        if r.get("ok"):
+            c["probed"] = True; c["kind"] = k
+            if k == "zwave":
+                c["family"] = zwave_family(r); c["holds_network"] = r.get("verdict") == "live"
+                c["identity"] = {x: r.get(x) for x in ("home_id_hex", "node_count", "sdk", "chip", "manufacturer_id", "product_type", "product_id")}
+                c["why"] = "answers the Z-Wave Serial API: SDK %s, chip %s, %s" % (r.get("sdk"), r.get("chip"), "a network of %s node(s)" % r.get("node_count") if c["holds_network"] else "no network (blank)")
+            else:
+                c["family"] = "znp"; c["holds_network"] = r.get("verdict") == "live"
+                c["identity"] = {x: r.get(x) for x in ("ieee", "version", "code_revision", "device_state_name")}
+                c["why"] = "answers TI's ZNP: Z-Stack %s (%s), %s" % (r.get("version"), r.get("code_revision"), "on a network" if c["holds_network"] else "no network (blank)")
+            return c
+        errs.append("%s: %s" % (TEXT[k], r.get("error") or "no answer"))
+    if hk and c["hint"]["confirm"]:      # a generic bridge chip: only an answer makes it a radio
+        c["why"] = "a %s could be here (%s), but nothing answered the %s probe (%s): not a radio" % (TEXT[hk], c["hint"]["name"], TEXT[hk], "; ".join(errs)[:160])
+    elif hk:    # the list named it, the stick did not answer its protocol: served as the list says, never synced
+        c.update(kind=hk, family=hf or "", why="the list says %s, but it did not answer the %s probe (%s)" % (c["hint"]["name"] or hk, TEXT[hk], "; ".join(errs)[:160]))
+        c["unanswered"] = True
+    else:
+        c["why"] = "not in the list and no answer to either probe (%s): not a radio the kit knows" % "; ".join(errs)[:200]
+    return c
+
+
+def level(c):
+    return "synced" if c["probed"] and c["family"] in SYNCED[c["kind"]] else "served"
+
+
+def choose(cands, forced):
+    """One stick per kind. Returns ({kind: candidate}, [lines about what was passed over], [problems])."""
+    chosen, notes, problems = {}, [], []
+    for k in KINDS:
+        if k in forced:
+            f = [c for c in cands if c["tty"] == forced[k][0]]
+            if not f: problems.append("--use %s=%s: no such serial port here" % (k, forced[k][0])); continue
+            c = f[0]; c["kind"] = k
+            if forced[k][1]: c["family"] = forced[k][1]
+            c["why"] = "--use: " + (c["why"] or "named by hand"); chosen[k] = c; continue
+        pool = [c for c in cands if c["kind"] == k]
+        if not pool: continue
+        def rank(c): return (c["probed"], bool(c["holds_network"]), not c.get("unanswered"))
+        pool.sort(key=rank, reverse=True)
+        if len(pool) > 1 and rank(pool[0]) == rank(pool[1]):
+            problems.append("two %s sticks the kit cannot choose between (%s and %s): unplug one, or name one with --use %s=<port>" % (TEXT[k], pool[0]["tty"], pool[1]["tty"], k))
+            continue
+        chosen[k] = pool[0]
+        for c in pool[1:]:
+            notes.append("%s is also a %s radio (%s) and is NOT used: %s was chosen (%s). To use it instead: --use %s=%s" % (
+                c["tty"], TEXT[k], c["product"] or c["usb"], pool[0]["tty"], "it answered a probe" if pool[0]["probed"] and not c["probed"] else "it holds a network", k, c["tty"]))
+    return chosen, notes, problems
+
+
+def udev_rule(c, name, cands):
+    """A rule that names this port by what it IS (ids, product string, port number) — and by serial only when another
+    port here would match the same line. A replaced stick of the same model gets the name without an edit."""
+    def q(v): return v.replace("\\", "\\\\").replace('"', '\\"')
+    vid, pid = c["usb"].split(":")
+    same = [o for o in cands if o is not c and o["usb"] == c["usb"] and o["product"] == c["product"] and o["iface"] == c["iface"]]
+    parts = ['SUBSYSTEM=="tty"', 'ENV{ID_VENDOR_ID}=="%s"' % q(vid), 'ENV{ID_MODEL_ID}=="%s"' % q(pid)]
+    if c["product"]: parts.append('ENV{ID_MODEL}=="%s"' % q(c["product"].replace(" ", "_")))
+    if c["iface"]: parts.append('ENV{ID_USB_INTERFACE_NUM}=="%s"' % q(c["iface"]))
+    if same and c["serial"]: parts.append('ENV{ID_SERIAL_SHORT}=="%s"' % q(c["serial"]))
+    return ", ".join(parts) + ', SYMLINK+="%s"' % name
+
+
+def write_atomic(path, text, mode=0o644):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + ".tmp", "w") as f: f.write(text)
+    os.chmod(path + ".tmp", mode); os.replace(path + ".tmp", path)
+
+
+def main():
+    args = sys.argv[1:]; forced = {}; write = False; do_probe = True
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-h", "--help"): print(__doc__); return 0
+        elif a == "--write": write = True
+        elif a == "--no-probe": do_probe = False
+        elif a == "--json": pass
+        elif a == "--use" and i + 1 < len(args):
+            i += 1
+            m = re.fullmatch(r"(zwave|zigbee)=(/[A-Za-z0-9/_.-]+)(?::([a-z0-9-]+))?", args[i])
+            if not m: print("die: --use zwave|zigbee=/dev/ttyX[:family]", file=sys.stderr); return 2
+            forced[m.group(1)] = (m.group(2), m.group(3) or "")
+        else: print("unknown arg: %s (--help)" % a, file=sys.stderr); return 2
+        i += 1
+    try: ids = json.load(open(IDS))["entries"]
+    except Exception as e: print("die: cannot read the USB list %s: %s" % (IDS, e), file=sys.stderr); return 2
+    serving = subprocess.run([SYSTEMCTL, "is-active", "--quiet", "ser2net"]).returncode == 0
+    if serving and do_probe:
+        print("REFUSED: ser2net is active — this VM serves and its sticks are in use. Run this on the standby, or with --no-probe for the list's view.", file=sys.stderr); return 1
+    if write and not do_probe:
+        print("REFUSED: --write needs the probe (a level is only as good as what the stick answered)", file=sys.stderr); return 2
+    ttys = sorted(glob.glob(os.path.join(DEV, "ttyUSB*")) + glob.glob(os.path.join(DEV, "ttyACM*")))
+    for t in (v[0] for v in forced.values()):
+        if t not in ttys and os.path.exists(t): ttys.append(t)
+    cands = [examine(t, ids, do_probe) for t in ttys]
+    for c in cands:     # a port that is only a radio beside its device's other port (the Zigbee side of a two-radio stick)
+        b = (c["hint"] or {}).get("beside")
+        if c["kind"] and b and do_probe and not any(o is not c and o["usb"] == c["usb"] and o["serial"] == c["serial"] and o["kind"] == b and o["probed"] for o in cands):
+            c["why"] = "would be the %s side of %s, but that device's %s port did not answer: not a radio" % (TEXT[c["kind"]], c["hint"]["name"], TEXT[b]); c["kind"] = None
+    if not do_probe:                # the list's view only: a level is never given without the stick's own answer
+        say("== USB serial ports on this VM: %d (the list's view; nothing was sent to any of them) ==" % len(cands))
+        for c in cands:
+            say("  %-14s %s  %-9s %s" % (os.path.basename(c["tty"]), c["usb"], ("port " + c["iface"]) if c["iface"] else "", c["product"] or "(no product string)"))
+            say("      %s — %s" % ((TEXT[c["kind"]] + (" (%s)" % c["family"] if c["family"] else "")) if c["kind"] else "—", c["why"]))
+        say("Nothing was chosen and no level was given: the probe decides (run without --no-probe on a VM that does not serve).")
+        if "--json" in sys.argv: print(json.dumps({"format": "zradio radios v1", "ports": cands, "radios": {}, "problems": []}, indent=1, default=str))
+        return 0
+    chosen, notes, problems = choose(cands, forced)
+    say("== USB serial ports on this VM: %d ==" % len(cands))
+    for c in cands:
+        used = [k for k, v in chosen.items() if v is c]
+        tag = ("%-6s %s" % (TEXT[used[0]], level(c).upper())) if used else ("%-6s not used" % TEXT[c["kind"]] if c["kind"] else "—      not a radio")
+        say("  %-14s %s  %-9s %s%s" % (os.path.basename(c["tty"]), c["usb"], ("port " + c["iface"]) if c["iface"] else "", c["product"] or "(no product string)", ""))
+        say("      %s%s — %s" % (tag, (" (%s)" % c["family"]) if c["kind"] and c["family"] else "", c["why"]))
+    for n in notes: say("NOTE  " + n)
+    for k in KINDS:
+        c = chosen.get(k)
+        if not c: say("%-7s none" % (TEXT[k] + ":")); continue
+        lv = level(c)
+        say("%-7s %s on %s — %s" % (TEXT[k] + ":", lv.upper(), c["tty"], {
+            "synced": "served, kept silent as a standby, and copied from the active VM's stick",
+            "served": "served and failed over; NOT silenced and NOT copied (family %s is not proven for that): the standby's %s stick must hold no network" % (c["family"] or "unknown", TEXT[k])}[lv]))
+        if lv == "served" and not c["probed"] and c.get("hint") and not c["hint"]["proven"]:
+            say("        its serial settings (%d baud, flow control %s) come from the list and are not verified on this model: set %s_BAUD / %s_FLOW in radios.conf if Home Assistant cannot talk to it" % (c["baud"], c["flow"], k.upper(), k.upper()))
+    for p in problems: say("FAIL  " + p)
+    result = {"format": "zradio radios v1", "detected_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+              "radios": {k: dict(chosen[k], level=level(chosen[k]), name="/dev/zradio-" + k) for k in chosen}, "ports": cands, "problems": problems}
+    if "--json" in sys.argv: print(json.dumps(result, indent=1, default=str))
+    if problems or not chosen:
+        if not chosen and not problems: say("FAIL  no Z-Wave or Zigbee stick found on this VM (is the USB device passed through?)")
+        if write: say("nothing was written")
+        return 1
+    if not write:
+        say("REPORT ONLY — nothing was written. Re-run with --write."); return 0
+    lines = ["# /etc/zradio/radios.conf — written by zradio-detect --write on %s. What this VM's sticks are and what the kit" % result["detected_utc"],
+             "# does with each (synced | served | none). Re-run zradio-detect --write after changing a stick; edit by hand only",
+             "# to overrule it (a level may be lowered to 'served'; raising one to 'synced' asks the kit to write to a stick it",
+             "# has not proven it can write to)."]
+    for k in KINDS:
+        c = chosen.get(k); K = k.upper()
+        if not c: lines.append("%s=none" % K); continue
+        lines += ["%s=%s" % (K, level(c)), "%s_FAMILY=%s" % (K, c["family"]), "%s_TTY=/dev/zradio-%s" % (K, k), "%s_BAUD=%d" % (K, c["baud"]), "%s_FLOW=%s" % (K, c["flow"])]
+    rules = ["# /etc/udev/rules.d/99-zradio.rules — written by zradio-detect --write: stable names for this VM's radio sticks,",
+             "# by what each one is (not by which ttyUSB number it got today)."]
+    for k in KINDS:
+        if k in chosen: rules.append(udev_rule(chosen[k], "zradio-" + k, cands))
+    write_atomic(os.path.join(ETC, "radios.json"), json.dumps(result, indent=1, default=str) + "\n")
+    write_atomic(UDEV_RULES, "\n".join(rules) + "\n")
+    write_atomic(os.path.join(ETC, "radios.conf"), "\n".join(lines) + "\n")
+    rc = 0
+    for cmd in ([UDEVADM, "control", "--reload"], [UDEVADM, "trigger", "--action=add", "--subsystem-match=tty"], [UDEVADM, "settle", "--timeout=10"]):
+        try:
+            if subprocess.run(cmd, capture_output=True, timeout=30).returncode != 0: rc = 1
+        except Exception: rc = 1
+    missing = [k for k in chosen if not os.path.exists(os.path.join(DEV, "zradio-" + k))]
+    if rc or missing:
+        say("FAIL  written, but udev did not make %s (udevadm rc %d): read %s" % (", ".join("/dev/zradio-" + k for k in missing) or "the names", rc, UDEV_RULES)); return 1
+    say("DONE  %s, %s and %s written; %s exist" % (os.path.join(ETC, "radios.conf"), os.path.join(ETC, "radios.json"), UDEV_RULES, " and ".join("/dev/zradio-" + k for k in KINDS if k in chosen)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

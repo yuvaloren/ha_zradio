@@ -1,0 +1,17 @@
+# A radio VM boots silent: a stick powers up with its receiver on, so before
+# keepalived may elect anyone this VM switches the Z-Wave receiver off and resets the coordinator. If keepalived then
+# makes this VM the active one, zradio-serve.service switches the receiver on again.
+[Unit]
+Description=zradio: both sticks silent at boot, before keepalived
+After=systemd-udev-settle.service local-fs.target
+Wants=systemd-udev-settle.service
+Before=keepalived.service zradio-serve.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/zradio-serve down
+TimeoutStartSec=90
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,10 @@
+# zradio.target — everything that makes this VM a member of the pair, under one name: `systemctl start zradio.target`
+# after the first install (the installer starts nothing), and at every boot. The sticks are silenced first
+# (zradio-quiet), then keepalived decides who serves; the timers and the watcher only matter on the VM that serves.
+# Starting it on a VM that is already in the pair changes nothing. Installed by guest/install.sh.
+[Unit]
+Description=zradio: this VM takes part in the radio pair
+Wants=zradio-quiet.service keepalived.service zradio-sync.timer zradio-sync-tick.timer zradio-state.timer zradio-change-watch.service
+After=zradio-quiet.service
+[Install]
+WantedBy=multi-user.target
