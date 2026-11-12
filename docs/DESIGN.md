@@ -58,11 +58,14 @@ them); and a 15-minute catch-up tick with back-off after a failure.
 Rails, each from something that went wrong or nearly did:
 
 - A VM never serves a stick set that was not written to the end (a mark on disk, set before the first write).
-- At install a node is the **primary** (its sticks hold the networks and are left alone) or the **standby** (its
-  sticks will be overwritten). The installer asks and does not guess. A standby carries the same mark from the
-  install until the primary's first sync, whatever its sticks hold, so an old copy on them never reaches the air; a
-  "primary" whose sticks hold no network is refused and marked, unless the house is new (`--first`). The role is a
-  fact about the day of the install only: after the first sync the two VMs are equals.
+- At install a node is **initially** the primary (its sticks hold the networks and are left alone) or the standby
+  (its sticks will be overwritten). The installer asks and does not guess. A standby carries the same mark from
+  the install until the primary's first sync, whatever its sticks hold, so an old copy on them never reaches the
+  air; a "primary" whose sticks hold no network is refused and marked, unless the house is new (`--first`).
+  **Initial, because the two swap:** after the first sync either serves, so the answer is used once and kept
+  (`initial-role`). The same answer on a later run changes nothing — it would otherwise mark the VM that serves
+  today, or free one that a sync is filling. The installer's mark carries a line of text and zradio-sync's own is
+  empty: the installer lifts only its own.
 - A new VM whose synced sticks hold no network does not serve until a sync has filled them.
 - A returning VM is synced once by the serving VM's next tick. Until that sync it is a standby with an older copy:
   with the election of §3a armed (`ELECTION=act`) it is held out of the claim for that time and asks for the sync at

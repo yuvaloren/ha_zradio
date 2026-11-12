@@ -60,7 +60,7 @@ SH
   chmod +x "$d/bin/qm"
 }
 zvm() { local d=$1; shift; PATH="$d/bin:$PATH" ZRADIO_VM_SYS="$d/sys" ZRADIO_VM_PVE="$d/pve" ZRADIO_VM_CACHE="$d/cache" ZRADIO_VM_WAIT=0 ZRADIO_VM_KEYS="$d/keys" bash "$TOOL" "$@" > "$d/out" 2>&1 < /dev/null; RC=$?; }   # nobody there to answer
-BASE=(--name zr2 --role standby --self 10.20.30.6/24 --peer 10.20.30.5 --vip 10.20.30.50/24 --pair-bridge vmbrpair)
+BASE=(--name zr2 --initial-role standby --self 10.20.30.6/24 --peer 10.20.30.5 --vip 10.20.30.50/24 --pair-bridge vmbrpair)
 vmconf() { printf '%s\n' "${@:3}" > "$1/pve/nodes/${2%%/*}/qemu-server/${2##*/}.conf"; }      # vmconf <dir> <node>/<id> <lines…>
 
 echo "-- sticks: what the node has that the kit knows"
@@ -110,7 +110,7 @@ import sys, yaml
 r = yaml.safe_load(open(sys.argv[1]))["runcmd"]
 assert r[0] == ["systemctl", "enable", "--now", "qemu-guest-agent"]
 assert r[1][2] == "mkdir -p /opt/zradio/kit && tar -xzf /root/zradio-kit.tgz -C /opt/zradio/kit"
-assert r[2][2] == "bash /opt/zradio/kit/guest/install.sh --conf /root/zradio.conf --run --detect --role standby > /var/log/zradio-install.log 2>&1; echo $? > /root/zradio-install.rc", r[2][2]' "$Y"
+assert r[2][2] == "bash /opt/zradio/kit/guest/install.sh --conf /root/zradio.conf --run --detect --initial-role standby > /var/log/zradio-install.log 2>&1; echo $? > /root/zradio-install.rc", r[2][2]' "$Y"
 if command -v cloud-init >/dev/null 2>&1; then
   check "…and the real cloud-init accepts the file (cloud-init schema)" bash -c 'cloud-init schema --config-file "$1" 2>&1 | grep -q "^Valid schema"' _ "$Y"
 else echo "  (cloud-init is not installed here: its schema check of the file is skipped)"; fi
@@ -120,41 +120,41 @@ check "the VM's addresses are shown; without --start it is NOT put into the pair
 
 echo "-- options"
 node "$T/o"; zvm "$T/o" create "${BASE[@]/standby/primary}" --run --start --first --hookscript local:snippets/my-hook.sh --conf SYNC_TZ=Europe/Berlin --conf ELECTION=observe --vmid 150 --priority 110 --vrid 77 --pair-mac BC:24:11:0A:63:36 --memory 1024 --cores 1 --disk 12G
-check "--start joins the pair after the install; --first reaches install.sh" bash -c '[ "$2" = 0 ] && grep -q "guest: systemctl start zradio.target" "$1/calls" && grep -q "install.sh --conf /root/zradio.conf --run --detect --role primary --first > " "$1/store/snippets/zr2-zradio.yaml" && grep -q "it is in the pair" "$1/out"' _ "$T/o" "$RC"
+check "--start joins the pair after the install; --first reaches install.sh" bash -c '[ "$2" = 0 ] && grep -q "guest: systemctl start zradio.target" "$1/calls" && grep -q "install.sh --conf /root/zradio.conf --run --detect --initial-role primary --first > " "$1/store/snippets/zr2-zradio.yaml" && grep -q "it is in the pair" "$1/out"' _ "$T/o" "$RC"
 check "--hookscript, --vmid, --pair-mac, --memory, --cores, --disk reach qm" bash -c 'grep "^qm create 150 " "$1/calls" | grep -q -- "--cores 1 --memory 1024 .*--net1 virtio=BC:24:11:0A:63:36,bridge=vmbrpair .*--hookscript local:snippets/my-hook.sh" && grep -q "^qm disk resize 150 scsi0 12G" "$1/calls"' _ "$T/o"
 check "--conf lines, --priority and --vrid reach zradio.conf" bash -c 'grep -q "^      SYNC_TZ=Europe/Berlin$" "$1" && grep -q "^      ELECTION=observe$" "$1" && grep -q "^      PRIORITY=110$" "$1" && grep -q "^      VRID=77$" "$1"' _ "$T/o/store/snippets/zr2-zradio.yaml"
-node "$T/o2"; zvm "$T/o2" create --name zr2 --role standby --self 192.0.2.6/24 --peer 192.0.2.5 --vip 192.0.2.50/24 --gateway 192.0.2.1 --no-ha --run
+node "$T/o2"; zvm "$T/o2" create --name zr2 --initial-role standby --self 192.0.2.6/24 --peer 192.0.2.5 --vip 192.0.2.50/24 --gateway 192.0.2.1 --no-ha --run
 check "no --pair-bridge: one interface, --self on the LAN with the gateway" bash -c '[ "$2" = 0 ] && grep "^qm create" "$1/calls" | grep -q -- "--net0 virtio,bridge=vmbr0 --ipconfig0 ip=192.0.2.6/24,gw=192.0.2.1 --serial0" && ! grep -q "net1" "$1/calls"' _ "$T/o2" "$RC"
 check "--no-ha: a plain qm start, no ha-manager call" bash -c 'grep -q "^qm start 109" "$1/calls" && ! grep -q "^ha-manager" "$1/calls"' _ "$T/o2"
-zvm "$T/o2" create --name zr3 --role standby --self 192.0.2.6/24 --peer 192.0.2.5 --vip 192.0.2.50/24
+zvm "$T/o2" create --name zr3 --initial-role standby --self 192.0.2.6/24 --peer 192.0.2.5 --vip 192.0.2.50/24
 check "no --pair-bridge and no --gateway: refused before anything (exit 2)" bash -c '[ "$2" = 2 ] && grep -q "gateway A.B.C.D is needed" "$1/out"' _ "$T/o2" "$RC"
 
 echo "-- primary or standby: the one thing the tool will not guess"
 NOROLE=(--name zr2 --self 10.20.30.6/24 --peer 10.20.30.5 --vip 10.20.30.50/24 --pair-bridge vmbrpair)
 ask() { local d=$1; shift; PATH="$d/bin:$PATH" ZRADIO_VM_ASK=1 ZRADIO_VM_SYS="$d/sys" ZRADIO_VM_PVE="$d/pve" ZRADIO_VM_CACHE="$d/cache" ZRADIO_VM_WAIT=0 ZRADIO_VM_KEYS="$d/keys" bash "$TOOL" "$@" > "$d/out" 2>&1; RC=$?; }   # answers on stdin (a here-string, not a pipe: RC must be this shell's)
 node "$T/q1"; zvm "$T/q1" create "${NOROLE[@]}" --run
-check "no --role and nobody to ask: refused before anything, with what each role means for the node's radios" bash -c '[ "$2" = 2 ] && grep -q "role primary (its radios are configured" "$1/out" && grep -q "role standby (its radios will be wiped" "$1/out" && [ ! -s "$1/calls" ]' _ "$T/q1" "$RC"
-node "$T/q2"; zvm "$T/q2" create "${NOROLE[@]}" --role standby --run
-check "--role standby: said in capitals that the sticks WILL BE OVERWRITTEN; the installer in the VM is told; priority 100" bash -c '[ "$2" = 0 ] && grep -q "NOTE  this node is the STANDBY: its sticks WILL BE OVERWRITTEN" "$1/out" && grep -q "install.sh --conf /root/zradio.conf --run --detect --role standby > " "$1/store/snippets/zr2-zradio.yaml" && grep -q "^      PRIORITY=100$" "$1/store/snippets/zr2-zradio.yaml" && grep -q "installed in zr2, as the standby" "$1/out"' _ "$T/q2" "$RC"
-node "$T/q3"; zvm "$T/q3" create "${NOROLE[@]}" --role primary --run
-check "--role primary: its sticks stay as they are; the installer is told; priority 110 (it wins a tie)" bash -c '[ "$2" = 0 ] && grep -q "OK    this node is the PRIMARY: its sticks hold your networks and stay as they are" "$1/out" && grep -q -- "--run --detect --role primary > " "$1/store/snippets/zr2-zradio.yaml" && grep -q "^      PRIORITY=110$" "$1/store/snippets/zr2-zradio.yaml"' _ "$T/q3" "$RC"
-node "$T/q4"; zvm "$T/q4" create "${NOROLE[@]}" --role primary --priority 77 --run
+check "no --initial-role and nobody to ask: refused before anything, with what each role means for the node's radios — and that it is only for the start" bash -c '[ "$2" = 2 ] && grep -q "what this node is INITIALLY" "$1/out" && grep -q "the two swap later" "$1/out" && grep -q "role primary (its radios are configured" "$1/out" && grep -q "role standby (its radios will be wiped" "$1/out" && [ ! -s "$1/calls" ]' _ "$T/q1" "$RC"
+node "$T/q2"; zvm "$T/q2" create "${NOROLE[@]}" --initial-role standby --run
+check "--initial-role standby: said in capitals that the sticks WILL BE OVERWRITTEN; the installer in the VM is told; priority 100" bash -c '[ "$2" = 0 ] && grep -q "NOTE  this node starts as the STANDBY: its sticks WILL BE OVERWRITTEN" "$1/out" && grep -q "install.sh --conf /root/zradio.conf --run --detect --initial-role standby > " "$1/store/snippets/zr2-zradio.yaml" && grep -q "^      PRIORITY=100$" "$1/store/snippets/zr2-zradio.yaml" && grep -q "installed in zr2, as the initial standby" "$1/out"' _ "$T/q2" "$RC"
+node "$T/q3"; zvm "$T/q3" create "${NOROLE[@]}" --initial-role primary --run
+check "--initial-role primary: its sticks stay as they are; the installer is told; priority 110 (it wins a tie)" bash -c '[ "$2" = 0 ] && grep -q "OK    this node starts as the PRIMARY: its sticks hold your networks and stay as they are" "$1/out" && grep -q -- "--run --detect --initial-role primary > " "$1/store/snippets/zr2-zradio.yaml" && grep -q "^      PRIORITY=110$" "$1/store/snippets/zr2-zradio.yaml"' _ "$T/q3" "$RC"
+node "$T/q4"; zvm "$T/q4" create "${NOROLE[@]}" --initial-role primary --priority 77 --run
 check "--priority said: it is the one used" bash -c 'grep -q "^      PRIORITY=77$" "$1/store/snippets/zr2-zradio.yaml"' _ "$T/q4"
-node "$T/q5"; zvm "$T/q5" create "${NOROLE[@]}" --role standby --first --run
-check "--role standby with --first: refused (a standby is filled by the sync)" bash -c '[ "$2" = 2 ] && grep -q "first is for the primary of a new house" "$1/out" && [ ! -s "$1/calls" ]' _ "$T/q5" "$RC"
-node "$T/q6"; zvm "$T/q6" create "${NOROLE[@]}" --role both --run
-check "--role that is neither: refused" bash -c '[ "$2" = 2 ] && [ ! -s "$1/calls" ]' _ "$T/q6" "$RC"
+node "$T/q5"; zvm "$T/q5" create "${NOROLE[@]}" --initial-role standby --first --run
+check "--initial-role standby with --first: refused (a standby is filled by the sync)" bash -c '[ "$2" = 2 ] && grep -q "first is for the initial primary of a new house" "$1/out" && [ ! -s "$1/calls" ]' _ "$T/q5" "$RC"
+node "$T/q6"; zvm "$T/q6" create "${NOROLE[@]}" --initial-role both --run
+check "--initial-role that is neither: refused" bash -c '[ "$2" = 2 ] && [ ! -s "$1/calls" ]' _ "$T/q6" "$RC"
 node "$T/q7"; ask "$T/q7" create "${NOROLE[@]}" --run <<< 'standby'
-check "someone is there: asked in the words that matter (configured / WILL BE WIPED); 'standby' is the standby" bash -c '[ "$2" = 0 ] && grep -q "primary  its radios are configured" "$1/out" && grep -q "standby  its radios WILL BE WIPED" "$1/out" && grep -q -- "--detect --role standby > " "$1/store/snippets/zr2-zradio.yaml"' _ "$T/q7" "$RC"
+check "someone is there: asked what the node is INITIALLY (the two swap), in the words that matter (configured / WILL BE WIPED); 'standby' is the standby" bash -c '[ "$2" = 0 ] && grep -q "Is this node INITIALLY the primary or the standby of the pair?" "$1/out" && grep -q "the two are equals and swap" "$1/out" && grep -q "primary  its radios are configured" "$1/out" && grep -q "standby  its radios WILL BE WIPED" "$1/out" && grep -q -- "--detect --initial-role standby > " "$1/store/snippets/zr2-zradio.yaml"' _ "$T/q7" "$RC"
 node "$T/q8"; ask "$T/q8" create "${NOROLE[@]}" --run <<< $'dunno\nPrimary\nn'
-check "an answer that is neither is asked again; a primary is asked whether its sticks hold the networks — 'n' is a new house (--first)" bash -c '[ "$2" = 0 ] && [ "$(grep -o "primary or standby: " "$1/out" | wc -l)" = 2 ] && grep -q "already hold your Z-Wave / Zigbee networks" "$1/out" && grep -q -- "--detect --role primary --first > " "$1/store/snippets/zr2-zradio.yaml" && grep -q "PRIMARY: a new house" "$1/out"' _ "$T/q8" "$RC"
+check "an answer that is neither is asked again; a primary is asked whether its sticks hold the networks — 'n' is a new house (--first)" bash -c '[ "$2" = 0 ] && [ "$(grep -o "primary or standby: " "$1/out" | wc -l)" = 2 ] && grep -q "already hold your Z-Wave / Zigbee networks" "$1/out" && grep -q -- "--detect --initial-role primary --first > " "$1/store/snippets/zr2-zradio.yaml" && grep -q "starts as the PRIMARY: a new house" "$1/out"' _ "$T/q8" "$RC"
 node "$T/q9"; ask "$T/q9" create "${NOROLE[@]}" --run <<< $'p\n'
-check "…Enter there: the sticks hold the networks (no --first)" bash -c '[ "$2" = 0 ] && grep -q -- "--detect --role primary > " "$1/store/snippets/zr2-zradio.yaml"' _ "$T/q9" "$RC"
+check "…Enter there: the sticks hold the networks (no --first)" bash -c '[ "$2" = 0 ] && grep -q -- "--detect --initial-role primary > " "$1/store/snippets/zr2-zradio.yaml"' _ "$T/q9" "$RC"
 node "$T/q10"; ask "$T/q10" create "${NOROLE[@]}" --run < /dev/null
 check "no answer at all: refused, nothing made" bash -c '[ "$2" = 2 ] && [ ! -s "$1/calls" ]' _ "$T/q10" "$RC"
 
 echo "-- the VM's name is the user's: a flag, a question, or the first free default"
-NONAME=(--role standby --self 10.20.30.6/24 --peer 10.20.30.5 --vip 10.20.30.50/24 --pair-bridge vmbrpair)
+NONAME=(--initial-role standby --self 10.20.30.6/24 --peer 10.20.30.5 --vip 10.20.30.50/24 --pair-bridge vmbrpair)
 node "$T/n1"; zvm "$T/n1" create "${NONAME[@]}" --run
 check "no --name and nobody to ask: zradio1, said" bash -c '[ "$2" = 0 ] && grep -q "NOTE  no --name: this VM is called zradio1" "$1/out" && grep -q "^qm create 109 --name zradio1 " "$1/calls" && [ -f "$1/store/snippets/zradio1-zradio.yaml" ] && grep -q "^      NAME=zradio1$" "$1/store/snippets/zradio1-zradio.yaml"' _ "$T/n1" "$RC"
 node "$T/n2"; echo '[{"vmid":105,"name":"zradio1","node":"nodeb","status":"running"}]' > "$T/n2/vms.json"; zvm "$T/n2" create "${NONAME[@]}" --run
@@ -252,5 +252,5 @@ node "$T/f5"; echo 1 > "$T/f5/install.rc"; printf 'FAIL  zradio-detect did not e
 check "the kit's installer failed in the VM: its FAIL line is shown, exit 1, the VM is not put into the pair" bash -c '[ "$2" = 1 ] && grep -q "| *FAIL  zradio-detect did not end clean" "$1/out" && grep -q "install.sh ended 1 in zr2" "$1/out" && ! grep -q "guest: systemctl start" "$1/calls"' _ "$T/f5" "$RC"
 
 echo "-- help"
-check "--help names both commands and says that nothing is changed without --run" bash -c 'bash "$1" --help | grep -q "zradio-vm sticks" && bash "$1" --help | grep -q "zradio-vm create --role primary|standby --self A.B.C.D/NN" && bash "$1" --help | grep -q "role standby .*WILL BE WIPED" && bash "$1" --help | grep -q "name NAME .*yours to choose" && bash "$1" --help | grep -q "Report mode unless --run" && ! bash "$1" --help | grep -q "^set -uo"' _ "$TOOL"
+check "--help names both commands and says that nothing is changed without --run" bash -c 'bash "$1" --help | grep -q "zradio-vm sticks" && bash "$1" --help | grep -q "zradio-vm create --initial-role primary|standby --self A.B.C.D/NN" && bash "$1" --help | grep -q "what this node is INITIALLY" && bash "$1" --help | grep -q "standby  this node.s radios WILL BE WIPED" && bash "$1" --help | grep -q "name NAME .*yours to choose" && bash "$1" --help | grep -q "Report mode unless --run" && ! bash "$1" --help | grep -q "^set -uo"' _ "$TOOL"
 finish

@@ -5,14 +5,17 @@
 #
 #   install.sh --conf my-zradio.conf [--run]     first install: the pair's one config file (zradio.conf.example)
 #   install.sh [--run]                           later runs: /etc/zradio/zradio.conf is already there
-#   --role primary   this VM's sticks ARE the house's networks: they stay as they are, and this VM may serve them.
-#                    Refused when a stick that would be synced holds no network — unless --first says so.
-#   --role standby   this VM's sticks WILL BE OVERWRITTEN with the primary's networks at the first sync, whatever
-#                    they hold now. Until that sync has landed the VM is marked "not filled" and does not serve: a
-#                    standby can never put an old or foreign network on the air.
-#   --first        with --role primary: the sticks hold no network yet (a new house; Home Assistant forms it).
-#   Without --role (the kit before roles were asked): a VM whose "synced" sticks are blank is marked "not filled"
-#                  unless --first; a VM whose sticks hold any network may serve.
+#   --initial-role primary|standby   what this VM is on the day of the install. INITIAL, because the two VMs swap
+#                  afterwards (a failover, a switch) and either serves: the answer is used once, kept in
+#                  /var/lib/zradio/initial-role, and saying the same again on a later run changes nothing.
+#                    primary  this VM's sticks ARE the house's networks: they stay as they are, and this VM may serve
+#                             them. Refused when a stick that would be synced holds no network — unless --first.
+#                    standby  this VM's sticks WILL BE OVERWRITTEN with the primary's networks at the first sync,
+#                             whatever they hold now. Until that sync has landed the VM is marked "not filled" and
+#                             does not serve: a standby can never put an old or foreign network on the air.
+#   --first        with --initial-role primary: the sticks hold no network yet (a new house; Home Assistant forms it).
+#   Without --initial-role (the kit before the role was asked): a VM whose "synced" sticks are blank is marked "not
+#                  filled" unless --first; a VM whose sticks hold any network may serve.
 #   --detect       look at the USB ports again even though /etc/zradio/radios.conf exists (after changing a stick)
 #   --use zigbee=/dev/ttyUSB3[:family]   passed to zradio-detect (repeatable)
 #
@@ -44,11 +47,11 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 R=${ZRADIO_INSTALL_ROOT:-}
 RUN=0 CONF_SRC="" FIRST=0 DETECT=0 USE=() ROLE=""
 while [ $# -gt 0 ]; do case "$1" in
-  --run) RUN=1; shift;; --conf) CONF_SRC=$2; shift 2;; --first) FIRST=1; shift;; --detect) DETECT=1; shift;; --role) ROLE=${2:-}; shift 2;;
+  --run) RUN=1; shift;; --conf) CONF_SRC=$2; shift 2;; --first) FIRST=1; shift;; --detect) DETECT=1; shift;; --initial-role) ROLE=${2:-}; shift 2;;
   --use) USE+=(--use "$2"); shift 2;;
   -h|--help) sed -n '2,/^set -uo pipefail$/{/^set -uo pipefail$/!p}' "$0"; exit 0;; *) echo "unknown arg: $1" >&2; exit 2;; esac; done
-case "$ROLE" in ""|primary|standby) ;; *) echo "--role '$ROLE': primary (its sticks hold the networks) or standby (its sticks will be overwritten)" >&2; exit 2;; esac
-[ "$ROLE" != standby ] || [ $FIRST = 0 ] || { echo "--first is for the primary of a new house: a standby's sticks are filled by the primary's sync" >&2; exit 2; }
+case "$ROLE" in ""|primary|standby) ;; *) echo "--initial-role '$ROLE': primary (its sticks hold the networks today) or standby (its sticks will be overwritten)" >&2; exit 2;; esac
+[ "$ROLE" != standby ] || [ $FIRST = 0 ] || { echo "--first is for the initial primary of a new house: a standby's sticks are filled by the primary's sync" >&2; exit 2; }
 FAILS=0
 ok()   { printf 'OK    %s\n' "$*"; }
 warn() { printf 'WARN  %s\n' "$*"; }
@@ -113,7 +116,7 @@ pkg ser2net ser2net || exit 1
 echo "== 3. the radios on this VM's USB ports =="
 DET=${ZRADIO_INSTALL_DETECT:-$R/usr/local/sbin/zradio-detect}
 if [ -f "$R/etc/zradio/radios.conf" ] && [ $DETECT = 0 ]; then ok "/etc/zradio/radios.conf exists: detection is not repeated (--detect looks again)"
-  [ -z "$ROLE" ] || warn "--role $ROLE is applied when the radios are looked at: nothing about the role was changed (add --detect to apply it)"
+  [ -z "$ROLE" ] || warn "--initial-role $ROLE is applied when the radios are looked at, once: nothing about it was changed on this run (the VM is installed already; who serves today: zradio-serve status; a VM that never had an initial role gets one with --detect, while it does not serve)"
 elif [ $RUN = 1 ]; then
   if "$DET" --write "${USE[@]}" 2>&1 | sed 's/^/    /'; [ "${PIPESTATUS[0]}" = 0 ]; then done_ "the radios are detected and named"
   else bad "zradio-detect did not end clean — read its lines above (on a VM that serves, detection is refused: run install.sh without --detect there)"; exit 1; fi
@@ -126,28 +129,45 @@ print(" ".join(k for k in sorted(r) if r[k].get("level") == "synced" and r[k].ge
 try: r = json.load(open(sys.argv[1]))["radios"]
 except Exception: r = {}
 print(" ".join(k for k in sorted(r) if r[k].get("level") == "synced" and r[k].get("holds_network") is True))' "$R/etc/zradio/radios.json" 2>/dev/null)
-  if [ "$ROLE" = standby ]; then
-    if [ -s "$R/var/lib/zradio/synced.json" ]; then ok "the standby: its sticks were filled by a sync before ($R/var/lib/zradio/synced.json) — not marked again"
+  # The INITIAL role: who holds the house's networks on the day of the install. Afterwards the two VMs swap freely
+  # (a failover, a switch), so it is applied ONCE — the answer is kept in initial-role, and a later run that says the
+  # same again changes nothing: it would otherwise mark a VM that has long since become the one that serves, or
+  # unmark one that a sync is in the middle of filling. The mark itself says who set it: the installer writes a
+  # line into it, zradio-sync's own (a set being written) is empty — the installer never lifts that one.
+  MARK="$R/var/lib/zradio/standby-dirty"; WAS=$(cat "$R/var/lib/zradio/initial-role" 2>/dev/null | tr -dc a-z)
+  sync_mark=0; if [ -e "$MARK" ] && [ ! -s "$MARK" ]; then sync_mark=1; fi
+  if [ -n "$ROLE" ] && [ "$WAS" = "$ROLE" ]; then
+    ok "this VM was installed as the initial $ROLE before: that is asked once, and nothing about it was changed (the two swap since then — who serves today: zradio-serve status)"
+  elif [ "$ROLE" = standby ]; then
+    if [ -s "$R/var/lib/zradio/synced.json" ]; then ok "initially the standby: its sticks were filled by a sync before ($R/var/lib/zradio/synced.json) — not marked again"
     else
-      : > "$R/var/lib/zradio/standby-dirty"
-      warn "this VM is the STANDBY: it is marked NOT FILLED ($R/var/lib/zradio/standby-dirty) and does not serve until the primary's first sync has written the house's networks onto its sticks. What they hold now is replaced then${held:+ — the $held stick(s) hold a network today: it will be OVERWRITTEN}${blank:+ (the $blank stick(s) are empty)}."
+      [ $sync_mark = 1 ] || echo "install.sh: the initial standby, not filled yet" > "$MARK"
+      warn "this VM starts as the STANDBY: it is marked NOT FILLED ($MARK) and does not serve until the primary's first sync has written the house's networks onto its sticks. What they hold now is replaced then${held:+ — the $held stick(s) hold a network today: it will be OVERWRITTEN}${blank:+ (the $blank stick(s) are empty)}. After that sync the two VMs are equals and swap"
     fi
+    echo standby > "$R/var/lib/zradio/initial-role"
+    [ -z "$WAS" ] || warn "this VM was installed as the initial $WAS before; it is the initial standby now"
   elif [ "$ROLE" = primary ]; then
-    if [ -n "$blank" ] && [ $FIRST = 0 ]; then
-      bad "this VM is to be the PRIMARY, but its $blank stick(s) hold no network. A new house with no network yet: run again with --first (Home Assistant forms the network). Your devices are on the OTHER node's sticks: then that node is the primary and this one the standby (--role standby). Nothing was started, and this VM is marked NOT FILLED ($R/var/lib/zradio/standby-dirty): it does not serve empty sticks, whoever starts it."
-      : > "$R/var/lib/zradio/standby-dirty"
+    if [ $sync_mark = 1 ]; then
+      bad "this VM is to start as the PRIMARY, but a set from the other VM was being written onto its sticks and did not finish ($MARK is zradio-sync's): what they hold is not a whole network. Nothing was changed; the other VM's next sync finishes it (zradio-sync status)."
       exit 1
     fi
-    rm -f "$R/var/lib/zradio/standby-dirty"
+    if [ -n "$blank" ] && [ $FIRST = 0 ]; then
+      bad "this VM is to start as the PRIMARY, but its $blank stick(s) hold no network. A new house with no network yet: run again with --first (Home Assistant forms the network). Your devices are on the OTHER node's sticks: then that node is the primary and this one the standby (--initial-role standby). Nothing was started, and this VM is marked NOT FILLED ($MARK): it does not serve empty sticks, whoever starts it."
+      echo "install.sh: a primary whose sticks hold no network" > "$MARK"
+      exit 1
+    fi
+    rm -f "$MARK"
     pmsg="${held:+its $held stick(s) hold the networks and stay as they are}"; [ -z "$blank" ] || pmsg="${pmsg:+$pmsg; }--first: the $blank stick(s) hold no network yet and Home Assistant forms it"
-    ok "this VM is the PRIMARY: ${pmsg:-its sticks stay as they are (none of them is one the kit copies, so there was no network to look for)}"
+    ok "this VM starts as the PRIMARY: ${pmsg:-its sticks stay as they are (none of them is one the kit copies, so there was no network to look for)}. After the first sync the two VMs are equals and swap"
+    echo primary > "$R/var/lib/zradio/initial-role"
+    [ -z "$WAS" ] || warn "this VM was installed as the initial $WAS before; it is the initial primary now"
   elif [ -n "$blank" ] && [ $FIRST = 0 ]; then
-    : > "$R/var/lib/zradio/standby-dirty"
-    warn "the $blank stick(s) here hold no network: this VM is marked NOT FILLED ($R/var/lib/zradio/standby-dirty) and does not serve until the other VM's sync has written its networks onto them. (A brand-new pair with new networks: run again with --first on the VM that serves first.)"
+    [ $sync_mark = 1 ] || echo "install.sh: sticks without a network" > "$MARK"
+    warn "the $blank stick(s) here hold no network: this VM is marked NOT FILLED ($MARK) and does not serve until the other VM's sync has written its networks onto them. (A brand-new pair with new networks: run again with --first on the VM that serves first.)"
   elif [ -n "$blank" ]; then
-    rm -f "$R/var/lib/zradio/standby-dirty"; ok "--first: the $blank stick(s) hold no network and this VM may serve them all the same (Home Assistant forms the network)"
+    [ $sync_mark = 1 ] || rm -f "$MARK"; ok "--first: the $blank stick(s) hold no network and this VM may serve them all the same (Home Assistant forms the network)"
   fi
-else would "zradio-detect --write ${USE[*]}  (nothing is typed: it lists the USB serial ports, asks each what it is, read-only, and names them)${ROLE:+; then as the $ROLE: $([ "$ROLE" = standby ] && echo "marked NOT FILLED until the primary's first sync" || echo "its sticks stay as they are and may be served")}"; fi
+else would "zradio-detect --write ${USE[*]}  (nothing is typed: it lists the USB serial ports, asks each what it is, read-only, and names them)${ROLE:+; then as the initial $ROLE: $([ "$ROLE" = standby ] && echo "marked NOT FILLED until the primary's first sync" || echo "its sticks stay as they are and may be served")}"; fi
 if zr_load_radios 2>/dev/null; then RADIOS_KNOWN=1; ok "radios: Z-Wave $ZWAVE${ZWAVE_FAMILY:+ ($ZWAVE_FAMILY)}, Zigbee $ZIGBEE${ZIGBEE_FAMILY:+ ($ZIGBEE_FAMILY)}"
 else RADIOS_KNOWN=0; [ $RUN = 1 ] && { bad "$ZR_ERR"; exit 1; }; fi
 
