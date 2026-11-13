@@ -29,6 +29,7 @@
 #   more: --vrid --priority --pair-mac --usb-mapping --vmid --storage --snippets --memory --cores --disk --hookscript
 #         --ssh-keys --conf KEY=VALUE --no-ha --no-usb --allow-no-radios --image-dir   (docs/DESIGN.md, "Options")
 #
+# Needs to reach GitHub: the table of known sticks is built from Home Assistant's USB lists at every run, into gen/.
 # Tests: tests/t-host.sh and tests/t-e2e.sh (Proxmox and the guest are fakes there). Not yet run on a real node.
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -54,8 +55,6 @@ ip4() { local o; [[ "$1" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,
   for o in "${BASH_REMATCH[@]:1}"; do [ "$((10#$o))" -le 255 ] || return 1; done; }
 cidr() { local a=${1%/*} p=${1##*/}; [ "$1" != "$a" ] && ip4 "$a" && [[ "$p" =~ ^[0-9]{1,2}$ ]] && [ "$p" -ge 8 ] && [ "$p" -le 32 ]; }
 NODE=$(hostname -s)
-TABLE="$KIT/guest/lib/usb-ids.json"
-[ -r "$TABLE" ] || { echo "die: no $TABLE — run this from a checkout of the kit" >&2; exit 2; }
 
 sticks_here() { # one line per USB device of this node that the kit's table names: "<bus-port> <vid:pid> <kinds> <product>"
   python3 - "$TABLE" "$SYS" <<'PY'
@@ -152,7 +151,15 @@ name_ok() { [[ "$1" =~ ^[a-z][a-z0-9-]{0,30}$ ]]; }
 br_ok() { [[ "$1" =~ ^[a-zA-Z][a-zA-Z0-9._-]{0,14}$ ]]; }
 [ "$(id -u)" = 0 ] || die "run as root on the Proxmox node"
 command -v qm >/dev/null 2>&1 && command -v pvesh >/dev/null 2>&1 || die "no qm / pvesh here: this runs on a Proxmox VE node"
-for f in install.sh sbin/zradio-serve lib/zradio-common.sh units/zradio.target; do [ -r "$KIT/guest/$f" ] || die "the kit's guest/$f is missing next to this script"; done
+for f in install.sh sbin/zradio-serve lib/zradio-common.sh lib/zradio-usb-ids.py lib/usb-annotations.json units/zradio.target; do [ -r "$KIT/guest/$f" ] || die "the kit's guest/$f is missing next to this script"; done
+# The table of sticks the kit knows is not kept in git: it is built here, at every run, into the kit's own gen/ folder
+# (the only place the kit writes what it generates), from Home Assistant's USB lists at the commit the kit pins and the
+# kit's notes on each stick. The VM gets it inside the kit (step 3).
+GEN="$KIT/gen"; TABLE="$GEN/usb-ids.json"
+mkdir -p "$GEN" || die "cannot make $GEN (the kit's folder for what it generates)"
+IDS_SAID=$(python3 "$KIT/guest/lib/zradio-usb-ids.py" --out "$TABLE" 2>&1) \
+  || die "the table of the sticks the kit knows could not be built: $(printf '%s\n' "$IDS_SAID" | grep -m1 FAIL | sed 's/^FAIL  //'). It is built from Home Assistant's USB lists on GitHub: this node has to reach raw.githubusercontent.com"
+TABLE_SAID=$(printf '%s\n' "$IDS_SAID" | sed -n 's/^usb-ids.json: //p')
 if [ $STICKS = 1 ]; then
   echo "The sticks on $NODE that the kit knows (the VM itself finds out which is what):"
   show_sticks || { echo "      none. A stick the kit's table does not know can still be passed through: make a USB mapping for it and use --usb-mapping."; exit 1; }
@@ -356,6 +363,7 @@ if [ -n "$PVMID" ]; then ARGS+=(--join "$PNAME"); elif [ $PAIR = 0 ]; then ARGS+
 ARGS+=(${PASS[@]+"${PASS[@]}"})
 echo "== 0. checks ($NODE; $([ $RUN = 1 ] && echo RUN || echo "report only: nothing is changed")) =="
 [ -z "${NAME_NOTE:-}" ] || warn "$NAME_NOTE"
+ok "the sticks the kit knows: $TABLE_SAID"
 case "$ROLE" in
   primary) ok "this node starts as the PRIMARY: $([ $FIRST = 1 ] && echo "a new house — its sticks hold no network yet, Home Assistant forms it" || echo "its sticks hold your networks and stay as they are (the installer in the VM checks that they do)")";;
   standby) [ $NOUSB = 1 ] || warn "this node starts as the STANDBY: its sticks WILL BE OVERWRITTEN with the primary's networks at the first sync, whatever they hold now; the VM does not serve before that";;
@@ -491,7 +499,7 @@ else would "download $IMAGE_DIR/$IMAGE_NAME and SHA512SUMS, check, keep under $C
 echo "== 3. the cloud-init file $SNIPDIR/$NAME-zradio.yaml =="
 mk_user_data() {
   local kit64
-  kit64=$(tar -C "$KIT" --owner=0 --group=0 --sort=name -czf - guest zradio.conf.example | base64 -w 76 | sed 's/^/      /')
+  kit64=$(tar -C "$KIT" --owner=0 --group=0 --sort=name -czf - guest gen/usb-ids.json zradio.conf.example | base64 -w 76 | sed 's/^/      /')
   cat <<EOF
 #cloud-config
 # $NAME: one radio VM of a zradio pair (ha_zradio's install.sh on $NODE, $(date -u +%F)). Debian 13 generic; root over keys

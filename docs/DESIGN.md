@@ -118,7 +118,9 @@ radio VM. During a cut link both VMs still serve; this only decides which copy s
 
 ## Recognizing the sticks
 
-A list first (`guest/lib/usb-ids.json`, from Home Assistant's own USB lists), then a read-only question to the stick.
+A list first, then a read-only question to the stick. The list (`gen/usb-ids.json`) is built at every install from
+Home Assistant's own USB lists, at the commit `guest/lib/usb-annotations.json` pins, merged with the kit's notes in that
+file (`guest/lib/zradio-usb-ids.py`). Nothing generated is kept in git: it all goes into the kit's `gen/` folder.
 Z-Wave 800 series and TI Z-Stack sticks are **synced**; every other stick is **served** only. One stick per kind per
 VM. Serial settings of served-only sticks come from public documentation and are not verified.
 

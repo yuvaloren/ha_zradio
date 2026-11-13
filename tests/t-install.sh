@@ -149,4 +149,19 @@ vm "$T/dh5"; fake "$T/dh5/bin" ip ':'; printf '%s\n' NAME=attic1 VIP=192.168.1.5
 check "no SELF in the conf and no address on the machine: refused, saying so" bash -c '[ "$2" = 1 ] && grep -q "FAIL  .* names no SELF, and this machine has no IPv4 address to take" "$1/out" && [ ! -e "$1/root/etc/zradio/zradio.conf" ]' _ "$T/dh5" "$RC"
 vm "$T/dh6"; grep -v '^PEER=' "$T/dh6/my.conf" > "$T/dh6/c"; inst "$T/dh6" --conf "$T/dh6/c" --initial-role primary --run
 check "a fixed SELF and no PEER: installed as a VM without a peer; its address is its own business (no RESERVE line)" bash -c '[ "$2" = 0 ] && grep -q "WARN  no PEER" "$1/out" && ! grep -q "RESERVE" "$1/out" && ! grep -q "unicast_" "$1/root/etc/keepalived/keepalived.conf"' _ "$T/dh6" "$RC"
+
+echo "-- the table of known sticks in the VM: the node's, or built here into the kit's gen/"
+kitcopy() { rm -rf "$1/kit"; mkdir -p "$1/kit"; cp -R "$KIT/guest" "$KIT/zradio.conf.example" "$1/kit/"; }
+vm "$T/t1"; kitcopy "$T/t1"; TOOL="$T/t1/kit/guest/install.sh" inst "$T/t1" --conf "$T/t1/my.conf" --run
+check "on its own (no node): built here, into the kit's gen/, installed as /usr/local/lib/zradio/usb-ids.json" bash -c '[ "$2" = 0 ] && grep -q "OK    the table of the sticks the kit knows, built now into $1/kit/gen: 25 sticks" "$1/out" && cmp -s "$1/kit/gen/usb-ids.json" "$1/root/usr/local/lib/zradio/usb-ids.json" && [ "$(ls "$1/kit")" = "$(printf "gen\nguest\nzradio.conf.example")" ]' _ "$T/t1" "$RC"
+vm "$T/t2"; kitcopy "$T/t2"; mkdir -p "$T/t2/kit/gen"; echo '{"format": "zradio usb ids v1", "entries": [], "home_assistant_core_commit": "from-the-node"}' > "$T/t2/kit/gen/usb-ids.json"
+ZRADIO_USB_IDS_SOURCE="$T/t2/nowhere" TOOL="$T/t2/kit/guest/install.sh" inst "$T/t2" --conf "$T/t2/my.conf" --from-node --run
+check "run by the node: the node's table is used as it is — nothing fetched, nothing rebuilt" bash -c 'grep -q "OK    the table of the sticks the kit knows came with the kit (the node built it)" "$1/out" && grep -q from-the-node "$1/root/usr/local/lib/zradio/usb-ids.json"' _ "$T/t2"
+vm "$T/t3"; kitcopy "$T/t3"; ZRADIO_USB_IDS_SOURCE="$T/t3/nowhere" TOOL="$T/t3/kit/guest/install.sh" inst "$T/t3" --conf "$T/t3/my.conf" --run
+check "on its own, and Home Assistant's lists cannot be read: refused before anything is changed" bash -c '[ "$2" = 1 ] && grep -q "FAIL  the table of the sticks the kit knows could not be built: Home Assistant.s USB list for zha" "$1/out" && grep -q "REFUSED" "$1/out" && [ ! -e "$1/root/usr" ] && [ ! -e "$1/kit/gen/usb-ids.json" ]' _ "$T/t3" "$RC"
+gen() { ZRADIO_USB_IDS_SOURCE="$2" python3 "$KIT/guest/lib/zradio-usb-ids.py" --out "$1" > /dev/null 2>&1; }
+mkdir -p "$T/u/src"; cp -R "$TESTS_DIR/fixtures/ha-core/." "$T/u/src/"; rm "$T/u/src/zwave_js/manifest.json"; echo old > "$T/u/ids.json"; gen "$T/u/ids.json" "$T/u/src"; RC=$?
+check "the generator: one list missing → exit 1, and the file it was to write is left as it was (no half table)" bash -c '[ "$2" = 1 ] && [ "$(cat "$1/ids.json")" = old ] && [ ! -e "$1/ids.json.tmp" ]' _ "$T/u" "$RC"
+gen "$T/u/a.json" "$TESTS_DIR/fixtures/ha-core"; gen "$T/u/b.json" "$TESTS_DIR/fixtures/ha-core"
+check "…the same sources give the same table, byte for byte" cmp -s "$T/u/a.json" "$T/u/b.json"
 finish

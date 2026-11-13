@@ -48,9 +48,10 @@ check "…the VM's zradio.conf: exactly the six values, checked by the kit's own
   python3 -c "import sys, yaml; d = yaml.safe_load(open(sys.argv[1])); print([f for f in d[\"write_files\"] if f[\"path\"] == \"/root/zradio.conf\"][0][\"content\"], end=\"\")" "$1" > "$2/zradio.conf"
   [ "$(grep -v "^#" "$2/zradio.conf" | tr "\n" " ")" = "NAME=zr2 SELF=10.20.30.6 PEER=10.20.30.5 VIP=10.20.30.50/24 VRID=50 PRIORITY=100 " ] &&
   ZRADIO_CONF="$2/zradio.conf" bash -c ". \"$3/guest/lib/zradio-common.sh\"; zr_load_conf"' _ "$Y" "$T/c" "$KIT"
-check "…the kit inside it unpacks to the same files as guest/ here (and the example conf), nothing else" bash -c '
+check "…the kit inside it unpacks to the same files as guest/ here (and the example conf), plus gen/ with the table of known sticks the node built — nothing else" bash -c '
   python3 -c "import sys, yaml, base64; d = yaml.safe_load(open(sys.argv[1])); f = [f for f in d[\"write_files\"] if f[\"path\"] == \"/root/zradio-kit.tgz\"][0]; assert f[\"encoding\"] == \"b64\"; sys.stdout.buffer.write(base64.b64decode(f[\"content\"]))" "$1" > "$2/kit.tgz"
-  mkdir -p "$2/unpacked" && tar -xzf "$2/kit.tgz" -C "$2/unpacked" && diff -r "$2/unpacked/guest" "$3/guest" && cmp -s "$2/unpacked/zradio.conf.example" "$3/zradio.conf.example" && [ "$(ls "$2/unpacked" | tr "\n" " ")" = "guest zradio.conf.example " ]' _ "$Y" "$T/c" "$KIT"
+  mkdir -p "$2/unpacked" && tar -xzf "$2/kit.tgz" -C "$2/unpacked" && diff -r "$2/unpacked/guest" "$3/guest" && cmp -s "$2/unpacked/zradio.conf.example" "$3/zradio.conf.example" && [ "$(ls "$2/unpacked" | tr "\n" " ")" = "gen guest zradio.conf.example " ] && [ "$(ls "$2/unpacked/gen")" = usb-ids.json ] &&
+  python3 "$3/guest/lib/zradio-usb-ids.py" --out "$2/expected-ids.json" 2>/dev/null && cmp -s "$2/expected-ids.json" "$2/unpacked/gen/usb-ids.json"' _ "$Y" "$T/c" "$KIT"
 check "…and cloud-init runs nothing of the kit: the node's install.sh does, through the guest agent" python3 -c '
 import sys, yaml
 assert yaml.safe_load(open(sys.argv[1]))["runcmd"] == [["systemctl", "enable", "--now", "qemu-guest-agent"]]' "$Y"
@@ -305,4 +306,10 @@ check "the kit's installer failed in the VM: its FAIL line is shown, exit 1, the
 
 echo "-- help"
 check "--help: one command, what it asks, that nothing is changed without --run; short" bash -c 'h=$(bash "$1" --help); printf "%s\n" "$h" | grep -q "^#     ./install.sh$" && printf "%s\n" "$h" | grep -q "standby: this node.s sticks WILL BE WIPED" && printf "%s\n" "$h" | grep -q "Only for the start" && printf "%s\n" "$h" | grep -q "nothing is changed without --run" && [ "$(printf "%s\n" "$h" | wc -l)" -le 32 ] && ! printf "%s\n" "$h" | grep -q "^set -uo"' _ "$TOOL"
+
+echo "-- the table of known sticks: built at every run into the kit's gen/, never kept in git"
+node "$T/g1"; zvm "$T/g1" "${BASE[@]}"
+check "built from Home Assistant's lists at the pinned commit, into gen/, and said" bash -c '[ "$2" = 0 ] && [ -s "$3/gen/usb-ids.json" ] && grep -q "OK    the sticks the kit knows: 25 sticks (23 from Home Assistant.s lists at fd864375b04b, 2 added by the kit)" "$1/out"' _ "$T/g1" "$RC" "$KIT"
+mkdir -p "$T/g2"; node "$T/g2"; ZRADIO_USB_IDS_SOURCE="$T/g2/nowhere" zvm "$T/g2" "${BASE[@]}" --run
+check "Home Assistant's lists cannot be read: refused before anything, saying it needs GitHub" bash -c '[ "$2" = 2 ] && grep -q "die: the table of the sticks the kit knows could not be built: Home Assistant.s USB list for zha" "$1/out" && grep -q "has to reach raw.githubusercontent.com" "$1/out" && [ ! -s "$1/calls" ]' _ "$T/g2" "$RC"
 finish

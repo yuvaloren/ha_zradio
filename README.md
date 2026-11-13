@@ -15,9 +15,11 @@ Assistant can reach. Pick one free address on it that DHCP does not hand out: th
 On the node whose sticks your devices are paired to, as root:
 
 ```
-git clone https://github.com/yuvaloren/ha_zradio.git && cd ha_zradio
-./install.sh
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/yuvaloren/ha_zradio/main/get.sh)"
 ```
+
+It downloads the kit into `/opt/ha_zradio/<version>` and runs its installer (`./install.sh`) on your terminal. Or
+clone the repository and run `./install.sh` yourself.
 
 It asks a few questions, shows what it will do, and does it after a `y`. Then run the same on the other node: there
 it finds the first VM, takes the network from it, and sets up the keys between the two. At the end it prints the
@@ -38,6 +40,23 @@ The one question to get right:
 
 Without questions: `./install.sh --answers my.answers --run` ([answers.example](answers.example)), or every answer
 as an option (`./install.sh --help`). Nothing is changed without `--run` or a `y`.
+
+## Connecting Home Assistant
+
+Home Assistant connects to the floating address, never to a VM: whichever VM serves holds it. The installer's last
+lines give the two addresses. Home Assistant's host must reach them, and each port takes one client at a time.
+
+**Z-Wave.** Home Assistant's Z-Wave integration talks to a Z-Wave JS server, and that server opens the stick. In the
+server (the Z-Wave JS UI app or container), set the serial port to `tcp://<floating address>:6639` and keep your
+network's S0/S2 keys. The Z-Wave integration then connects to the server as usual. The port is neither
+authenticated nor encrypted: keep it on a trusted network.
+
+**Zigbee (ZHA).** A new setup: add Zigbee Home Automation, choose manual setup if asked, radio type ZNP (TI CC2652)
+or EZSP (Silicon Labs), serial path `socket://<floating address>:6638`, 115200 baud. ZHA that used a stick on its
+own machine: "Migrate radio", manual setup, the same `socket://` address. The stick already holds the network.
+
+**Replacing a pair you already have:** give the new pair the same floating address and ports, and Home Assistant
+needs no change. It reconnects by itself.
 
 ## Which sticks
 
@@ -76,4 +95,5 @@ Measured on the pair this kit was extracted from (about 50 Z-Wave nodes):
   No hardware needed; they also run on every push (`.github/workflows/tests.yml`).
 - To see the install without a Proxmox node: `tests/try.sh` (needs docker) is a shell on a pretend two-node cluster
   where `./install.sh` asks and prints what it would on a real one. Proxmox, the VMs and the sticks are fakes.
-- MIT. The USB id list is derived from Home Assistant core (Apache-2.0).
+- MIT. The list of known sticks is built at install time from Home Assistant core's USB lists (Apache-2.0); the
+  install needs to reach GitHub for it.

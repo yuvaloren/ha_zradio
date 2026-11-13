@@ -82,14 +82,14 @@ pkg() { # pkg <name> [stop: the service the package starts]
   if [ -n "${2:-}" ]; then systemctl disable --now "$2" >/dev/null 2>&1; active "$2" && bad "$2 was started by its package and did not stop" || ok "$2 is stopped and not enabled (its package starts it; only the pair may)"; fi
 }
 SBIN="zradio-serve zradio-notify zradio-sync zradio-switch zradio-change-watch zradio-render zradio-detect zradio-apply zradio-gate"
-LIBF="zradio-common.sh zradio-probe.py zui-restore.py zui-settings.json keepalived.conf.tmpl zradio-sync.timer usb-ids.json"
+LIBF="zradio-common.sh zradio-probe.py zui-restore.py zui-settings.json keepalived.conf.tmpl zradio-sync.timer"
 UNITS="zradio.target zradio-serve.service zradio-quiet.service zradio-hush.service zradio-sync.service zradio-sync-tick.service zradio-sync-tick.timer zradio-state.service zradio-state.timer zradio-change-watch.service zradio-gate.service"
 
 echo "== 0. checks ($([ $RUN = 1 ] && echo RUN || echo REPORT) mode) =="
 [ "$(id -u)" = 0 ] && ok "root" || bad "not root"
 miss=""
 for f in $SBIN; do [ -f "$HERE/sbin/$f" ] || miss="$miss sbin/$f"; done
-for f in $LIBF; do [ -f "$HERE/lib/$f" ] || miss="$miss lib/$f"; done
+for f in $LIBF zradio-usb-ids.py usb-annotations.json; do [ -f "$HERE/lib/$f" ] || miss="$miss lib/$f"; done
 for f in $UNITS; do [ -f "$HERE/units/$f" ] || miss="$miss units/$f"; done
 [ -z "$miss" ] && ok "the kit's files are all here ($HERE)" || bad "missing in $HERE:$miss"
 # shellcheck source=lib/zradio-common.sh
@@ -142,6 +142,14 @@ if zr_load_conf; then ok "$CONF_NAME checks: $NAME, $SELF ↔ ${PEER:-no peer ye
   [ -z "${SELF_TAKEN:-}" ] || warn "SELF: $CONF_NAME names no address for this VM, so the one it has is written into its conf: ${SELF_TAKEN%% *} on ${SELF_TAKEN#* }$(m=$(cat "/sys/class/net/${SELF_TAKEN#* }/address" 2>/dev/null); [ -z "$m" ] || echo " (MAC $m)"). The pair knows this VM by that address from now on: RESERVE it for this VM in your DHCP server. A VM whose address changes does not serve (zradio-serve status says so)"
   [ -n "$PEER" ] || warn "no PEER: this VM has no peer yet. It holds the floating address alone (keepalived sends VRRP's ordinary multicast adverts) until the pair's other VM is installed and this one is told its address (the node's install.sh does that; by hand: install.sh --peer A.B.C.D --run)"
 else bad "$ZR_ERR"; fi
+# the table of the sticks the kit knows, in the kit's gen/ folder (never kept in git): run by the node, the one the
+# node built and put into the kit; otherwise built here, now
+GEN="$(cd "$HERE/.." && pwd)/gen"; IDS="$GEN/usb-ids.json"
+if [ $BYNODE = 1 ] && [ -f "$IDS" ]; then ok "the table of the sticks the kit knows came with the kit (the node built it)"
+elif [ -f "$HERE/lib/zradio-usb-ids.py" ]; then
+  if mkdir -p "$GEN" && said=$(python3 "$HERE/lib/zradio-usb-ids.py" --out "$IDS" 2>&1); then ok "the table of the sticks the kit knows, built now into $GEN: $(printf '%s\n' "$said" | sed -n 's/^usb-ids.json: //p')"
+  else bad "the table of the sticks the kit knows could not be built: $(printf '%s\n' "${said:-cannot make $GEN}" | grep -m1 -v '^usb-ids' | sed 's/^FAIL  //'). It is built from Home Assistant's USB lists on GitHub: this machine has to reach raw.githubusercontent.com"; fi
+fi
 echo "== checks: $FAILS FAIL =="
 [ $FAILS -eq 0 ] || { echo "REFUSED: fix the FAIL lines; nothing was changed"; exit 1; }
 export ZRADIO_LIB="$R/usr/local/lib/zradio" ZRADIO_CONF="$R/etc/zradio/zradio.conf" ZRADIO_RADIOS="$R/etc/zradio/radios.conf"
@@ -153,6 +161,7 @@ export ZRADIO_DETECT_ETC="$R/etc/zradio" ZRADIO_DETECT_UDEV_RULES="$R/etc/udev/r
 echo "== 1. the kit's files =="
 for f in $SBIN; do put "$HERE/sbin/$f" "/usr/local/sbin/$f" 755; done
 for f in $LIBF; do put "$HERE/lib/$f" "/usr/local/lib/zradio/$f" 644; done
+put "$IDS" /usr/local/lib/zradio/usb-ids.json 644
 [ -z "$CONF_SRC" ] || put "$CONF_SRC" /etc/zradio/zradio.conf 644
 if [ -f "$R/etc/zradio/zui/settings.json" ]; then ok "/etc/zradio/zui/settings.json exists (Z-Wave JS UI's own store: left as it is)"
 elif [ $RUN = 1 ]; then mkdir -p "$R/etc/zradio/zui" && install -m 644 "$HERE/lib/zui-settings.json" "$R/etc/zradio/zui/settings.json" && done_ "/etc/zradio/zui/settings.json (the store of the container that writes a copied Z-Wave network)"

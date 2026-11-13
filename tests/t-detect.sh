@@ -2,10 +2,12 @@
 # t-detect.sh — guest/sbin/zradio-detect against a fake radio VM: a /dev with ttyUSB files, udevadm as a fake that
 # prints each port's properties from a file (the property names and values are the ones udev printed for the reference
 # sticks) and, on `trigger`, makes the SYMLINKs the written rules ask for; zradio-probe.py as a stub that answers per
-# port and protocol from a knob file, or not at all; systemctl for ser2net's state. The real guest/lib/usb-ids.json is
-# the list. Nothing reaches a stick.
+# port and protocol from a knob file, or not at all; systemctl for ser2net's state. The list is the real table, built
+# as an install builds it (from the tests' copies of Home Assistant's lists). Nothing reaches a stick.
 . "$(dirname "$0")/lib.sh"
 TOOL="$KIT/guest/sbin/zradio-detect"
+python3 "$KIT/guest/lib/zradio-usb-ids.py" --out "$T/usb-ids.json" 2>/dev/null || { echo "t-detect.sh: the table did not build"; exit 1; }
+export ZRADIO_DETECT_IDS="$T/usb-ids.json"
 vm() { local d=$1; rm -rf "$d"; mkdir -p "$d/bin" "$d/dev" "$d/udev" "$d/answers" "$d/etc" "$d/rules.d"; : > "$d/calls"; echo 0 > "$d/ser2net"
   fake "$d/bin" systemctl "[ \"\$(cat '$d/ser2net')\" = 1 ]"
   fake "$d/bin" udevadm "case \"\$1\" in

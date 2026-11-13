@@ -12,7 +12,7 @@ can do with it, and (with --write) records that for the other tools. Nobody type
 
 How a stick is recognized, in this order:
   1. The list. Every /dev/ttyUSB* and /dev/ttyACM* is looked up by USB vendor:product, product string and port number
-     in guest/lib/usb-ids.json: the USB lists Home Assistant's own Zigbee and Z-Wave integrations ship, plus the kit's
+     in usb-ids.json (built at install time by zradio-usb-ids.py): the USB lists Home Assistant's own Zigbee and Z-Wave integrations ship, plus the kit's
      annotations (which serial protocol, which port of a two-port adapter). A match gives a HINT, never the answer.
   2. The probe, read-only (zradio-probe.py): a port hinted Z-Wave — or with no hint — is asked for its controller id
      over the Z-Wave Serial API; a port hinted Zigbee without a family, hinted Z-Stack, or with no hint, is asked for

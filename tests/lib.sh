@@ -6,6 +6,8 @@ set -uo pipefail
 TESTS_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck disable=SC2034  # KIT is the tests' root
 KIT=$(cd "$TESTS_DIR/.." && pwd)            # the repository under test
+# The table of known sticks is built from Home Assistant's USB lists: here from the tests' copies of them, never GitHub.
+export ZRADIO_USB_IDS_SOURCE="$TESTS_DIR/fixtures/ha-core"
 PASS=0; FAIL=0
 T=$(mktemp -d "${TMPDIR:-/tmp}/zradio-test.XXXXXX") && [ -d "$T" ] || { echo "lib.sh: no temp dir (mktemp failed)" >&2; exit 2; }; trap 'rm -rf "$T"' EXIT
 check() { # check <name> <command…>: one PASS or FAIL line

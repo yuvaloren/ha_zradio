@@ -1,2 +1,5 @@
 __pycache__/
 *.pyc
+# Everything the kit generates goes into gen/ and is never kept in git (the table of known sticks, built at install
+# time by guest/lib/zradio-usb-ids.py).
+/gen/

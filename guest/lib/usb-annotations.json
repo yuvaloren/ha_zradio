@@ -1,5 +1,7 @@
 {
- "_comment": "What Home Assistant's USB lists do not say and the kit needs: which serial protocol a stick speaks (family), its serial settings, and on a two-port adapter which port is the radio. Keyed by 'VID:PID description-glob' exactly as the list has it. 'proven' = served, synced and failed over on real hardware by this project; everything else is taken from public documentation and NOT yet verified on a stick ('served only' until someone proves it). tools/update-usb-ids.py merges this into guest/lib/usb-ids.json. In 'add': confirm=true = a generic bridge chip, a radio only if it answers the probe; beside=<kind> = counts only when the same device's other port answered as that kind.",
+ "_comment": "What Home Assistant's USB lists do not say and the kit needs: which serial protocol a stick speaks (family), its serial settings, and on a two-port adapter which port is the radio. Keyed by 'VID:PID description-glob' exactly as the list has it. 'proven' = served, synced and failed over on real hardware by this project; everything else is taken from public documentation and NOT yet verified on a stick ('served only' until someone proves it). guest/lib/zradio-usb-ids.py merges this with Home Assistant's lists into usb-ids.json, at install time. In 'add': confirm=true = a generic bridge chip, a radio only if it answers the probe; beside=<kind> = counts only when the same device's other port answered as that kind.",
+ "home_assistant_core_commit": "fd864375b04b2b4ed1d6c383a4bd8b0293d6e809",
+ "_commit_comment": "The Home Assistant core commit whose USB lists the install reads (its zha, zwave_js, homeassistant_sky_connect and homeassistant_connect_zbt2 manifests). Moving it is a reviewed change: the tests' copies of those files (tests/fixtures/ha-core) move with it, and CI checks the two agree.",
  "annotate": {
   "10C4:EA60 *sonoff*plus*": {
    "family": "znp",
@@ -142,7 +144,7 @@
     "Aeotec Z-Stick 10 Pro (Z-Wave port)"
    ],
    "source": "zradio",
-   "note": "A CP2105 two-port bridge with a generic product string: port 1 is the Z-Wave controller. Any other CP2105 device matches too \u2014 the probe decides.",
+   "note": "A CP2105 two-port bridge with a generic product string: port 1 is the Z-Wave controller. Any other CP2105 device matches too — the probe decides.",
    "confirm": true
   },
   {
