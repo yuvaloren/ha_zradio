@@ -3,7 +3,7 @@
 # is there, and otherwise takes its default. An option given on the command line wins. ./install.sh --help lists them.
 
 # What this node is INITIALLY. primary: its sticks hold your networks and stay as they are.
-# standby: its sticks WILL BE WIPED by the first sync. (Afterwards the two VMs swap.)
+# standby: its sticks WILL BE WIPED by the first sync. (Afterward the two VMs swap.)
 INITIAL_ROLE=primary
 # A new house, nothing paired yet:
 #FIRST=yes

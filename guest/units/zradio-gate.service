@@ -1,5 +1,5 @@
 # zradio-gate.service — zradio-gate run: asks the other radio VM which of the two holds the newer networks, at boot and
-# afterwards (docs/DESIGN.md §3a). With ELECTION=observe in /etc/zradio/zradio.conf (the default) it only writes what
+# afterward (docs/DESIGN.md §3a). With ELECTION=observe in /etc/zradio/zradio.conf (the default) it only writes what
 # it would do to the journal; ELECTION=act lets it hold this VM back and take the radios from an older copy.
 # Installed by guest/install.sh.
 [Unit]

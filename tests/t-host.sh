@@ -223,7 +223,7 @@ check "the installer's \"no stick\" end is the drill's expected end: said so, ex
 check "the drill is under Proxmox HA like the real thing (the rule and the restart are what it is for)" bash -c 'grep -q "^ha-manager rules add node-affinity zr-drill-on-nodea .*--strict 1" "$1/calls" && grep -q "^ha-manager set vm:109 --state started" "$1/calls"' _ "$T/d"
 echo 1 > "$T/d/install.rc"; printf 'FAIL  apt-get install keepalived failed\n' > "$T/d/install.log"; echo '[{"vmid":101,"name":"live1","node":"nodea","status":"running"}]' > "$T/d/vms.json"
 zvm "$T/d" --name zr-drill2 --self 10.20.30.77/24 --peer 10.20.30.78 --vip 10.20.30.79/24 --pair-bridge vmbrpair --no-usb --run
-check "the line the drill is recognised by is the one the kit's installer really prints when the detection fails" bash -c 'grep -q "bad \"zradio-detect did not end clean" "$1/guest/install.sh" && grep -q "printf .FAIL  %s" "$1/guest/install.sh"' _ "$KIT"
+check "the line the drill is recognized by is the one the kit's installer really prints when the detection fails" bash -c 'grep -q "bad \"zradio-detect did not end clean" "$1/guest/install.sh" && grep -q "printf .FAIL  %s" "$1/guest/install.sh"' _ "$KIT"
 check "a drill whose installer failed for ANOTHER reason is a failure" bash -c '[ "$2" = 1 ] && grep -q "the installer ended 1 in zr-drill2" "$1/out"' _ "$T/d" "$RC"
 zvm "$T/d" --name zr-drill3 --self 10.20.30.77/24 --peer 10.20.30.78 --vip 10.20.30.79/24 --pair-bridge vmbrpair --no-usb --start
 check "--no-usb with --start, or with --usb-mapping: refused" bash -c '[ "$2" = 2 ] && grep -q "is a drill" "$1/out"' _ "$T/d" "$RC"

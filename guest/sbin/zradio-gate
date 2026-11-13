@@ -19,7 +19,7 @@
 #                                               terms are equal, provisionally (as an outdated VM) when its is lower
 #       no answer for the whole wait         -> this VM may claim, provisionally ($RUN/gate-alone, until the peer
 #                                               has answered once)
-#     afterwards, as a standby:
+#     afterward, as a standby:
 #       it was the one in use, and its own health check (zradio-serve check) has failed for the standard wait
 #                                            -> it gives its claim up (used=no): a VM that cannot serve is not ahead
 #       outdated and the peer answers        -> stay held ($RUN/hold): a blip of the serving VM does not hand the
@@ -29,8 +29,8 @@
 #       the peer serves, has been for a minute, and has not synced this VM in its turn -> zradio-sync peer-poke
 #                                               (at most every 5 minutes): the sync now, not at the next tick
 #       the peer serves and is behind        -> preempt
-#     afterwards, serving provisionally: the peer answers and is not ahead -> the turn is confirmed
-#     afterwards, serving a confirmed turn that Home Assistant has not used yet: zradio-sync beat --quiet — the
+#     afterward, serving provisionally: the peer answers and is not ahead -> the turn is confirmed
+#     afterward, serving a confirmed turn that Home Assistant has not used yet: zradio-sync beat --quiet — the
 #       version advances as soon as a client is connected (unless the peer answers and is ahead)
 #   A serving peer is preempted when its version is strictly lower than this VM's. A failover or a planned switch
 #   stands all the same, because the VM that gave the radios up no longer claims the copy in use (zradio-notify,
@@ -165,7 +165,7 @@ step_inner() {
     return 0
   fi
 
-  # ---- afterwards, serving: a provisional turn is confirmed once the peer answers and is not ahead
+  # ---- afterward, serving: a provisional turn is confirmed once the peer answers and is not ahead
   if serving; then
     # the version is advanced as soon as Home Assistant uses this turn (zradio-sync beat asks the peer first), not
     # at the next minute's state line: an old active that returns finds this VM ahead, and the failover stands
@@ -183,7 +183,7 @@ step_inner() {
     return 0
   fi
 
-  # ---- afterwards, standing by
+  # ---- afterward, standing by
   [ -e "$OUT" ] || rm -f "$HOLD" "$MAY"                       # a sync landed: nothing holds this VM any more
   # A VM that was the one in use and cannot serve for its own reasons (a stick gone, a start that failed: its own
   # health check, with nothing of the gate's in the way) gives its claim up after the standard wait — or the VM that

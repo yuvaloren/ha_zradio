@@ -15,7 +15,7 @@
 #   --initial-role primary|standby
 #                            primary: this node's sticks hold your networks and stay as they are.
 #                            standby: this node's sticks WILL BE WIPED by the first sync.
-#                            Only for the start: afterwards the two VMs swap. (--first: a new house, no network yet)
+#                            Only for the start: afterward the two VMs swap. (--first: a new house, no network yet)
 #   --name NAME              the VM's name (default: the first free of zradio1, zradio2, …)
 #   --self A.B.C.D/NN  --peer A.B.C.D  --vip A.B.C.D/NN      this VM, the other VM, the floating address
 #   --bridge BR  --gateway A.B.C.D                            the network they are on (default vmbr0)

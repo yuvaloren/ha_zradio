@@ -209,7 +209,7 @@ waitfor 10 sh -c "! [ -f $R/a/ser2net.pid ]" && ok "a stopped serving" || no "a 
 [ "$(cat "$R/b/counter")" -gt "$CA" ] && ok "b raised its counter above a's before taking over: $(cat "$R/b/counter") > $CA" || no "b's counter $(cat "$R/b/counter") is not above a's $CA"
 waitfor 10 jhas b "result=preempted" && jhas a "result=yield" && ok "the journals: b 'preempted', a 'yield'" || no "journals lack preempted/yield"
 [ "$(ver b)" = "term=7 used=yes" ] && held a && ok "the turn b took back is a new term ($(ver b)); a is outdated against it and held until b's sync" || no "after the preemption: b $(ver b), a held=$(held a && echo y || echo n) ($(cat "$R/a/state/outdated" 2>/dev/null))"
-waitfor 40 veris a "term=7 used=no" && ok "b synced a afterwards: a holds $(ver a), counter $(cat "$R/a/counter"); one preemption, then quiet" || no "a was not synced after the preemption: $(ver a)"
+waitfor 40 veris a "term=7 used=no" && ok "b synced a afterward: a holds $(ver a), counter $(cat "$R/a/counter"); one preemption, then quiet" || no "a was not synced after the preemption: $(ver a)"
 sleep 8; serves b && ! serves a && [ "$(grep -c 'result=preempt ' "$R/b/journal")" = 1 ] && ok "8 s later: b still serves, a stands by, exactly one preemption in b's journal (no flapping)" || no "not stable: b serves=$(serves b && echo y || echo n) a serves=$(serves a && echo y || echo n) preempts=$(grep -c 'result=preempt ' "$R/b/journal")"
 
 if [ "${REHEARSE_UPTO:-9}" -ge 5 ]; then
@@ -235,7 +235,7 @@ waitfor 10 sh -c "! [ -f $R/b/ser2net.pid ]" && jhas b "result=yield" && ok "b h
 [ "$(ver a)" = "term=9 used=yes" ] && held b && ok "a's turn is a new term ($(ver a)); b is outdated against it and held" || no "after the heal: a $(ver a), b held=$(held b && echo y || echo n) ($(cat "$R/b/state/outdated" 2>/dev/null))"
 [ "$(cat "$R/a/counter")" -gt "$CB0" ] && ok "a raised its Zigbee counter above b's before taking the radios back ($(cat "$R/a/counter") > $CB0)" || no "a's counter $(cat "$R/a/counter") is not above b's $CB0"
 [ "$(grep -c 'event=version result=advanced' "$R/b/journal")" = "$ADV0" ] && ok "b's version never advanced on its own, cut or healed: what it held was never taken for the newer copy" || no "b advanced its version: $(ver b)"
-waitfor 40 veris b "term=9 used=no" && waitfor 5 unheld b && ok "a synced b afterwards: b holds $(ver b) and is an ordinary standby" || no "b after the heal: $(ver b), held=$([ -e "$R/b/run/hold" ] && echo y || echo n)"
+waitfor 40 veris b "term=9 used=no" && waitfor 5 unheld b && ok "a synced b afterward: b holds $(ver b) and is an ordinary standby" || no "b after the heal: $(ver b), held=$([ -e "$R/b/run/hold" ] && echo y || echo n)"
 sleep 8; serves a && ! serves b && [ "$(grep -c 'result=preempt ' "$R/a/journal")" = 1 ] && [ "$(grep -c 'result=preempt ' "$R/b/journal")" = 1 ] && ok "8 s later: a serves, b stands by, one preemption each in the whole run (no flapping)" || no "not stable after the heal: a serves=$(serves a && echo y || echo n) b serves=$(serves b && echo y || echo n) preempts a=$(grep -c 'result=preempt ' "$R/a/journal") b=$(grep -c 'result=preempt ' "$R/b/journal")"
 
 if [ "${REHEARSE_UPTO:-9}" -ge 7 ]; then

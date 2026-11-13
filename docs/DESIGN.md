@@ -97,7 +97,7 @@ Each VM keeps a version of the networks, a counter `(term, used)`. With `ELECTIO
 Rehearsed with the real keepalived in two network namespaces (`sudo bash tests/rehearse-election.sh`); not on a
 radio VM. During a cut link both VMs still serve; this only decides which copy survives the heal.
 
-## Recognising the sticks
+## Recognizing the sticks
 
 A list first (`guest/lib/usb-ids.json`, from Home Assistant's own USB lists), then a read-only question to the stick.
 Z-Wave 800 series and TI Z-Stack sticks are **synced**; every other stick is **served** only. One stick per kind per

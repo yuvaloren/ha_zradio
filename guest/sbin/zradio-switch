@@ -19,7 +19,7 @@
 #      the standby now (nopreempt: it does not take the role back).
 #   If the standby did not take the role in 20 s: keepalived is started here anyway — with no other MASTER this VM takes
 #   the address back after ~4 s — and the exit is 1.
-# Afterwards the new active's tick (every 15 min) syncs this VM once: the copy of a VM that just gave the role away has
+# Afterward the new active's tick (every 15 min) syncs this VM once: the copy of a VM that just gave the role away has
 # a Zigbee frame counter BELOW the new active's, and only a sync raises it.
 # [V reference pair 2026-11-11: Home Assistant's Z-Wave back after 1.3 s, Zigbee after 7 s.]
 # Journal lines: `zradio: event=switch result=…`. Tests: tests/t-switch.sh. Env: ZRADIO_SWITCH_*.

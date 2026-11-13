@@ -824,7 +824,7 @@ class ZNP:
     def _wipe_gate_ok(self, cid: int, payload: bytes) -> bool:
         """The two write SREQs' exact shape: command from ZNP_WIPE, an NV item of reset_network_info's
         four for DELETE, and the one STARTUP_OPTION value for WRITE_EXT. Checked in _exchange — the lowest send path —
-        so no caller can reach the wire with a write this tool did not authorise."""
+        so no caller can reach the wire with a write this tool did not authorize."""
         nv = int.from_bytes(payload[0:2], "little")
         return (MT_SYS, cid) in ZNP_WIPE and not (
             (cid == ZNP_SYS_OSAL_NV_DELETE and (len(payload) != 4 or nv not in ZNP_WIPE_DELETE_IDS))
@@ -970,7 +970,7 @@ class ZNP:
                         self.notes.append(f"{name} answered on attempt {attempt}")
                     return pl
                 if c0 == MT_SRSP | MT_RPC and c1 == 0x00:   # commands/rpc_error: CommandNotRecognized
-                    raise RPCError(f"{name}: the radio does not recognise it (RPC error {pl[:1].hex()}, request {pl[1:3].hex()})")
+                    raise RPCError(f"{name}: the radio does not recognize it (RPC error {pl[:1].hex()}, request {pl[1:3].hex()})")
                 kind = "an AREQ" if c0 & 0xE0 == MT_AREQ else "an unexpected frame"
                 self.notes.append(f"while waiting for {name}: {kind} 0x{c0:02x} 0x{c1:02x} — ignored")
         raise ProbeError(f"{name}: no answer ({'; '.join(why) or 'the radio budget is spent'})")
@@ -1394,7 +1394,7 @@ def main(argv=None) -> int:
         if args.zwave.startswith("tcp://"):
             p.error("--nvm-dump opens a local tty only: %s is a tcp:// port (the LIVE stick's NVM is not for dumping through ser2net)" % args.zwave)
     if args.wipe:
-        # the wipe's last line of defence. Once a network is copied, the LIVE sticks answer the same home ID and
+        # the wipe's last line of defense. Once a network is copied, the LIVE sticks answer the same home ID and
         # coordinator IEEE as the copy — only the HOST tells them apart, and zradio-probe has no host checks. The
         # wipe therefore runs on local ttys only: a tcp:// port (ser2net) is a usage error, exit 2.
         for k in ("zwave", "zigbee"):

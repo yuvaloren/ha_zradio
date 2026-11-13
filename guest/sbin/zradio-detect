@@ -10,7 +10,7 @@ can do with it, and (with --write) records that for the other tools. Nobody type
     zradio-detect --no-probe      table lookups only: nothing is sent to any stick
     zradio-detect --json          the result as JSON on stdout (the table goes to stderr)
 
-How a stick is recognised, in this order:
+How a stick is recognized, in this order:
   1. The list. Every /dev/ttyUSB* and /dev/ttyACM* is looked up by USB vendor:product, product string and port number
      in guest/lib/usb-ids.json: the USB lists Home Assistant's own Zigbee and Z-Wave integrations ship, plus the kit's
      annotations (which serial protocol, which port of a two-port adapter). A match gives a HINT, never the answer.

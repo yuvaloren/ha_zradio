@@ -62,7 +62,7 @@ vm "$T/x4"; : > "$T/x4/nostop"; sw "$T/x4" --run
 check "keepalived does not stop: exit 1, says this VM still serves" bash -c '[ "$2" = 1 ] && grep -q "systemctl stop keepalived failed — this VM still serves" "$1/out"' _ "$T/x4" "$RC"
 OUT=$(bash "$TOOL" --help 2>&1); RC=$?
 check "--help: exit 0, names the steps" bash -c '[ "$1" = 0 ] && printf "%s" "$2" | grep -q "zradio-switch \[--run\] \[--sync\]" && printf "%s" "$2" | grep -q "^#   3\. wait"' _ "$RC" "$OUT"
-echo "-- --yield (asked for by a more advanced peer): no sync from the older copy; this VM is outdated afterwards"
+echo "-- --yield (asked for by a more advanced peer): no sync from the older copy; this VM is outdated afterward"
 vm "$T/y" MASTER 1 yes 20261101T000000Z 20261112T001339Z; sed -i 's/$/ term=5 used=yes zbfloor=7000000 wait=no/' "$T/y/peer"; echo "term=4 used=yes" > "$T/y/state/version"; sw "$T/y" --run --yield
 check "exit 0; the standby does not hold this VM's last sync, yet no sync is run" bash -c '[ "$2" = 0 ] && ! grep -q "zradio-sync run" "$1/calls" && grep -q "OK    --yield" "$1/out"' _ "$T/y" "$RC"
 check "keepalived stopped and started again; outdated holds the peer's term and counter floor" bash -c 'grep -q "^systemctl stop keepalived" "$1/calls" && grep -q "^systemctl start keepalived" "$1/calls" && [ "$(cat "$1/state/outdated")" = "term=5 zbfloor=7000000" ]' _ "$T/y"

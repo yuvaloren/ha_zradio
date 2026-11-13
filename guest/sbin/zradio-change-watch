@@ -22,7 +22,7 @@ A request seen = $STATE/change-seen is touched (on disk: a reboot inside the fiv
 journal line. When change-seen is $QUIET s old, this VM is the active and no sync ran for it yet:
 `zradio-sync run --reason device-change`. A sync that fails leaves zradio-sync's own pending mark: its tick retries.
 At most $MAX_PER_DAY device-change syncs start in 24 h (each is a pause for Home Assistant): past that, one loud line
-and the nightly sync covers it. Over-triggering (an inclusion started and cancelled) costs one sync; a missed request
+and the nightly sync covers it. Over-triggering (an inclusion started and canceled) costs one sync; a missed request
 costs nothing the nightly sync does not repair.
 
 A second job, with the same packets: A STICK THAT STOPPED ANSWERING while its tty is still there (hung firmware). The

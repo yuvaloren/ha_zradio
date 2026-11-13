@@ -234,7 +234,7 @@ class ZuiSocket(object):
                 raise HAError("socket.io", "Z-Wave JS UI refused the connection: %s" % m[2:200])
 
     def _recv_message(self, deadline):
-        """The next whole WebSocket message as (opcode, bytes): pings answered, close honoured, binary kept."""
+        """The next whole WebSocket message as (opcode, bytes): pings answered, close honored, binary kept."""
         ws = self.ws
         while True:
             f = ws._parse()

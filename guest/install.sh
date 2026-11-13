@@ -6,7 +6,7 @@
 #   install.sh --conf my-zradio.conf [--run]     first install: the pair's one config file (zradio.conf.example)
 #   install.sh [--run]                           later runs: /etc/zradio/zradio.conf is already there
 #   --initial-role primary|standby   what this VM is on the day of the install. INITIAL, because the two VMs swap
-#                  afterwards (a failover, a switch) and either serves: the answer is used once, kept in
+#                  afterward (a failover, a switch) and either serves: the answer is used once, kept in
 #                  /var/lib/zradio/initial-role, and saying the same again on a later run changes nothing.
 #                    primary  this VM's sticks ARE the house's networks: they stay as they are, and this VM may serve
 #                             them. Refused when a stick that would be synced holds no network — unless --first.
@@ -130,7 +130,7 @@ print(" ".join(k for k in sorted(r) if r[k].get("level") == "synced" and r[k].ge
 try: r = json.load(open(sys.argv[1]))["radios"]
 except Exception: r = {}
 print(" ".join(k for k in sorted(r) if r[k].get("level") == "synced" and r[k].get("holds_network") is True))' "$R/etc/zradio/radios.json" 2>/dev/null)
-  # The INITIAL role: who holds the house's networks on the day of the install. Afterwards the two VMs swap freely
+  # The INITIAL role: who holds the house's networks on the day of the install. Afterward the two VMs swap freely
   # (a failover, a switch), so it is applied ONCE — the answer is kept in initial-role, and a later run that says the
   # same again changes nothing: it would otherwise mark a VM that has long since become the one that serves, or
   # unmark one that a sync is in the middle of filling. The mark itself says who set it: the installer writes a

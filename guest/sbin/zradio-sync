@@ -44,7 +44,7 @@
 #   zradio-sync serve-ssh   the forced command: hello | receive | poke | yield <term> <used> (from
 #                       SSH_ORIGINAL_COMMAND); anything else is refused
 #   zradio-sync peer-poke   ask the serving peer to run its tick now (a returning standby wants its sync at once)
-#   zradio-sync peer-yield  ask the serving peer to hand the radios over: only honoured when this VM's version is
+#   zradio-sync peer-yield  ask the serving peer to hand the radios over: only honored when this VM's version is
 #                       strictly higher than the peer's and ELECTION=act (docs/DESIGN.md §3a); the peer answers YIELDED
 #   zradio-sync self-raise --above N   on a VM that does not serve: raise this VM's own Zigbee frame counter above N
 #                       (its own backup, the counter set to max(read, N) + $BUMP, written back and verified by
