@@ -6,6 +6,7 @@
 #   node <dir> [sticks on nodea: both|zwave|none|twins|dark] [ha: 1|0]
 #   canned guests (the default): cloud-init, systemctl, zradio-sync and zradio-serve in the VM are fakes, and the
 #     kit's installer "runs" by copying <dir>/install.log and install.rc into place.          knobs: files in <dir>
+#     The VM's conf is the one cloud-init wrote; one without SELF (a VM on DHCP) gets the address in <dir>/lease.
 #   live (touch <dir>/live): qm create really registers the VM in the cluster's files, and the guests are the fake
 #     radio VMs of tests/fake-guest.sh, in which the kit's real installer runs (tests/t-e2e.sh).
 #   FAKE_NODE=nodeb: the command runs on the other node (its sticks: <dir>/sys-nodeb).
@@ -100,6 +101,12 @@ case "\$what" in
     printf 'guest: %s\n' "\$(printf '%s' "\$script" | head -1 | cut -c1-240)" >> "\$d/calls"
     if [ ! -f "\$d/live" ] && [[ "\$script" == *"guest/install.sh --conf"* ]]; then
       cp "\$d/install.log" "\$R/var/log/zradio-install.log"; cp "\$d/install.rc" "\$R/root/zradio-install.rc"; : > "\$G/x/\$n.out"; echo 0 > "\$G/x/\$n.rc"
+      # …and its conf is in place: the one cloud-init wrote, with the VM's own address when that one names none (DHCP: <dir>/lease)
+      if [ -f "\$R/root/zradio.conf" ]; then cp "\$R/root/zradio.conf" "\$R/etc/zradio/zradio.conf"; grep -q '^SELF=' "\$R/etc/zradio/zradio.conf" || echo "SELF=\$(cat "\$d/lease" 2>/dev/null || echo 10.20.30.77)" >> "\$R/etc/zradio/zradio.conf"; fi
+    elif [ ! -f "\$d/live" ] && [[ "\$script" == *"guest/install.sh --peer "* ]]; then      # the first VM is told its peer (knob: <dir>/peer-fail)
+      if [ -f "\$d/peer-fail" ]; then echo "FAIL  --peer: refused" > "\$G/x/\$n.out"; echo 1 > "\$G/x/\$n.rc"
+      else pa=\${script#*--peer }; pa=\${pa%% *}; { grep -v '^PEER=' "\$R/etc/zradio/zradio.conf"; echo "PEER=\$pa"; } > "\$R/etc/zradio/zradio.conf.new" && mv "\$R/etc/zradio/zradio.conf.new" "\$R/etc/zradio/zradio.conf"
+        cat "\$d/peer.log" 2>/dev/null > "\$G/x/\$n.out"; echo 0 > "\$G/x/\$n.rc"; fi
     else
       r=\$(printf '%s' "\$script" | sed -E "s#(^|[ \"'=<>(;])/(etc|var|root|opt|usr/local)/#\\\\1\$R/\\\\2/#g")
       ( [ ! -f "\$d/genv.sh" ] || . "\$d/genv.sh" "\$id"; cd "\$G" && PATH="\$G/bin:\$d/gbin:\$PATH" bash -c "\$r" ) > "\$G/x/\$n.out" 2> "\$G/x/\$n.err"; echo \$? > "\$G/x/\$n.rc"
@@ -111,6 +118,11 @@ SH
   chmod +x "$d/bin/vmreg" "$d/bin/ga"
   fake "$d/gbin" cloud-init "printf 'status: %s\n' \"\$(cat '$d/ci-status')\""
   fake "$d/gbin" systemctl "[ ! -f '$d/start-fail' ]"
+}
+peer_dhcp() { # peer_dhcp <dir> <vmid> <name>: that first VM as one on DHCP — one interface, its own address filled in, no peer yet
+  printf '%s\n' "NAME=$3" VIP=192.168.1.20/24 VRID=61 PRIORITY=110 "# this VM's own address on the day it was installed" SELF=192.168.1.31 > "$1/g/$2/root/etc/zradio/zradio.conf"
+  vmconf "$1" "nodeb/$2" "name: $3" "net0: virtio=BC:24:11:00:00:01,bridge=vmbr1" "ipconfig0: ip=dhcp" "tags: zradio"
+  : > "$1/calls"
 }
 zvm() { local d=$1; shift; PATH="$d/bin:$PATH" ZRADIO_VM_SYS="$d/sys$([ "${FAKE_NODE:-nodea}" = nodea ] || echo "-$FAKE_NODE")" ZRADIO_VM_NET="$d/net" ZRADIO_VM_PVE="$d/pve" ZRADIO_VM_CACHE="$d/cache" ZRADIO_VM_WAIT=0 ZRADIO_VM_POLL=0 ZRADIO_VM_KEYS="$d/keys" bash "$TOOL" "$@" > "$d/out" 2>&1 < /dev/null; RC=$?; }   # nobody there to answer
 ask() { local d=$1; shift; PATH="$d/bin:$PATH" ZRADIO_VM_ASK=1 ZRADIO_VM_SYS="$d/sys$([ "${FAKE_NODE:-nodea}" = nodea ] || echo "-$FAKE_NODE")" ZRADIO_VM_NET="$d/net" ZRADIO_VM_PVE="$d/pve" ZRADIO_VM_CACHE="$d/cache" ZRADIO_VM_WAIT=0 ZRADIO_VM_POLL=0 ZRADIO_VM_KEYS="$d/keys" bash "$TOOL" "$@" > "$d/out" 2>&1; RC=$?; }   # answers on stdin (a here-string, not a pipe: RC must be this shell's)

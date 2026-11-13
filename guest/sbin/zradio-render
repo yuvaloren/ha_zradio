@@ -10,7 +10,7 @@
 # What it takes from the conf (see zradio.conf.example for the whole file):
 #   NAME=radio2            this VM (router_id)
 #   SELF=10.20.30.6        this VM's own address on the network the pair talks over (unicast source)
-#   PEER=10.20.30.5        the other radio VM's address
+#   PEER=10.20.30.5        the other radio VM's address. Empty: no peer yet — the file has no unicast lines
 #   VIP=10.20.30.50/24     the floating address Home Assistant connects to
 #   VRID=50                the pair's virtual router id (1-255); unique among VRRP routers on that network
 #   PRIORITY=100           1-254; with nopreempt it only decides who wins when both start at the same moment
@@ -66,7 +66,11 @@ esac
 [ -r "$TMPL" ] || die "no template $TMPL"
 zr_iface || die "$ZR_ERR"
 IFACE=$ZR_IFACE
+if [ -z "$PEER" ]; then      # not paired yet: the unicast lines go, all four
+  TMPL_NOPEER=$(sed -e '/^ *unicast_src_ip /d' -e '/^ *unicast_peer {$/,/^ *}$/d' "$TMPL") || die "sed failed"
+  case "$TMPL_NOPEER" in *@PEER@*|*unicast_*) die "the template's unicast lines are not the ones this tool takes out for a VM without a peer";; esac
+else TMPL_NOPEER=""; fi
 out=$(sed -e "s|@NAME@|$NAME|g" -e "s|@IFACE@|$IFACE|g" -e "s|@SELF@|$SELF|g" -e "s|@PEER@|$PEER|g" \
-          -e "s|@VIP@|$VIP|g" -e "s|@VRID@|$VRID|g" -e "s|@PRIORITY@|$PRIORITY|g" "$TMPL") || die "sed failed"
+          -e "s|@VIP@|$VIP|g" -e "s|@VRID@|$VRID|g" -e "s|@PRIORITY@|$PRIORITY|g" < <(if [ -z "$PEER" ]; then printf '%s\n' "$TMPL_NOPEER"; else cat "$TMPL"; fi)) || die "sed failed"
 case "$out" in *@[A-Z]*@*) die "the template has a placeholder this tool does not know";; esac
 printf '%s\n' "$out"

@@ -9,14 +9,17 @@ INITIAL_ROLE=primary
 #FIRST=yes
 
 NAME=zradio1
-# This VM, the other radio VM, and the floating address Home Assistant connects to:
-SELF=192.168.1.21/24
-PEER=192.168.1.22
-VIP=192.168.1.20/24
+# The floating address Home Assistant connects to: a free address that your DHCP server does not hand out.
+VIP=192.168.1.20
+# The network the radio VMs are on. Each VM takes its own address from DHCP there (reserve it afterward).
 BRIDGE=vmbr0
-GATEWAY=192.168.1.1
+# Fixed addresses instead of DHCP — this VM, the other radio VM, the gateway (the floating address then with its prefix):
+#SELF=192.168.1.21/24
+#PEER=192.168.1.22
+#GATEWAY=192.168.1.1
+#VIP=192.168.1.20/24
 
 # Start the VM in the pair at the end:
 #START=yes
 
-# The second node needs none of this: it takes the addresses from the first VM and the opposite role. NAME if you like.
+# The second node needs none of this: it takes the network from the first VM and the opposite role. NAME if you like.

@@ -17,6 +17,13 @@
 #   Without --initial-role (the kit before the role was asked): a VM whose "synced" sticks are blank is marked "not
 #                  filled" unless --first; a VM whose sticks hold any network may serve.
 #   --from-node    run by ./install.sh on the Proxmox node, which pairs the two VMs itself: the trust line is not printed
+#   --peer A.B.C.D the other radio VM's address, written into the conf this VM has (PEER). For the pair's first VM, which
+#                  was installed before the second one had an address: keepalived.conf is rendered again, and a
+#                  keepalived that runs is reloaded — the floating address is gone for about 4 seconds [V keepalived 2.3].
+#   A conf without SELF: this machine's own address is written into it (the one on IFACE, else on the default route's
+#                  interface) — for a VM whose address comes from DHCP. The pair knows the VM by that address from
+#                  then on: RESERVE it for this VM in the DHCP server. A VIP without a prefix gets that address's.
+#                  A conf without PEER: no peer yet (the first VM of a pair); --peer adds it later.
 #   --detect       look at the USB ports again even though /etc/zradio/radios.conf exists (after changing a stick)
 #   --use zigbee=/dev/ttyUSB3[:family]   passed to zradio-detect (repeatable)
 #
@@ -46,9 +53,9 @@
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 R=${ZRADIO_INSTALL_ROOT:-}
-RUN=0 CONF_SRC="" FIRST=0 DETECT=0 USE=() ROLE="" BYNODE=0
+RUN=0 CONF_SRC="" FIRST=0 DETECT=0 USE=() ROLE="" BYNODE=0 SETPEER="" PEER_SAID=0
 while [ $# -gt 0 ]; do case "$1" in
-  --run) RUN=1; shift;; --conf) CONF_SRC=$2; shift 2;; --first) FIRST=1; shift;; --detect) DETECT=1; shift;; --from-node) BYNODE=1; shift;; --initial-role) ROLE=${2:-}; shift 2;;
+  --run) RUN=1; shift;; --conf) CONF_SRC=$2; shift 2;; --first) FIRST=1; shift;; --detect) DETECT=1; shift;; --from-node) BYNODE=1; shift;; --initial-role) ROLE=${2:-}; shift 2;; --peer) SETPEER=${2:-}; PEER_SAID=1; shift 2;;
   --use) USE+=(--use "$2"); shift 2;;
   -h|--help) sed -n '2,/^set -uo pipefail$/{/^set -uo pipefail$/!p}' "$0"; exit 0;; *) echo "unknown arg: $1" >&2; exit 2;; esac; done
 case "$ROLE" in ""|primary|standby) ;; *) echo "--initial-role '$ROLE': primary (its sticks hold the networks today) or standby (its sticks will be overwritten)" >&2; exit 2;; esac
@@ -87,11 +94,53 @@ for f in $UNITS; do [ -f "$HERE/units/$f" ] || miss="$miss units/$f"; done
 [ -z "$miss" ] && ok "the kit's files are all here ($HERE)" || bad "missing in $HERE:$miss"
 # shellcheck source=lib/zradio-common.sh
 . "$HERE/lib/zradio-common.sh" || exit 2
+TMP=$(mktemp -d) || exit 1; trap 'rm -rf "$TMP"' EXIT
 if [ -n "$CONF_SRC" ]; then
   [ -r "$CONF_SRC" ] || { bad "--conf $CONF_SRC: no such file"; CONF_SRC=""; }
   ZR_CONF=${CONF_SRC:-$R/etc/zradio/zradio.conf}
 else ZR_CONF="$R/etc/zradio/zradio.conf"; fi
-if zr_load_conf; then ok "$ZR_CONF checks: $NAME, $SELF ↔ $PEER, the floating address $VIP (VRID $VRID, priority $PRIORITY), ports $ZWAVE_PORT (Z-Wave) / $ZIGBEE_PORT (Zigbee)"
+CONF_NAME=$ZR_CONF
+[ $PEER_SAID = 0 ] || zr_ip4 "$SETPEER" || { bad "--peer '$SETPEER': the other radio VM's IPv4 address"; SETPEER=""; }
+# What the conf leaves open is filled in here, into a copy that is then checked and installed like any other: SELF
+# (this machine's own address), the VIP's prefix (that address's), PEER (--peer; else the one this VM already has).
+if [ -r "$ZR_CONF" ] && zr_kv_only "$ZR_CONF"; then
+  cv() { sed -n "s/^$1=//p" "$2" 2>/dev/null | tail -1; }
+  setkv() { # setkv <KEY> <value> <comment>: in place when the key has a line, else at the end under the comment
+    if grep -q "^$1=" "$TMP/zradio.conf"; then sed -i "s|^$1=.*|$1=$2|" "$TMP/zradio.conf"; else printf '# %s\n%s=%s\n' "$3" "$1" "$2" >> "$TMP/zradio.conf"; fi
+  }
+  cp "$ZR_CONF" "$TMP/zradio.conf"
+  c_self=$(cv SELF "$ZR_CONF"); c_vip=$(cv VIP "$ZR_CONF"); c_peer=$(cv PEER "$ZR_CONF"); own=""
+  if [ -z "$c_self" ] || { [ -n "$c_vip" ] && [ "$c_vip" = "${c_vip%/*}" ]; }; then
+    # this machine's addresses: "<interface> <address/prefix>" per line; the one that counts is SELF's, else the one on
+    # IFACE, else the one on the default route's interface, else the first
+    addrs=$("${ZRADIO_IP:-ip}" -o -4 addr show scope global 2>/dev/null | awk '$3 == "inet" { print $2, $4 }')
+    dev=$(cv IFACE "$ZR_CONF"); [ -n "$dev" ] || dev=$("${ZRADIO_IP:-ip}" -o -4 route show default 2>/dev/null | sed -n 's/^default .* dev \([^ ]*\).*/\1/p' | head -1)
+    if [ -n "$c_self" ]; then own=$(printf '%s\n' "$addrs" | awk -v a="$c_self" '{ split($2, x, "/"); if (x[1] == a) { print; exit } }')
+    else
+      own=$(printf '%s\n' "$addrs" | awk -v d="$dev" 'd != "" && $1 == d { print; exit }'); [ -n "$own" ] || own=$(printf '%s\n' "$addrs" | head -1)
+      if [ -n "$own" ]; then
+        a=${own#* }; setkv SELF "${a%/*}" "this VM's own address on the day it was installed. It came from the network (DHCP): reserve it for this VM there"
+        SELF_TAKEN="$a ${own% *}"          # "<address/prefix> <interface>", for the line below
+      else bad "$CONF_NAME names no SELF, and this machine has no IPv4 address to take (ip -o -4 addr show scope global): give it one, or write SELF into the conf"; fi
+    fi
+    if [ -n "$own" ] && [ -n "$c_vip" ] && [ "$c_vip" = "${c_vip%/*}" ]; then
+      setkv VIP "$c_vip/${own##*/}" "the floating address"
+      python3 -c 'import ipaddress, sys; sys.exit(0 if ipaddress.ip_address(sys.argv[2]) in ipaddress.ip_interface(sys.argv[1]).network else 1)' "${own#* }" "$c_vip" 2>/dev/null \
+        || bad "the floating address $c_vip is not in this VM's network (its own address is ${own#* }): the floating address is a free address of the same network"
+    fi
+  fi
+  if [ -n "$SETPEER" ]; then
+    [ -z "$c_peer" ] || [ "$c_peer" = "$SETPEER" ] || warn "PEER was $c_peer in $CONF_NAME: it is $SETPEER now (--peer)"
+    setkv PEER "$SETPEER" "the other radio VM's address (the node's install.sh wrote it when the second VM was installed)"
+  elif [ -z "$c_peer" ] && [ -n "$CONF_SRC" ]; then
+    was=$(cv PEER "$R/etc/zradio/zradio.conf")           # a re-run with the first conf does not take the peer away again
+    [ -z "$was" ] || setkv PEER "$was" "the other radio VM's address (the node's install.sh wrote it when the second VM was installed)"
+  fi
+  if ! cmp -s "$ZR_CONF" "$TMP/zradio.conf"; then CONF_SRC="$TMP/zradio.conf"; ZR_CONF=$CONF_SRC; fi
+elif [ $PEER_SAID = 1 ]; then bad "--peer: there is no conf to write it into ($ZR_CONF)"; fi
+if zr_load_conf; then ok "$CONF_NAME checks: $NAME, $SELF ↔ ${PEER:-no peer yet}, the floating address $VIP (VRID $VRID, priority $PRIORITY), ports $ZWAVE_PORT (Z-Wave) / $ZIGBEE_PORT (Zigbee)"
+  [ -z "${SELF_TAKEN:-}" ] || warn "SELF: $CONF_NAME names no address for this VM, so the one it has is written into its conf: ${SELF_TAKEN%% *} on ${SELF_TAKEN#* }$(m=$(cat "/sys/class/net/${SELF_TAKEN#* }/address" 2>/dev/null); [ -z "$m" ] || echo " (MAC $m)"). The pair knows this VM by that address from now on: RESERVE it for this VM in your DHCP server. A VM whose address changes does not serve (zradio-serve status says so)"
+  [ -n "$PEER" ] || warn "no PEER: this VM has no peer yet. It holds the floating address alone (keepalived sends VRRP's ordinary multicast adverts) until the pair's other VM is installed and this one is told its address (the node's install.sh does that; by hand: install.sh --peer A.B.C.D --run)"
 else bad "$ZR_ERR"; fi
 echo "== checks: $FAILS FAIL =="
 [ $FAILS -eq 0 ] || { echo "REFUSED: fix the FAIL lines; nothing was changed"; exit 1; }
@@ -194,7 +243,6 @@ fi
 [ $FAILS -eq 0 ] || { echo "== FAILED before any service file was touched: $FAILS FAIL =="; exit 1; }
 
 echo "== 5. the rendered files =="
-TMP=$(mktemp -d) || exit 1; trap 'rm -rf "$TMP"' EXIT
 RENDER="$R/usr/local/sbin/zradio-render"; [ $RUN = 1 ] || RENDER="$HERE/sbin/zradio-render"
 if bash "$RENDER" --keepalived > "$TMP/keepalived.conf" 2> "$TMP/err"; then
   put "$TMP/keepalived.conf" /etc/keepalived/keepalived.conf 644
@@ -223,7 +271,11 @@ else would "systemctl daemon-reload; enable zradio.target, zradio-quiet, keepali
 # a re-run on a VM that is in the pair: say what still runs on the old files
 if [ $RUN = 1 ]; then
   case " $CHANGED " in *" /etc/ser2net.yaml "*) active ser2net && warn "/etc/ser2net.yaml changed and ser2net is active (this VM serves): the new file is used from the next switch on (zradio-switch --run), or after 'systemctl restart ser2net' — a few seconds without radios for Home Assistant";; esac
-  case " $CHANGED " in *" /etc/keepalived/keepalived.conf "*) active keepalived && warn "/etc/keepalived/keepalived.conf changed and keepalived is active: 'systemctl restart keepalived' puts it in place (on the active VM that hands the radios to the other one)";; esac
+  case " $CHANGED " in *" /etc/keepalived/keepalived.conf "*)
+    if active keepalived && [ -n "$SETPEER" ]; then
+      systemctl reload keepalived >/dev/null 2>&1 && done_ "keepalived reloaded: this VM sends its adverts to its peer $SETPEER now. On the VM that serves, the floating address was gone for about 4 seconds; Home Assistant connects again by itself" \
+        || bad "systemctl reload keepalived failed: this VM does not talk to its peer $SETPEER yet ('systemctl restart keepalived' puts the new file in place)"
+    elif active keepalived; then warn "/etc/keepalived/keepalived.conf changed and keepalived is active: 'systemctl restart keepalived' puts it in place (on the active VM that hands the radios to the other one)"; fi;; esac
   case " $CHANGED " in *zradio-change-watch*) active zradio-change-watch && { systemctl restart zradio-change-watch >/dev/null 2>&1; ok "zradio-change-watch restarted on the new file (it only watches)"; };; esac
   case " $CHANGED " in *zradio-gate*|*zradio.conf*) active zradio-gate && { systemctl restart zradio-gate >/dev/null 2>&1; ok "zradio-gate restarted on the new files (ELECTION=$ELECTION)"; };; esac
 fi
@@ -233,7 +285,7 @@ if [ $RUN = 1 ]; then
   if K=$(env ZRADIO_SYNC_KEY="$R/etc/zradio/sync.key" ZRADIO_SYNC_HOSTKEY="${ZRADIO_INSTALL_HOSTKEY:-$R/etc/ssh/ssh_host_ed25519_key.pub}" bash "$R/usr/local/sbin/zradio-sync" keys 2>&1); then
     if [ $BYNODE = 1 ]; then done_ "the sync key is at /etc/zradio/sync.key (0600)"
     else
-      done_ "the sync key is at /etc/zradio/sync.key (0600). On the OTHER radio VM ($PEER), as root, run:"
+      done_ "the sync key is at /etc/zradio/sync.key (0600). On the OTHER radio VM${PEER:+ ($PEER)}, as root, run:"
       printf "      zradio-sync trust --sync-key '%s' --host-key '%s'\n" "$(printf '%s\n' "$K" | sed -n 's/^SYNCKEY //p')" "$(printf '%s\n' "$K" | sed -n 's/^HOSTKEY //p')"
     fi
   else bad "zradio-sync keys: $K"; fi

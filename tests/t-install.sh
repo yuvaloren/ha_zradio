@@ -120,4 +120,33 @@ echo "ZWAVE_PORT=7001" >> "$T/a/my.conf"; inst "$T/a" --conf "$T/a/my.conf" --ru
 check "exit 0; no detection, ser2net not restarted or stopped" bash -c '[ "$2" = 0 ] && ! grep -q "^zradio-detect" "$1/calls" && ! grep -qE "^systemctl (restart|stop|disable --now) ser2net" "$1/calls"' _ "$T/a" "$RC"
 check "the new port is in the file and a WARN says when it takes effect" bash -c 'grep -q "accepter: tcp,10.20.30.50,7001" "$1/root/etc/ser2net.yaml" && grep -q "WARN  /etc/ser2net.yaml changed and ser2net is active" "$1/out"' _ "$T/a"
 check "--help names the steps" bash -c 'bash "$1" --help | grep -q "NOTHING IS STARTED"' _ "$TOOL"
+
+echo "-- a VM whose address comes from DHCP: a conf without SELF, and without PEER (the pair's first VM)"
+C() { printf '%s/root/etc/zradio/zradio.conf' "$1"; }
+vm "$T/dh"; printf '%s\n' "# a pair on DHCP" NAME=attic1 VIP=192.168.1.50 VRID=50 PRIORITY=110 > "$T/dh/dhcp.conf"
+inst "$T/dh" --conf "$T/dh/dhcp.conf" --initial-role primary --run
+check "exit 0; this machine's own address is in the installed conf as SELF, the floating address got its prefix, and there is no PEER" bash -c '[ "$3" = 0 ] && grep -qx "SELF=192.168.1.44" "$1" && grep -qx "VIP=192.168.1.50/24" "$1" && ! grep -q "^PEER=" "$1" && ! grep -q "SELF" "$2/dhcp.conf"' _ "$(C "$T/dh")" "$T/dh" "$RC"
+check "said: which address, on which interface, that it is to be RESERVED — and that this VM has no peer yet" bash -c 'grep -q "WARN  SELF: .*192.168.1.44/24 on eth0.*RESERVE it for this VM in your DHCP server" "$1/out" && grep -q "WARN  no PEER: this VM has no peer yet" "$1/out" && grep -q "attic1, 192.168.1.44 ↔ no peer yet, the floating address 192.168.1.50/24" "$1/out"' _ "$T/dh"
+check "its keepalived.conf has no unicast lines: it holds the floating address alone" bash -c '! grep -q "unicast_" "$1/root/etc/keepalived/keepalived.conf" && grep -q "192.168.1.50/24 dev eth0" "$1/root/etc/keepalived/keepalived.conf"' _ "$T/dh"
+inst "$T/dh" --conf "$T/dh/dhcp.conf" --run
+check "the same line again: nothing is rewritten" bash -c '[ "$2" = 0 ] && grep -q "OK    /etc/zradio/zradio.conf is current" "$1/out" && grep -q "OK    /etc/keepalived/keepalived.conf is current" "$1/out"' _ "$T/dh" "$RC"
+echo 1 > "$T/dh/keepalived"          # the VM is in the pair by now: keepalived runs
+inst "$T/dh" --peer 192.168.1.45 --from-node --run
+check "--peer (the second VM exists now): PEER is in the conf, keepalived.conf has the unicast lines, nothing is detected again" bash -c '[ "$3" = 0 ] && grep -qx "PEER=192.168.1.45" "$1" && grep -qx "SELF=192.168.1.44" "$1" && grep -A2 "unicast_src_ip 192.168.1.44" "$2/root/etc/keepalived/keepalived.conf" | grep -q "^ *192.168.1.45$" && [ "$(grep -c "^zradio-detect" "$2/calls")" = 1 ]' _ "$(C "$T/dh")" "$T/dh" "$RC"
+check "…and the keepalived that runs is reloaded, with what that costs said" bash -c 'grep -q "^systemctl reload keepalived" "$1/calls" && grep -q "DONE  keepalived reloaded: this VM sends its adverts to its peer 192.168.1.45 now.*about 4 seconds" "$1/out" && ! grep -q "systemctl restart keepalived" "$1/out"' _ "$T/dh"
+inst "$T/dh" --conf "$T/dh/dhcp.conf" --run
+check "a later run with the first conf (it names no peer) does not take the peer away" bash -c '[ "$2" = 0 ] && grep -qx "PEER=192.168.1.45" "$1" && grep -q "OK    /etc/zradio/zradio.conf is current"  "$3/out"' _ "$(C "$T/dh")" "$RC" "$T/dh"
+inst "$T/dh" --peer 192.168.1 --run
+check "--peer with something that is no address: refused, nothing changed" bash -c '[ "$2" = 1 ] && grep -q "FAIL  --peer .192.168.1.: the other radio VM.s IPv4 address" "$3/out" && grep -qx "PEER=192.168.1.45" "$1"' _ "$(C "$T/dh")" "$RC" "$T/dh"
+vm "$T/dh2"; printf '%s\n' NAME=attic1 VIP=10.20.30.50 VRID=50 PRIORITY=110 IFACE=eth1 > "$T/dh2/c"; inst "$T/dh2" --conf "$T/dh2/c" --initial-role primary --run
+check "IFACE in the conf: the address on THAT interface is the VM's" bash -c '[ "$2" = 0 ] && grep -qx "SELF=10.20.30.6" "$1" && grep -qx "VIP=10.20.30.50/24" "$1"' _ "$(C "$T/dh2")" "$RC"
+vm "$T/dh3"; fake "$T/dh3/bin" ip 'case "$*" in *route*) echo "default via 10.20.30.1 dev eth1 proto dhcp src 10.20.30.6 metric 100";; *) printf "2: eth0    inet 192.168.1.44/24 scope global eth0\n3: eth1    inet 10.20.30.6/24 scope global dynamic eth1\n";; esac'
+printf '%s\n' NAME=attic1 VIP=10.20.30.50 VRID=50 PRIORITY=110 > "$T/dh3/c"; inst "$T/dh3" --conf "$T/dh3/c" --initial-role primary --run
+check "no IFACE: the address on the default route's interface, not the first one listed" bash -c '[ "$2" = 0 ] && grep -qx "SELF=10.20.30.6" "$1"' _ "$(C "$T/dh3")" "$RC"
+vm "$T/dh4"; printf '%s\n' NAME=attic1 VIP=10.9.9.50 VRID=50 PRIORITY=110 > "$T/dh4/c"; inst "$T/dh4" --conf "$T/dh4/c" --initial-role primary --run
+check "a floating address outside the VM's own network: refused before anything is changed" bash -c '[ "$2" = 1 ] && grep -q "FAIL  the floating address 10.9.9.50 is not in this VM.s network (its own address is 192.168.1.44/24)" "$1/out" && [ ! -e "$1/root/etc/zradio/zradio.conf" ] && ! grep -q "^apt-get" "$1/calls"' _ "$T/dh4" "$RC"
+vm "$T/dh5"; fake "$T/dh5/bin" ip ':'; printf '%s\n' NAME=attic1 VIP=192.168.1.50 VRID=50 PRIORITY=110 > "$T/dh5/c"; inst "$T/dh5" --conf "$T/dh5/c" --initial-role primary --run
+check "no SELF in the conf and no address on the machine: refused, saying so" bash -c '[ "$2" = 1 ] && grep -q "FAIL  .* names no SELF, and this machine has no IPv4 address to take" "$1/out" && [ ! -e "$1/root/etc/zradio/zradio.conf" ]' _ "$T/dh5" "$RC"
+vm "$T/dh6"; grep -v '^PEER=' "$T/dh6/my.conf" > "$T/dh6/c"; inst "$T/dh6" --conf "$T/dh6/c" --initial-role primary --run
+check "a fixed SELF and no PEER: installed as a VM without a peer; its address is its own business (no RESERVE line)" bash -c '[ "$2" = 0 ] && grep -q "WARN  no PEER" "$1/out" && ! grep -q "RESERVE" "$1/out" && ! grep -q "unicast_" "$1/root/etc/keepalived/keepalived.conf"' _ "$T/dh6" "$RC"
 finish

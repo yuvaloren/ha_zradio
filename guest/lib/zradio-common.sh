@@ -39,7 +39,7 @@ zr_load_conf() { # the pair's conf into NAME SELF PEER VIP VRID PRIORITY IFACE Z
   . "$ZR_CONF"
   [[ "$NAME" =~ ^[a-z][a-z0-9-]{0,30}$ ]] || { ZR_ERR="NAME '$NAME': a short lower-case name"; return 1; }
   zr_ip4 "$SELF" || { ZR_ERR="SELF '$SELF': this VM's own IPv4 address"; return 1; }
-  zr_ip4 "$PEER" || { ZR_ERR="PEER '$PEER': the other radio VM's IPv4 address"; return 1; }
+  [ -z "$PEER" ] || zr_ip4 "$PEER" || { ZR_ERR="PEER '$PEER': the other radio VM's IPv4 address (empty: this VM has no peer yet)"; return 1; }
   local vip_a=${VIP%/*} vip_p=${VIP##*/}
   [ "$VIP" != "$vip_a" ] && zr_ip4 "$vip_a" && [[ "$vip_p" =~ ^[0-9]{1,2}$ ]] && [ "$vip_p" -ge 8 ] && [ "$vip_p" -le 32 ] \
     || { ZR_ERR="VIP '$VIP': the floating address as A.B.C.D/prefix"; return 1; }
@@ -99,4 +99,14 @@ zr_iface() { # the pair's interface into ZR_IFACE: IFACE from the conf, else the
   [ -z "$ZR_IFACE" ] || return 0
   ZR_IFACE=$("${ZRADIO_IP:-ip}" -o -4 addr show 2>/dev/null | awk -v a="$SELF" '{ split($4, x, "/"); if (x[1] == a) { print $2; exit } }')
   [ -n "$ZR_IFACE" ] || { ZR_ERR="no interface holds SELF $SELF (set IFACE in $ZR_CONF, or give this VM that address)"; return 1; }
+}
+zr_holds_self() { # 0 when an interface of this VM holds SELF — or when that cannot be told (no `ip`, no answer). 1: the
+  # VM's address is not the one the pair knows it by (an address from DHCP that changed); what it holds instead is in
+  # ZR_HOLDS. The other VM cannot hear this one then, and keepalived would still claim the floating address
+  # [V keepalived 2.3: MASTER within 4 s on an address that is not its unicast_src_ip] — so such a VM does not serve.
+  local out; ZR_HOLDS=""
+  out=$("${ZRADIO_IP:-ip}" -o -4 addr show scope global 2>/dev/null) || return 0
+  [ -n "$out" ] || return 0
+  ZR_HOLDS=$(printf '%s\n' "$out" | awk '{ split($4, x, "/"); printf "%s%s", (n++ ? " " : ""), x[1] }')
+  printf '%s\n' "$out" | awk -v a="$SELF" '{ split($4, x, "/"); if (x[1] == a) f = 1 } END { exit !f }'
 }

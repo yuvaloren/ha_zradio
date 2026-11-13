@@ -6,8 +6,9 @@
 #
 # It asks what it needs, shows what it would do, and does it after a yes: the VM (Debian 13), this node's Z-Wave
 # and/or Zigbee sticks passed through, the kit installed inside (through the guest agent), the VM under Proxmox HA
-# and pinned to this node. On the second node it takes the addresses from the first VM and introduces the two VMs to
-# each other (their sync keys), so nothing is typed twice and nothing is pasted. Either kind of stick may be missing.
+# and pinned to this node. The VM takes its own address from DHCP; the one address asked for is the floating one that
+# Home Assistant connects to. On the second node it takes the network from the first VM and introduces the two to each
+# other (addresses, sync keys): nothing is typed twice, nothing is pasted. Either kind of stick may be missing.
 #
 # Without a terminal nothing is asked: every answer is an option, and nothing is changed without --run.
 #   --answers FILE           the options below as lines of a file, KEY=value (answers.example); for unattended runs
@@ -16,9 +17,12 @@
 #                            primary: this node's sticks hold your networks and stay as they are.
 #                            standby: this node's sticks WILL BE WIPED by the first sync.
 #                            Only for the start: afterward the two VMs swap. (--first: a new house, no network yet)
-#   --name NAME              the VM's name (default: the first free of zradio1, zradio2, …)
-#   --self A.B.C.D/NN  --peer A.B.C.D  --vip A.B.C.D/NN      this VM, the other VM, the floating address
-#   --bridge BR  --gateway A.B.C.D                            the network they are on (default vmbr0)
+#   --name NAME              the VM's name (default: zradio1; the pair's second VM after the first: radio1 -> radio2)
+#   --vip A.B.C.D            the floating address: a free one of the VMs' network that DHCP does not hand out
+#   --bridge BR              the network the VMs are on (default vmbr0). The VM's own address comes from DHCP there:
+#                            RESERVE it for the VM in the DHCP server afterward (the run ends with the address).
+#   --self A.B.C.D/NN  --peer A.B.C.D  --gateway A.B.C.D  --vip A.B.C.D/NN
+#                            fixed addresses instead of DHCP: this VM, the other VM, the gateway
 #   --pair-bridge BR         a link of its own between the nodes for --self (--bridge is then DHCP, no --gateway)
 #   --join NAME              the first radio VM, to pair with (found by itself when there is one);  --no-pair
 #   --start                  put the VM into the pair at the end        --run   do it
@@ -211,16 +215,19 @@ if [ -n "$PVMID" ]; then
     || die "could not read $PNAME's configuration through its guest agent"
   pf() { printf '%s\n' "$PF" | sed -n "s/^$1=//p" | tail -1 | tr -dc 'A-Za-z0-9./:_-'; }
   P_SELF=$(pf SELF); P_PEER=$(pf PEER); P_ROLE=$(pf INITIAL_ROLE); P_ZWAVE=$(pf P_ZWAVE); P_ZIGBEE=$(pf P_ZIGBEE)
-  ip4 "$P_SELF" && ip4 "$P_PEER" || die "$PNAME has no /etc/zradio/zradio.conf with SELF and PEER: the kit is not installed in it"
+  ip4 "$P_SELF" || die "$PNAME has no /etc/zradio/zradio.conf with SELF: the kit is not installed in it"
+  [ -z "$P_PEER" ] || ip4 "$P_PEER" || die "$PNAME's /etc/zradio/zradio.conf names a PEER that is no address: '$P_PEER'"
   [ -n "$PEER" ] || PEER=$P_SELF
   [ -n "$VIP" ] || VIP=$(pf VIP)
   [ -n "$VRID" ] || VRID=$(pf VRID)
   # the network, from the first VM's own lines in the cluster's files: the ipconfig that holds its address, and that interface's bridge
   PC="$PVE/nodes/$PNODE/qemu-server/$PVMID.conf"
   pk=$(sed -n '/^\[/q; s/^ipconfig\([0-9]\):.*ip='"${P_SELF//./\\.}"'\/\([0-9]*\).*/\1 \2/p' "$PC" 2>/dev/null | head -1)
-  if [ -n "$pk" ]; then
-    [ -n "$SELF" ] || SELF="$P_PEER/${pk#* }"
-    pbr() { sed -n '/^\[/q; s/^net'"$1"':.*bridge=\([A-Za-z0-9._-]*\).*/\1/p' "$PC" | head -1; }
+  pbr() { sed -n '/^\[/q; s/^net'"$1"':.*bridge=\([A-Za-z0-9._-]*\).*/\1/p' "$PC" | head -1; }
+  if [ -z "$pk" ]; then                      # the first VM has its address from DHCP: so does this one, on the same bridge
+    [ -n "$BRIDGE" ] || BRIDGE=$(pbr 0)
+  else
+    [ -n "$SELF" ] || [ -z "$P_PEER" ] || SELF="$P_PEER/${pk#* }"
     if [ "${pk% *}" = 0 ]; then
       [ -n "$BRIDGE" ] || BRIDGE=$(pbr 0)
       [ -n "$GATEWAY" ] || GATEWAY=$(sed -n '/^\[/q; s/^ipconfig0:.*gw=\([0-9.]*\).*/\1/p' "$PC" | head -1)
@@ -242,7 +249,7 @@ if [ $INTRO = 1 ]; then
     show_sticks || echo "      none"
   fi
   if [ -n "$PVMID" ]; then
-    echo "   This VM joins $PNAME on $PNODE: its address ${SELF:-?}, $PNAME's $PEER, the floating address ${VIP:-?}."
+    echo "   This VM joins $PNAME on $PNODE: its address $([ -n "$SELF" ] && echo "$SELF" || echo "comes from DHCP${BRIDGE:+ on $BRIDGE}"), $PNAME's is $PEER, the floating address ${VIP:-?}."
     [ "$ROLE" != standby ] || echo "   $PNAME is the initial primary, so this node starts as the STANDBY: the sticks here WILL BE WIPED by the first sync."
     [ "$ROLE" != primary ] || echo "   $PNAME is the initial standby, so this node starts as the PRIMARY: the sticks here hold your networks and stay as they are."
   fi
@@ -264,9 +271,13 @@ if [ -z "$ROLE" ] && [ $NOUSB = 0 ]; then                  # the one question no
 fi
 [ $NOUSB = 0 ] || [ -n "$ROLE" ] || ROLE=standby          # a drill has no radios: the harmless role
 if [ -z "$NAME" ]; then                 # the name is the user's: offered, asked for when someone is there
-  for i in 1 2 3 4 5 6 7 8 9; do
-    printf '%s\n' "$VMS" | awk -v n="zradio$i" '$2 == n { f = 1 } END { exit !f }' || { NAME="zradio$i"; break; }
-  done
+  taken() { printf '%s\n' "$VMS" | awk -v n="$1" '$2 == n { f = 1 } END { exit !f }'; }
+  NAME_WHY="the first free of zradio1, zradio2, …"
+  if [ -n "$PVMID" ]; then              # the pair's second VM is named after the first: radio1 -> radio2, attic -> attic2
+    base=$(printf '%s' "$PNAME" | sed 's/[0-9]*$//'); n=${PNAME#"$base"}; n=$((10#${n:-1}))
+    for i in 1 2 3 4 5 6 7 8 9; do c="$base$((n + i))"; if name_ok "$c" && ! taken "$c"; then NAME=$c; NAME_WHY="after $PNAME, the pair's first VM"; break; fi; done
+  fi
+  if [ -z "$NAME" ]; then for i in 1 2 3 4 5 6 7 8 9; do taken "zradio$i" || { NAME="zradio$i"; break; }; done; fi
   [ -n "$NAME" ] || die "zradio1 … zradio9 are all taken: name this VM with --name"
   if [ $ASK = 1 ]; then
     while :; do
@@ -274,34 +285,52 @@ if [ -z "$NAME" ]; then                 # the name is the user's: offered, asked
       if name_ok "$ANS"; then NAME=$ANS; break; fi
       echo "         a short lower-case name (letters, digits, -), please"
     done
-  else NAME_NOTE="no --name: this VM is called $NAME (the first free of zradio1, zradio2, …)"; fi
+  else NAME_NOTE="no --name: this VM is called $NAME ($NAME_WHY)"; fi
 fi
 if [ $ASK = 1 ] && [ $NOUSB = 0 ]; then
   if [ -z "$BRIDGE" ] && [ -z "$PAIR_BRIDGE" ]; then
     brs=$(for b in "$NETSYS"/*/bridge; do [ -d "$b" ] && basename "$(dirname "$b")"; done | tr '\n' ' ')
-    echo "   The network the two radio VMs and Home Assistant share — this node's bridges: ${brs:-none found}"
+    echo "   Which of this node's bridges is on the network the radio VMs will use? This VM, the other node's radio VM and the"
+    echo "   floating address each get an address on that network. Home Assistant only has to reach it, from wherever it runs."
+    echo "   This node's bridges: ${brs:-none found}"
     while :; do ask "bridge" "$([ -d "$NETSYS/vmbr0/bridge" ] && echo vmbr0)"; br_ok "$ANS" && break; done; BRIDGE=$ANS
   fi
-  while ! cidr "$SELF"; do ask "this VM's address there, with its prefix (like 192.168.1.21/24)"; SELF=$ANS; done
-  while ! ip4 "$PEER"; do ask "the other radio VM's address (the second node's VM gets it)"; PEER=$ANS; done
-  while ! cidr "$VIP"; do ask "the floating address Home Assistant will connect to"; VIP=$ANS; ip4 "$VIP" && VIP="$VIP/${SELF##*/}"; done
-  if [ -z "$PAIR_BRIDGE" ]; then while ! ip4 "$GATEWAY"; do ask "the gateway of that network"; GATEWAY=$ANS; done; fi
+  if [ -z "$SELF" ] && [ -z "$PAIR_BRIDGE" ]; then          # the VM's own address: DHCP's. One address is the user's to pick
+    if ! ip4 "$VIP" && ! cidr "$VIP"; then
+      echo "   The VM gets its own address from that network's DHCP server. One address is yours to pick: the floating address"
+      echo "   Home Assistant connects to — a free address of that network that the DHCP server does not hand out."
+      while ! ip4 "$VIP" && ! cidr "$VIP"; do ask "the floating address (like 192.168.1.20)"; VIP=$ANS; done
+    fi
+  else                                                       # fixed addresses (--self, or a pair link of its own)
+    while ! cidr "$SELF"; do ask "this VM's address there, with its prefix (like 192.168.1.21/24)"; SELF=$ANS; done
+    while ! ip4 "$PEER"; do ask "the other radio VM's address (the second node's VM gets it)"; PEER=$ANS; done
+    while ! cidr "$VIP"; do ask "the floating address Home Assistant will connect to"; VIP=$ANS; ip4 "$VIP" && VIP="$VIP/${SELF##*/}"; done
+    if [ -z "$PAIR_BRIDGE" ]; then while ! ip4 "$GATEWAY"; do ask "the gateway of that network"; GATEWAY=$ANS; done; fi
+  fi
 fi
 [ -n "$BRIDGE" ] || BRIDGE=vmbr0
 [ -n "$VRID" ] || VRID=50
 
 [ -z "$NAME" ] || name_ok "$NAME" || die "--name '$NAME': a short lower-case name (letters, digits, -)"
-cidr "$SELF" || die "--self '$SELF': this VM's address as A.B.C.D/prefix"
-ip4 "$PEER" || die "--peer '$PEER': the other radio VM's address"
-cidr "$VIP" || die "--vip '$VIP': the floating address as A.B.C.D/prefix"
-[ "${SELF%/*}" != "$PEER" ] && [ "${SELF%/*}" != "${VIP%/*}" ] && [ "$PEER" != "${VIP%/*}" ] || die "--self, --peer and --vip are three different addresses"
+DHCP=0; if [ -z "$SELF" ] && [ -z "$PAIR_BRIDGE" ]; then DHCP=1; fi       # no --self: the VM's own address is DHCP's
+if [ $DHCP = 1 ]; then
+  ip4 "$VIP" || cidr "$VIP" || die "--vip '$VIP': the floating address Home Assistant connects to (A.B.C.D — a free address of the VMs' network that DHCP does not hand out). The VM's own address comes from DHCP; fixed addresses instead: --self, --peer, --gateway"
+  [ -z "$GATEWAY" ] || die "--gateway goes with --self (a fixed address). Without --self the VM takes its address and its gateway from DHCP"
+  [ -z "$PEER" ] || ip4 "$PEER" || die "--peer '$PEER': the other radio VM's address"
+  [ "$PEER" != "${VIP%/*}" ] || die "--peer and --vip are two different addresses"
+else
+  cidr "$SELF" || die "--self '$SELF': this VM's address as A.B.C.D/prefix"
+  ip4 "$PEER" || die "--peer '$PEER': the other radio VM's address"
+  cidr "$VIP" || die "--vip '$VIP': the floating address as A.B.C.D/prefix"
+  [ "${SELF%/*}" != "$PEER" ] && [ "${SELF%/*}" != "${VIP%/*}" ] && [ "$PEER" != "${VIP%/*}" ] || die "--self, --peer and --vip are three different addresses"
+fi
 [[ "$VRID" =~ ^[0-9]+$ ]] && [ "$VRID" -ge 1 ] && [ "$VRID" -le 255 ] || die "--vrid '$VRID': 1-255"
 [ -z "$PRIORITY" ] || { [[ "$PRIORITY" =~ ^[0-9]+$ ]] && [ "$PRIORITY" -ge 1 ] && [ "$PRIORITY" -le 254 ]; } || die "--priority '$PRIORITY': 1-254"
 case "$ROLE" in primary|standby) ;; *) die "--initial-role '$ROLE': primary (this node's radios are configured) or standby (this node's radios will be wiped) — what the node is at the start; the two swap later";; esac
 [ "$ROLE" != standby ] || [ $FIRST = 0 ] || die "--first is for the initial primary of a new house: a standby's sticks are filled by the primary's sync"
 br_ok "$BRIDGE" || die "--bridge '$BRIDGE'"
 [ -z "$PAIR_BRIDGE" ] || br_ok "$PAIR_BRIDGE" || die "--pair-bridge '$PAIR_BRIDGE'"
-if [ -z "$PAIR_BRIDGE" ]; then ip4 "$GATEWAY" || die "without --pair-bridge the pair talks over the LAN on net0: --gateway A.B.C.D is needed with --self"; fi
+if [ $DHCP = 0 ] && [ -z "$PAIR_BRIDGE" ]; then ip4 "$GATEWAY" || die "without --pair-bridge the pair talks over the LAN on net0: --gateway A.B.C.D is needed with --self"; fi
 [ -z "$PAIR_MAC" ] || [[ "$PAIR_MAC" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]] || die "--pair-mac '$PAIR_MAC'"
 [ -z "$VMID" ] || { [[ "$VMID" =~ ^[0-9]{3,9}$ ]] && [ "$VMID" -ge 100 ]; } || die "--vmid '$VMID'"
 [[ "$MEMORY" =~ ^[0-9]{3,6}$ ]] && [[ "$CORES" =~ ^[0-9]{1,2}$ ]] && [[ "$DISK" =~ ^[0-9]+G$ ]] || die "--memory MB, --cores N, --disk <n>G"
@@ -313,10 +342,14 @@ for e in ${EXTRA[@]+"${EXTRA[@]}"}; do
   [[ "$e" =~ ^[A-Z][A-Z0-9_]*=[A-Za-z0-9./:_@+-]*$ ]] || die "--conf '$e': KEY=value"
   case "${e%%=*}" in NAME|SELF|PEER|VIP|VRID|PRIORITY) die "--conf ${e%%=*}: that one has its own option";; esac
 done
-if [ -n "$PVMID" ]; then [ "$PEER" = "$P_SELF" ] && [ "${SELF%/*}" = "$P_PEER" ] || die "$PNAME says it is $P_SELF and expects its peer at $P_PEER; this VM would be ${SELF%/*} with its peer at $PEER — the two do not fit (--no-pair: a pair of its own)"; fi
+if [ -n "$PVMID" ]; then
+  [ "$PEER" = "$P_SELF" ] || die "$PNAME says it is $P_SELF; this VM would have its peer at $PEER — the two do not fit (--no-pair: a pair of its own)"
+  [ $DHCP = 1 ] || [ -z "$P_PEER" ] || [ "${SELF%/*}" = "$P_PEER" ] || die "$PNAME says it is $P_SELF and expects its peer at $P_PEER; this VM would be ${SELF%/*} with its peer at $PEER — the two do not fit (--no-pair: a pair of its own)"
+fi
 [ -n "$PRIORITY" ] || { [ "$ROLE" = primary ] && PRIORITY=110 || PRIORITY=100; }
 # every answer as options: what a terminal-less run of the same would be, and what the confirmed run is started with
-ARGS=(--name "$NAME" --initial-role "$ROLE" --self "$SELF" --peer "$PEER" --vip "$VIP" --vrid "$VRID" --priority "$PRIORITY" --bridge "$BRIDGE")
+ARGS=(--name "$NAME" --initial-role "$ROLE"); [ -z "$SELF" ] || ARGS+=(--self "$SELF"); [ -z "$PEER" ] || ARGS+=(--peer "$PEER")
+ARGS+=(--vip "$VIP" --vrid "$VRID" --priority "$PRIORITY" --bridge "$BRIDGE")
 [ -z "$PAIR_BRIDGE" ] || ARGS+=(--pair-bridge "$PAIR_BRIDGE"); [ -z "$GATEWAY" ] || ARGS+=(--gateway "$GATEWAY")
 [ $FIRST = 0 ] || ARGS+=(--first); [ $START = 0 ] || ARGS+=(--start)
 if [ -n "$PVMID" ]; then ARGS+=(--join "$PNAME"); elif [ $PAIR = 0 ]; then ARGS+=(--no-pair); fi
@@ -333,9 +366,10 @@ if printf '%s\n' "$VMS" | awk -v n="$NAME" '$2 == n { f = 1 } END { exit !f }'; 
 else ok "no VM is named $NAME"; fi
 if [ -z "$VMID" ]; then VMID=$(pvesh get /cluster/nextid 2>/dev/null | tr -dc 0-9); [[ "$VMID" =~ ^[0-9]{3,9}$ ]] || { bad "pvesh get /cluster/nextid gave no id: name one with --vmid"; VMID=0; }; fi
 if printf '%s\n' "$VMS" | awk -v i="$VMID" '$1 == i { f = 1 } END { exit !f }'; then bad "the id $VMID is taken ($(printf '%s\n' "$VMS" | awk -v i="$VMID" '$1 == i { print $2 }'))"; else ok "$NAME gets the id $VMID"; fi
+[ $DHCP = 0 ] || ok "$NAME takes its own address from the DHCP server on $BRIDGE; the floating address is ${VIP%/*}"
 # another VM with this address: refused when it runs; said when it is stopped (the VM this one replaces)
 for f in "$PVE"/nodes/*/qemu-server/*.conf; do
-  [ -f "$f" ] || continue
+  [ -f "$f" ] && [ $DHCP = 0 ] || continue
   grep -qE "^ipconfig[0-9]+:.*ip=${SELF%/*}/" "$f" || continue
   oid=$(basename "$f" .conf); oname=$(printf '%s\n' "$VMS" | awk -v i="$oid" '$1 == i { print $2 }'); ost=$(printf '%s\n' "$VMS" | awk -v i="$oid" '$1 == i { print $4 }')
   if [ "$ost" = running ]; then bad "${oname:-VM $oid} runs with the address ${SELF%/*} already: two VMs on one address. Stop it first (it is the VM this one replaces?), or give this one another --self"
@@ -478,9 +512,7 @@ write_files:
     content: |
       # written by install.sh on $NODE; the installed copy is /etc/zradio/zradio.conf
       NAME=$NAME
-      SELF=${SELF%/*}
-      PEER=$PEER
-      VIP=$VIP
+$([ $DHCP = 1 ] || printf '      SELF=%s\n' "${SELF%/*}"; [ -z "$PEER" ] || printf '      PEER=%s\n' "$PEER"; printf '      VIP=%s' "$VIP")
       VRID=$VRID
       PRIORITY=$PRIORITY
 $(for e in ${EXTRA[@]+"${EXTRA[@]}"}; do printf '      %s\n' "$e"; done)
@@ -497,12 +529,13 @@ if [ $RUN = 1 ]; then
   mkdir -p "$SNIPDIR" && mk_user_data > "$SNIPDIR/$NAME-zradio.yaml.tmp" && mv -f "$SNIPDIR/$NAME-zradio.yaml.tmp" "$SNIPDIR/$NAME-zradio.yaml" \
     && done_ "$SNIPDIR/$NAME-zradio.yaml ($(wc -c < "$SNIPDIR/$NAME-zradio.yaml" | tr -d ' ') bytes: root's keys, the guest agent, the kit's guest folder, zradio.conf)" \
     || { bad "could not write $SNIPDIR/$NAME-zradio.yaml"; exit 1; }
-else would "write $SNIPDIR/$NAME-zradio.yaml: root's keys, qemu-guest-agent, the kit's guest folder, zradio.conf (NAME=$NAME SELF=${SELF%/*} PEER=$PEER VIP=$VIP VRID=$VRID PRIORITY=$PRIORITY${EXTRA[*]:+ ${EXTRA[*]}})"; fi
+else would "write $SNIPDIR/$NAME-zradio.yaml: root's keys, qemu-guest-agent, the kit's guest folder, zradio.conf (NAME=$NAME$([ $DHCP = 1 ] && echo ", its own address filled in by the VM" || echo " SELF=${SELF%/*}")${PEER:+ PEER=$PEER} VIP=$VIP VRID=$VRID PRIORITY=$PRIORITY${EXTRA[*]:+ ${EXTRA[*]}})"; fi
 
 echo "== 4. the VM $NAME ($VMID) =="
 NETS=(--net0 "virtio,bridge=$BRIDGE")
 if [ -n "$PAIR_BRIDGE" ]; then
   NETS+=(--ipconfig0 ip=dhcp --net1 "virtio${PAIR_MAC:+=$PAIR_MAC},bridge=$PAIR_BRIDGE" --ipconfig1 "ip=$SELF")
+elif [ $DHCP = 1 ]; then NETS=(--net0 "virtio${PAIR_MAC:+=$PAIR_MAC},bridge=$BRIDGE" --ipconfig0 ip=dhcp)
 else NETS=(--net0 "virtio${PAIR_MAC:+=$PAIR_MAC},bridge=$BRIDGE" --ipconfig0 "ip=$SELF,gw=$GATEWAY"); fi
 USBS=(); i=0; for m in ${USE[@]+"${USE[@]}"}; do USBS+=("--usb$i" "mapping=$m"); i=$((i + 1)); done
 do_ qm create "$VMID" --name "$NAME" --ostype l26 --machine q35 --bios ovmf --cores "$CORES" --memory "$MEMORY" --cpu host --scsihw virtio-scsi-single \
@@ -523,7 +556,9 @@ else do_ qm start "$VMID" || exit 1; fi
 echo "== 6. the kit, installed in $NAME through its guest agent =="
 if [ $RUN = 0 ]; then
   would "wait for the guest agent and cloud-init; unpack the kit in the VM and run its installer there (guest/install.sh --run --detect --initial-role $ROLE$([ $FIRST = 1 ] && echo ' --first')), its lines shown here"
-  if [ -n "$PVMID" ]; then would "introduce $NAME and $PNAME ($PNODE) to each other: each one's sync key and host key into the other (zradio-sync keys / trust), then a hello over that link"
+  if [ -n "$PVMID" ]; then
+    [ $DHCP = 0 ] && [ -n "$P_PEER" ] || would "tell $PNAME ($PNODE) this VM's address once DHCP has given it one (PEER in its zradio.conf; its keepalived is reloaded: when $PNAME serves, the floating address is gone for about 4 seconds)"
+    would "introduce $NAME and $PNAME ($PNODE) to each other: each one's sync key and host key into the other (zradio-sync keys / trust), then a hello over that link"
   elif [ $NOUSB = 0 ]; then warn "this is the pair's first VM: run ./install.sh on the other node next — it finds $NAME and takes everything from it"; fi
   [ $START = 0 ] || would "systemctl start zradio.target in $NAME: it joins the pair"
   echo "REPORT ONLY — nothing was changed."
@@ -564,6 +599,10 @@ elif [ $NOUSB = 1 ] && printf '%s' "$LOG" | grep -q "FAIL  zradio-detect did not
   echo "== a drill. To remove it: $([ $HA = 1 ] && echo "ha-manager rules remove $NAME-on-$NODE; ha-manager remove vm:$VMID; ")qm stop $VMID; qm destroy $VMID --purge; and the file $SNIPDIR/$NAME-zradio.yaml =="
   exit 0
 else bad "the installer ended ${rc:-without an exit code} in $NAME — nothing was started there. Its lines are above; to run it again in the VM: $INST"; exit 1; fi
+VSELF=$(gx "$NODE" "$VMID" 20 'sed -n "s/^SELF=//p" /etc/zradio/zradio.conf' | tail -1 | tr -dc 0-9.)
+ip4 "$VSELF" || { bad "could not read $NAME's own address from its /etc/zradio/zradio.conf (SELF)"; exit 1; }
+VMAC=$(sed -n '/^\[/q; s/^net0:[^,]*=\([0-9A-Fa-f:]\{17\}\).*/\1/p' "$PVE/nodes/$NODE/qemu-server/$VMID.conf" 2>/dev/null | head -1)
+[ $DHCP = 0 ] || ok "$NAME's own address is $VSELF, from DHCP: it is in its zradio.conf now, and the pair knows it by that address"
 RAD=$(gx "$NODE" "$VMID" 20 'grep -E "^(ZWAVE|ZIGBEE)=" /etc/zradio/radios.conf')
 ZW=$(printf '%s\n' "$RAD" | sed -n 's/^ZWAVE=//p' | tr -dc a-z); ZB=$(printf '%s\n' "$RAD" | sed -n 's/^ZIGBEE=//p' | tr -dc a-z)
 has_kind() { case "$1" in served|synced) return 0;; *) return 1;; esac; }
@@ -589,10 +628,17 @@ if [ -n "$PVMID" ]; then
     gx "$1" "$2" 30 "/usr/local/sbin/zradio-sync trust --sync-key '${4%%$'\t'*}' --host-key '${4##*$'\t'}'" >/dev/null \
       && done_ "$3 trusts $5: its host key pinned, its sync key allowed to run the sync and nothing else" || { bad "zradio-sync trust failed in $3"; return 1; }
   }
+  if [ "$P_PEER" != "$VSELF" ]; then     # the first VM was installed before this one had an address
+    if TP=$(gx "$PNODE" "$PVMID" 180 "bash /opt/zradio/kit/guest/install.sh --peer $VSELF --from-node --run 2>&1"); then
+      done_ "$PNAME knows its peer now: $VSELF (PEER in its zradio.conf, its keepalived.conf rendered again)"
+      printf '%s\n' "$TP" | grep -E '^(DONE  keepalived reloaded|WARN  /etc/keepalived)' | sed 's/^/      | /'
+    else printf '%s\n' "$TP" | grep -E '^(FAIL|REFUSED|unknown arg)' | sed 's/^/      | /'
+      bad "$PNAME could not be told its peer's address $VSELF (in $PNAME: bash /opt/zradio/kit/guest/install.sh --peer $VSELF --run). Nothing was started"; exit 1; fi
+  fi
   if KM=$(keys_of "$NODE" "$VMID") && KP=$(keys_of "$PNODE" "$PVMID"); then
     trust "$PNODE" "$PVMID" "$PNAME" "$KM" "$NAME" && trust "$NODE" "$VMID" "$NAME" "$KP" "$PNAME" || exit 1
     if h=$(gx "$NODE" "$VMID" 40 '/usr/local/sbin/zradio-sync peer-hello'); then ok "$NAME reached $PNAME over the sync's own link: $(printf '%s' "$h" | head -1 | cut -c1-120)"
-    else bad "$NAME does not reach $PNAME at $PEER over ssh (zradio-sync peer-hello): the two are on the same network? Nothing was started"; exit 1; fi
+    else bad "$NAME does not reach $PNAME at $P_SELF over ssh (zradio-sync peer-hello): the two are on the same network? Nothing was started"; exit 1; fi
   else bad "could not read the two VMs' public keys (zradio-sync keys in $NAME and in $PNAME)"; exit 1; fi
 fi
 
@@ -609,7 +655,11 @@ else warn "$NAME is installed and not started. To start it: qm guest exec $VMID 
 zp=6639; gp=6638; for e in ${EXTRA[@]+"${EXTRA[@]}"}; do case "$e" in ZWAVE_PORT=*) zp=${e#*=};; ZIGBEE_PORT=*) gp=${e#*=};; esac; done
 echo "== done: $NAME on $NODE =="
 if [ -n "$PVMID" ]; then echo "   The pair is complete: $PNAME on $PNODE, $NAME on $NODE. $([ "$ROLE" = standby ] && echo "$PNAME" || echo "$NAME") writes its networks onto the other's sticks within 15 minutes of both being started."
-else echo "   Next: ./install.sh on the other node. It finds $NAME, takes the addresses from it and pairs the two."; fi
+else echo "   Next: ./install.sh on the other node. It finds $NAME, takes the network from it and pairs the two."; fi
+if [ $DHCP = 1 ]; then
+  echo "   In your DHCP server (the router): RESERVE $VSELF for $NAME${VMAC:+ (MAC $VMAC)}, and keep ${VIP%/*} out of the range it hands out."
+  echo "   The pair knows $NAME by $VSELF: a VM whose address changes stops serving until it has that address back."
+fi
 echo "   In Home Assistant:$(has_kind "$ZW" && echo "  Z-Wave JS → tcp://${VIP%/*}:$zp")$(has_kind "$ZB" && echo "  ZHA → socket://${VIP%/*}:$gp")"
 echo "   Who serves, and why: qm guest exec $VMID -- zradio-serve status"
 exit 0

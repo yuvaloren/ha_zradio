@@ -292,4 +292,23 @@ check "check fails on the gate's hold" eq "$RC" 1
 serve "$T/t4" status
 check "status shows the version and the hold" bash -c 'grep -q "version: term 7, used yes" "$1/out" && grep -q "marker: .*hold" "$1/out"' _ "$T/t4"
 
+echo "-- a VM without a peer yet, and a VM whose own address changed (DHCP)"
+conf "$T/wp" NAME=radio1 SELF=10.20.30.6 PEER=10.20.30.5 VIP=10.20.30.50/24 VRID=50 PRIORITY=110; render "$T/wp"
+conf "$T/np" NAME=radio1 SELF=10.20.30.6 VIP=10.20.30.50/24 VRID=50 PRIORITY=110; render "$T/np"
+check "no PEER: keepalived.conf is rendered without the unicast lines — those four are all that is missing, nothing is added" bash -c '[ "$3" = 0 ] && ! grep -q "unicast_" "$1/out" && grep -q "interface eth1" "$1/out" && grep -q "10.20.30.50/24 dev eth1" "$1/out" && [ "$(diff "$2/out" "$1/out" | grep -c "^<")" = 4 ] && [ "$(diff "$2/out" "$1/out" | grep -c "^>")" = 0 ] && diff "$2/out" "$1/out" | grep -q "^<  *10.20.30.5$"' _ "$T/np" "$T/wp" "$RC"
+adconf() { printf '%s\n' NAME=radio1 SELF=10.20.30.5 PEER=10.20.30.6 VIP=10.20.30.50/24 VRID=50 PRIORITY=110 > "$1/zradio.conf"; }
+host "$T/ad"; adconf "$T/ad"; fake "$T/ad/bin" ip 'printf "2: eth0    inet 10.20.30.5/24 scope global eth0\n2: eth0    inet 10.20.30.50/24 scope global secondary eth0\n"'
+ZRADIO_CONF="$T/ad/zradio.conf" serve "$T/ad" check
+check "check: 0 while an interface holds SELF" eq "$RC" 0
+fake "$T/ad/bin" ip 'printf "2: eth0    inet 10.20.30.99/24 scope global dynamic eth0\n"'
+ZRADIO_CONF="$T/ad/zradio.conf" serve "$T/ad" check
+check "check: 1 when the VM's address is not SELF any more — keepalived would still claim the floating address, and the peer cannot hear this VM" eq "$RC" 1
+ZRADIO_CONF="$T/ad/zradio.conf" serve "$T/ad" status
+check "status says it: the address the pair knows, the one the VM holds, and what to do" bash -c 'grep -q "address: this VM does not hold its address 10.20.30.5 any more (it holds 10.20.30.99).*reservation in the DHCP server" "$1/out"' _ "$T/ad"
+fake "$T/ad/bin" ip ':'
+ZRADIO_CONF="$T/ad/zradio.conf" serve "$T/ad" check
+check "check: 0 when the addresses cannot be read at all (not a reason to hold a VM out)" eq "$RC" 0
+grep -v '^PEER=' "$T/ad/zradio.conf" > "$T/ad/np.conf"; ZRADIO_CONF="$T/ad/np.conf" serve "$T/ad" status
+check "status of a VM without a peer says so" bash -c 'grep -q "peer: none yet" "$1/out"' _ "$T/ad"
+
 finish

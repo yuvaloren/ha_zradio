@@ -9,8 +9,8 @@ and fake sticks only. The scripts it grew out of have run one real pair since 20
 
 ## Install
 
-You need two Proxmox nodes in one cluster, a Z-Wave and/or Zigbee stick on each, and three free addresses on a
-network that Home Assistant can reach.
+You need two Proxmox nodes in one cluster, a Z-Wave and/or Zigbee stick on each, and a network with DHCP that Home
+Assistant can reach. Pick one free address on it that DHCP does not hand out: the floating address.
 
 On the node whose sticks your devices are paired to, as root:
 
@@ -20,8 +20,12 @@ git clone https://github.com/yuvaloren/ha_zradio.git && cd ha_zradio
 ```
 
 It asks a few questions, shows what it will do, and does it after a `y`. Then run the same on the other node: there
-it finds the first VM, takes the addresses from it, and sets up the keys between the two. At the end it prints the
+it finds the first VM, takes the network from it, and sets up the keys between the two. At the end it prints the
 addresses to enter in Home Assistant.
+
+Each VM gets its own address from DHCP, and the pair knows it by that address from then on. **Reserve it in your
+DHCP server** (each run ends with the address and the MAC). A VM whose address changes stops serving until it has
+the old one back. Fixed addresses instead: `--self`, `--peer`, `--gateway`.
 
 The one question to get right:
 
@@ -70,4 +74,6 @@ Measured on the pair this kit was extracted from (about 50 Z-Wave nodes):
 - [docs/DESIGN.md](docs/DESIGN.md): how it works, every option, what is not built.
 - Tests: `bash tests/run.sh` on Linux, `bash tests/docker.sh` anywhere else (macOS lacks the GNU tools they need).
   No hardware needed; they also run on every push (`.github/workflows/tests.yml`).
+- To see the install without a Proxmox node: `tests/try.sh` (needs docker) is a shell on a pretend two-node cluster
+  where `./install.sh` asks and prints what it would on a real one. Proxmox, the VMs and the sticks are fakes.
 - MIT. The USB id list is derived from Home Assistant core (Apache-2.0).

@@ -140,6 +140,7 @@ receiver() { # receiver on|off <errfile>: SetRFReceiveMode, retried; 0 when the 
   return 1
 }
 peer_ssh() { # peer_ssh <timeout s> <remote command>: stdin passes through
+  [ -n "$PEER" ] || { echo "zradio-sync: no peer yet (PEER is not set in $ZR_CONF: the pair's other VM is not installed)" >&2; return 255; }
   timeout "$1" "$SSH" -i "$KEYF" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes \
     -o UserKnownHostsFile="$KNOWN" -o GlobalKnownHostsFile=/dev/null -o ConnectTimeout=5 \
     -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -b "$SELF" "root@$PEER" "$2"
@@ -397,6 +398,7 @@ cmd_run() {
   if [ $rehearse = 1 ]; then
     if serving || [ "$(role)" = MASTER ]; then echo "REFUSED: --rehearse on a VM that serves (it reads the sticks without giving them back to Home Assistant)"; exit 1; fi
   elif ! is_active; then echo "not the active (ser2net $(serving && echo active || echo 'not active'), keepalived's last word $(role)) — nothing to do"; exit 0; fi
+  [ -n "$PEER" ] || { echo "no peer yet (PEER is not set in $ZR_CONF: the pair's other VM is not installed) — nothing to sync"; exit 0; }
   exec 9>"$RUN/sync-out.lock"; flock -n 9 || { echo "a sync is running already — nothing done"; exit 0; }
   [ -r "$KEYF" ] && [ -s "$KNOWN" ] || { log sync failed "step=keys — no $KEYF or no $KNOWN: the pair is not paired (zradio-sync keys / trust)"; exit 1; }
   local t0 h gen id tries=0 pause
@@ -472,6 +474,7 @@ may_retry() { # 0 = a pending sync may be tried now: 15 min after the first fail
 }
 cmd_tick() {
   need_root; mkdir -p "$RUN" "$STATE"
+  zr_holds_self || log address loud "this VM does not hold its address $SELF any more (it holds ${ZR_HOLDS:-none}): the other VM cannot hear it, and it does not serve (zradio-serve check). An address from DHCP that changed: give this VM $SELF back (a reservation in the DHCP server), or pair the two again on the new one"
   if is_active; then
     local h mine
     [ -n "$(synced_here)" ] || { echo "no radio on this VM is at level 'synced' — nothing to sync"; exit 0; }

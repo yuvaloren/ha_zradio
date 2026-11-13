@@ -36,6 +36,9 @@
 # check fails (keepalived: FAULT, the address goes to the peer) when
 #   - there is no radios.conf, or it names no radio, or a named stick's tty is missing (a dead or unplugged stick on
 #     the active hands the role over), or
+#   - no interface of this VM holds SELF (an address from DHCP that changed): the other VM cannot hear this one, and
+#     keepalived would claim the floating address all the same — two VMs on the air. Not checked when `ip` gives no
+#     answer at all. Or
 #   - $RUN/applying or $STATE/standby-dirty exists (a standby in the middle of writing a synced image must finish
 #     before it may serve; standby-dirty is on disk, so a reboot in the middle does not forget it — zradio-sync sets it
 #     before the first write and clears it after the verification), or
@@ -196,6 +199,7 @@ hush)
 check)
   need_radios || exit 1
   [ -z "$(missing)" ] || exit 1
+  if zr_load_conf 2>/dev/null; then zr_holds_self || exit 1; fi      # an address that changed: the peer cannot hear this VM
   [ -e "$APPLYING" ] && exit 1
   [ -e "$DIRTY" ] && exit 1
   [ -e "$WEDGED" ] && exit 1
@@ -216,6 +220,10 @@ status)
   [ -e "$FAILED" ] && echo "marker: $FAILED ($(age_of "$FAILED") s old; holds this VM out for $HOLD s)"
   [ -e "$BOOTWAIT" ] && echo "marker: $BOOTWAIT (asking the peer who holds the newer networks before this VM may claim)"
   [ -e "$HELD" ] && echo "marker: $HELD (this VM holds an older copy: it may serve only after the peer has been silent for the standard wait)"
+  if zr_load_conf 2>/dev/null; then
+    zr_holds_self || echo "address: this VM does not hold its address $SELF any more (it holds ${ZR_HOLDS:-none}): the other VM cannot hear it, so it does not serve. An address from DHCP that changed: give this VM $SELF back (a reservation in the DHCP server), or pair the two again on the new one"
+    [ -n "$PEER" ] || echo "peer: none yet (the pair's other VM is not installed: this VM holds the floating address alone)"
+  fi
   [ -e "$STATE/outdated" ] && echo "outdated: the peer was ahead ($(cat "$STATE/outdated" 2>/dev/null)); a sync clears this"
   zr_version_read "$STATE"; echo "version: term $ZR_TERM, used $ZR_USED$([ -f "$RUN/turn" ] && echo "; this turn is $(cat "$RUN/turn")")"
   [ -f "$RUN/role" ] && echo "keepalived's last word: $(cat "$RUN/role")"

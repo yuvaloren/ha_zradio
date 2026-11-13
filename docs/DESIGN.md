@@ -19,18 +19,35 @@ who serves.
 
 ## Install (`install.sh`, on each Proxmox node)
 
-1. Checks, all before any change: the name and id are free; no **running** VM uses the address or the sticks.
+1. Checks, all before any change: the name and id are free; no **running** VM uses the sticks (or, with fixed
+   addresses, the address).
 2. The node's sticks get USB mappings; Debian 13's generic cloud image is downloaded and checksummed.
 3. The VM is created with a cloud-init file that holds root's keys, the guest agent and the kit's `guest/` folder.
 4. It becomes a Proxmox HA resource with a **strict** node rule, then starts: Proxmox restarts it on this node and
    never moves it to the other node's sticks.
 5. Through the guest agent, the kit's own installer runs in the VM (`guest/install.sh`): packages, detection of the
    sticks, config files, units. Nothing is started.
-6. On the second node: each VM gets the other's sync key and host key (`zradio-sync trust`), and the link is tried.
+6. On the second node: the first VM is told this VM's address, each VM gets the other's sync key and host key
+   (`zradio-sync trust`), and the link is tried.
 7. The VM is started in the pair if you say so.
 
 The second node finds the first VM by its `zradio` tag and reads its addresses through the guest agent
 (`pvesh … /agent/exec` reaches a VM on another node of the cluster).
+
+**Addresses.** The floating address is the only one asked for. Each VM boots on DHCP, and its in-VM installer writes
+the address it got into its `zradio.conf` (`SELF`). From then on that address is fixed as far as the pair goes:
+keepalived's adverts and the sync's ssh trust both name it. So it has to be reserved in the DHCP server; each run
+ends with the address and the MAC to reserve.
+
+- *A VM whose address changes does not serve.* keepalived would still claim the floating address on the new one
+  while the other VM can no longer hear it [V keepalived 2.3.3, in network namespaces], so `zradio-serve check` fails
+  while no interface holds `SELF`. `zradio-serve status` and one journal line every 15 minutes say so.
+- *The first VM has no peer until the second exists.* Its `zradio.conf` has no `PEER` and its keepalived.conf no
+  unicast lines: it holds the floating address alone and sends VRRP's ordinary multicast adverts. The second node's
+  run writes `PEER` into it (`guest/install.sh --peer`) and reloads its keepalived. On a VM that serves, the reload
+  takes the floating address away for about 4 seconds [V keepalived 2.3.3], and the sticks with it.
+- *Fixed addresses* (`--self`, `--peer`, `--gateway`, or `--pair-bridge`): nothing comes from DHCP, the first VM
+  names its peer from the start, and none of the above applies.
 
 **Primary or standby, initially.** The primary's sticks are left alone. The standby is marked "not filled" and does
 not serve until the primary's first sync, whatever its sticks hold. A primary whose sticks hold no network is
@@ -43,9 +60,10 @@ Every question has an option; `--answers FILE` takes them as `KEY=value` lines.
 | Option | |
 |---|---|
 | `--initial-role primary\|standby`, `--first` | above |
-| `--name` | the VM's name (default `zradio1`, `zradio2`, …) |
-| `--self A.B.C.D/NN`, `--peer`, `--vip A.B.C.D/NN` | this VM, the other VM, the floating address |
-| `--bridge`, `--gateway` | the network they are on (default `vmbr0`) |
+| `--name` | the VM's name (default `zradio1`, `zradio2`, …; the second VM of a pair after the first: `radio1` → `radio2`) |
+| `--vip A.B.C.D` | the floating address: free, and outside what DHCP hands out |
+| `--bridge` | the network the VMs are on (default `vmbr0`); each VM's own address comes from DHCP there |
+| `--self A.B.C.D/NN`, `--peer`, `--gateway`, `--vip A.B.C.D/NN` | fixed addresses instead of DHCP: this VM, the other VM, the gateway |
 | `--pair-bridge` | a separate link between the nodes for `--self`; `--bridge` is then DHCP |
 | `--join NAME`, `--no-pair` | the first VM to pair with (found by its tag); or none |
 | `--start`, `--run` | start the VM in the pair; do it (report only without) |
@@ -60,7 +78,8 @@ Every question has an option; `--answers FILE` takes them as `KEY=value` lines.
 | `--sticks` | list the node's sticks and stop |
 
 Without Proxmox: `bash guest/install.sh --conf zradio.conf --initial-role … --run` on two Debian 13 machines, then
-the `zradio-sync trust` line each prints, run on the other.
+the `zradio-sync trust` line each prints, run on the other. A conf without `SELF` takes the machine's own address;
+one without `PEER` is a VM with no peer yet (`guest/install.sh --peer A.B.C.D --run` adds it).
 
 ## Serving and standing by
 

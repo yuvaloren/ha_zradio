@@ -358,4 +358,19 @@ check "a conf line that is not KEY=value: refused before it is sourced" bash -c 
 OUT=$(bash "$TOOL" --help 2>&1); RC=$?
 check "--help: exit 0, names run, tick, trust and what never happens" bash -c '[ "$1" = 0 ] && for w in "zradio-sync run" "zradio-sync tick" "zradio-sync trust" "What never happens"; do printf "%s" "$2" | grep -qF "$w" || exit 1; done' _ "$RC" "$OUT"
 
+echo "-- a VM without a peer yet; a VM whose own address changed"
+vm "$T/np" radio1 10.20.30.5 10.20.30.6 "$T/np-none" MASTER 1; sed -i '/^PEER=/d' "$T/np/etc/zradio.conf"; fake "$T/np/bin" ip 'printf "2: eth0    inet 10.20.30.5/24 scope global eth0\n"'
+sync "$T/np" peer-hello
+check "peer-hello without a PEER in the conf: no ssh, exit 255, 'no peer yet'" bash -c '[ "$2" = 255 ] && grep -q "no peer yet (PEER is not set" "$1/out" && ! grep -q "^ssh" "$1/calls"' _ "$T/np" "$RC"
+sync "$T/np" run
+check "run without a PEER: nothing to sync, exit 0, no stick touched, no failure in the journal" bash -c '[ "$2" = 0 ] && grep -q "no peer yet .*nothing to sync" "$1/out" && ! grep -q "zradio-probe" "$1/calls" && ! grep -q "result=failed" "$1/journal"' _ "$T/np" "$RC"
+sync "$T/np" tick
+check "tick without a PEER: exit 0, quiet" bash -c '[ "$2" = 0 ] && ! grep -q "result=failed\|result=loud" "$1/journal"' _ "$T/np" "$RC"
+vm "$T/ac" radio1 10.20.30.5 10.20.30.6 "$T/ac-none" BACKUP 0; fake "$T/ac/bin" ip 'printf "2: eth0    inet 10.20.30.5/24 scope global eth0\n"'
+sync "$T/ac" tick
+check "tick while the VM holds its address: no word about it" bash -c '! grep -q "event=address" "$1/journal"' _ "$T/ac"
+fake "$T/ac/bin" ip 'printf "2: eth0    inet 10.20.30.99/24 scope global dynamic eth0\n"'
+sync "$T/ac" tick
+check "tick when the VM's address is not SELF any more: one loud journal line with both addresses and what to do" bash -c '[ "$(grep -c "event=address result=loud this VM does not hold its address 10.20.30.5 any more (it holds 10.20.30.99)" "$1/journal")" = 1 ] && grep -q "reservation in the DHCP server" "$1/journal"' _ "$T/ac"
+
 finish

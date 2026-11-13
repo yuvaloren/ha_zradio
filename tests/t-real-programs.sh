@@ -62,6 +62,9 @@ if command -v keepalived >/dev/null; then
   # here the interface eth9 and /usr/local/sbin/zradio-serve do not exist: keepalived says so and that is expected.
   # What must not appear is a complaint about the file's own words.
   check "no unknown keyword, no syntax complaint" bash -c '! printf "%s" "$1" | grep -qiE "unknown keyword|syntax|unexpected|missing .*}|invalid"' _ "$OUT"
+  grep -v '^PEER=' "$T/zradio.conf" > "$T/nopeer.conf"; ZRADIO_CONF="$T/nopeer.conf" ZRADIO_RADIOS="$T/radios.conf" bash "$RENDER" > "$T/keepalived-nopeer.conf"
+  OUT=$(keepalived -t -f "$T/keepalived-nopeer.conf" 2>&1)
+  check "…nor about the file of a VM that has no peer yet (no unicast lines)" bash -c '! grep -q "unicast_" "$2" && grep -q "vrrp_instance RADIO" "$2" && ! printf "%s" "$1" | grep -qiE "unknown keyword|syntax|unexpected|missing .*}|invalid"' _ "$OUT" "$T/keepalived-nopeer.conf"
 else
   echo "SKIP  keepalived is not installed here: the rendered keepalived.conf was not given to keepalived -t"
 fi

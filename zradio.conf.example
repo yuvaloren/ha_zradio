@@ -8,13 +8,17 @@
 # This VM's name in the pair (lower case; shown in every journal line).
 NAME=radio1
 
-# This VM's own address, and the other radio VM's, on the network the two VMs and Home Assistant share. Any IPv4
-# network works: the ordinary LAN, or a dedicated link between the nodes. Both must be fixed addresses.
+# This VM's own address, and the other radio VM's, on the network the two VMs are on and Home Assistant can reach.
+# Any IPv4 network works: the ordinary LAN, or a dedicated link between the nodes. Both must stay what they are:
+# fixed, or reserved in the DHCP server. A VM that does not hold SELF does not serve.
+#   No SELF line: the installer writes in the address this machine has (a VM on DHCP).
+#   No PEER line: this VM has no peer yet (the first VM of a pair); `guest/install.sh --peer A.B.C.D --run` adds it.
 SELF=10.20.30.5
 PEER=10.20.30.6
 
 # The floating address, with its prefix length: the one address Home Assistant connects to. Whichever VM serves
-# holds it. It must be free and must stay free (reserve it on the router when it is a LAN address).
+# holds it. It must be free and must stay free (keep it out of what the DHCP server hands out). Without a prefix it
+# gets the one of this VM's own address.
 VIP=10.20.30.50/24
 
 # The pair's VRRP id (1-255): the same on both VMs, and different from every other VRRP router on that network.

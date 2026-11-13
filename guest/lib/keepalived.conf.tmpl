@@ -4,6 +4,8 @@
 # Both radio VMs run this with state BACKUP and nopreempt: whoever holds @VIP@ keeps it until it stops, dies or fails
 # its health check; a VM that comes back stays the standby. Adverts go unicast between the two VMs. A graceful stop
 # sends a priority-0 advert, so the peer takes over at once; a peer that vanishes is noticed after three missed adverts.
+# A VM that has no PEER yet (the pair's first VM, until the second is installed) gets this file without the unicast
+# lines: it holds the address alone and sends VRRP's ordinary multicast adverts until it is told its peer.
 global_defs {
     router_id @NAME@
     enable_script_security
