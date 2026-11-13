@@ -68,5 +68,6 @@ Measured on the pair this kit was extracted from (about 50 Z-Wave nodes):
 ## More
 
 - [docs/DESIGN.md](docs/DESIGN.md): how it works, every option, what is not built.
-- Tests: `bash tests/run.sh`. No hardware needed; they also run on every push (`.github/workflows/tests.yml`).
+- Tests: `bash tests/run.sh` on Linux, `bash tests/docker.sh` anywhere else (macOS lacks the GNU tools they need).
+  No hardware needed; they also run on every push (`.github/workflows/tests.yml`).
 - MIT. The USB id list is derived from Home Assistant core (Apache-2.0).

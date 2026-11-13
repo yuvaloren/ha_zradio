@@ -2,7 +2,7 @@
 # tests/run.sh — every test of the kit, against fakes only: no radio, no VM, no network. One command:
 #   bash tests/run.sh              # all t-*.sh; exit 0 with "totals: N PASS, 0 FAIL" last
 #   bash tests/run.sh t-serve.sh
-# Needs: bash 4+, coreutils, util-linux (flock), python3.
+# Needs: Linux — bash 4+, GNU coreutils and sed, util-linux (flock), python3. On macOS: bash tests/docker.sh
 set -uo pipefail
 cd "$(dirname "$0")" || exit 2
 tests=("$@"); [ ${#tests[@]} -gt 0 ] || tests=(t-*.sh)
