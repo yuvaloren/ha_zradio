@@ -1,0 +1,10 @@
+# zradio-sync-tick.service — zradio-sync tick: the active catches the standby up when it does not hold the last
+# sync (a failed sync, a takeover, a rebuilt standby); the standby writes a half-written set again. Every 15 min by
+# zradio-sync-tick.timer on both radio VMs. Installed by guest/install.sh.
+[Unit]
+Description=zradio: catch-up tick
+After=keepalived.service
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/zradio-sync tick
+TimeoutStartSec=900

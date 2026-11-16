@@ -1,0 +1,120 @@
+# ha_zradio
+
+Z-Wave and Zigbee for Home Assistant that survive a dead server. Two small VMs, one per Proxmox node, each with its
+own sticks. One serves the sticks to Home Assistant over the network; the other keeps a copy of both networks on its
+sticks and takes over within seconds. Home Assistant talks to one floating address.
+
+**Status: under construction, and not yet run on real hardware.** The code is tested against a fake Proxmox cluster
+and fake sticks only. The scripts it grew out of have run one real pair since 2026-11-11.
+
+## Install
+
+You need two Proxmox nodes in one cluster, a Z-Wave and/or Zigbee stick on each, and a network with DHCP that Home
+Assistant can reach. Pick one free address on it that DHCP does not hand out: the floating address.
+
+On the node whose sticks your devices are paired to, as root:
+
+```
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/yuvaloren/ha_zradio/main/get.sh)"
+```
+
+It downloads the kit into `/opt/ha_zradio/<version>` and runs its installer (`./install.sh`) on your terminal. Or
+clone the repository and run `./install.sh` yourself.
+
+It asks a few questions, shows what it will do, and does it after a `y`. Then run the same on the other node: there
+it finds the first VM, takes the network from it, and sets up the keys between the two. At the end it prints the
+addresses to enter in Home Assistant.
+
+**To update**, run the same line again on either node. It finds the pair, says which kit each VM runs, and updates
+the ones that need it (or says they are up to date) after a `y`. The radios keep running.
+
+Each VM gets its own address from DHCP, and the pair knows it by that address from then on. **Reserve it in your
+DHCP server** (each run ends with the address and the MAC). A VM whose address changes stops serving until it has
+the old one back. Fixed addresses instead: `--self`, `--peer`, `--gateway`. With a link of its own between the
+nodes (`--pair-bridge`), the floating address is on that link, and Home Assistant has to reach it there.
+
+The one question to get right:
+
+| This node is initially the… | Its sticks |
+|---|---|
+| **primary** | hold your networks. They stay as they are. |
+| **standby** | **will be wiped**: the first sync overwrites them with the primary's networks. |
+
+"Initially", because after that first sync the two VMs are equals and swap at every failover.
+
+Without questions: `./install.sh --answers my.answers --run` ([answers.example](answers.example)), or every answer
+as an option (`./install.sh --help`). Nothing is changed without `--run` or a `y`.
+
+### Two nodes or three
+
+Two nodes are enough: the two VMs decide between them which one serves, and either node can die. The kit does not use
+Proxmox HA (on two nodes it would make the surviving node reboot itself); a VM that hangs is reset by its watchdog.
+
+A third vote is optional, and recommended. Without it, while one node is down the cluster has no quorum, and Proxmox
+starts no VM on the other node, at boot or by hand, until you run `pvecm expected 1` there. VMs already running keep
+running, so a failover works without it; a power cut that only one node comes back from does not. The installer says
+which case your cluster is in.
+
+The third vote is a QDevice: a small daemon on any always-on machine outside the cluster (not a VM on either node),
+reached over TCP port 5403. On a Debian-based machine: `apt install corosync-qnetd` there, `apt install
+corosync-qdevice` on both nodes, then `pvecm qdevice setup <its address>` on one node, which logs into the machine as
+root over SSH. A NAS can run the daemon in a container; with no root SSH into it, the certificates are made by hand
+(the `corosync-qdevice-net-certutil` and `corosync-qnetd-certutil` man pages).
+
+## Connecting Home Assistant
+
+Home Assistant connects to the floating address, never to a VM: whichever VM serves holds it. The installer's last
+lines give the two addresses. Home Assistant's host must reach them, and each port takes one client at a time.
+
+**Z-Wave.** Home Assistant's Z-Wave integration talks to a Z-Wave JS server, and that server opens the stick. In the
+server (the Z-Wave JS UI app or container), set the serial port to `tcp://<floating address>:6639` and keep your
+network's S0/S2 keys. The Z-Wave integration then connects to the server as usual. The port is neither
+authenticated nor encrypted: keep it on a trusted network.
+
+**Zigbee (ZHA).** A new setup: add Zigbee Home Automation, choose manual setup if asked, radio type ZNP (TI CC2652)
+or EZSP (Silicon Labs), serial path `socket://<floating address>:6638`, 115200 baud. ZHA that used a stick on its
+own machine: "Migrate radio", manual setup, the same `socket://` address. The stick already holds the network.
+
+**Replacing a pair you already have:** give the new pair the same floating address and ports, and Home Assistant
+needs no change. It reconnects by itself.
+
+## Which sticks
+
+The VM works out by itself which stick is what. Either kind may be missing.
+
+| | Sticks | Fails over | Standby holds a copy |
+|---|---|---|---|
+| **synced** | Z-Wave 800 series; Zigbee on TI Z-Stack (CC2652) | yes | yes |
+| **served** | every other Z-Wave or Zigbee stick | yes | no — restore with Home Assistant's tools after a takeover |
+
+## Day to day
+
+In a radio VM (`qm guest exec <id> -- <command>` on its node, or ssh):
+
+| Command | |
+|---|---|
+| `zradio-serve status` | who serves, and anything holding this VM back |
+| `zradio-sync run --reason manual` | sync now (pauses the radios about 12 s) |
+| `zradio-switch --run` | hand the radios to the other VM |
+| `journalctl -t zradio` | every decision, one line each |
+
+## What to expect
+
+Measured on the pair this kit was extracted from (about 50 Z-Wave nodes):
+
+| Event | Z-Wave back | Zigbee back |
+|---|---|---|
+| Planned switch | 1.3 s | 7 s |
+| The serving VM dies | about 5 s | about 14 s |
+| A sync (nightly, and after a device is added or removed) | paused 14 s | paused 26–28 s |
+
+## More
+
+- [docs/DESIGN.md](docs/DESIGN.md): how it works, every option, what is not built.
+- Versions: a release is a git tag; the installers stamp each VM with the kit it runs (docs/DESIGN.md, "Updating").
+- Tests: `bash tests/run.sh` on Linux, `bash tests/docker.sh` anywhere else (macOS lacks the GNU tools they need).
+  No hardware needed; they also run on every push (`.github/workflows/tests.yml`).
+- To see the install without a Proxmox node: `tests/try.sh` (needs docker) is a shell on a pretend two-node cluster
+  where `./install.sh` asks and prints what it would on a real one. Proxmox, the VMs and the sticks are fakes.
+- MIT. The list of known sticks is built at install time from Home Assistant core's USB lists (Apache-2.0); the
+  install needs to reach GitHub for it.

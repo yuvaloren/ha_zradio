@@ -1,0 +1,353 @@
+#!/usr/bin/env bash
+# zradio-gate — decides with the other radio VM which of the two holds the newer networks, and keeps the one that does
+# not from serving too early (docs/DESIGN.md, "Who serves when it is not obvious"). Runs INSIDE both radio VMs as root.
+# keepalived still decides who serves; the gate only writes the files `zradio-serve check` fails on.
+#
+#   zradio-gate arm      at boot (zradio-quiet.service, before keepalived): boot-wait — claim nothing before the peer
+#                        was asked
+#   zradio-gate run      the service: `step` in a loop — every 3 s at boot, 10 s while outdated or serving
+#                        provisionally, a minute otherwise, at once after a role change ($RUN/gate-kick, zradio-notify).
+#                        While a confirmed turn is not used yet: `zradio-sync beat --quiet` every 3 s between looks.
+#   zradio-gate step     one look at the peer (zradio-sync peer-hello), and what follows from it:
+#   zradio-gate status   the files and what they mean
+#
+# A copy's version is (term, used) (zradio-common.sh). Each look, by where this VM is ("wait" = ELECTION_WAIT, 60 s):
+#
+#   where          what the look finds                                         what the gate does
+#   at boot        no answer for the wait                                      claim, provisionally (gate-alone)
+#                  the peer serves, its version lower                          preempt (below)
+#                  the peer serves, its term higher                            outdated, held
+#                  the peer serves, otherwise                                  stand by
+#                  neither serves; this VM ahead (or level, higher PRIORITY)   claim
+#                  neither serves; the peer ahead, and the wait is over        claim (same term: a failover's standby),
+#                                                                              or release (a lower term: provisional)
+#   serving        a confirmed turn not used yet                               beat --quiet: the version advances
+#                  the peer answers and is not ahead                           settled; a provisional turn confirmed
+#   standing by    its own check failed for the wait, while it was the copy in use   used=no (gives the claim up)
+#                  the peer's term is higher                                   outdated, held
+#                  outdated, and the peer has not served for the wait          counter raised, released (may serve)
+#                  outdated and released, and the peer serves again            held again
+#                  the peer serves, its version lower                          preempt
+#                  the peer has served a minute without syncing this VM        peer-poke (at most every 5 min)
+#
+# A serving peer is preempted when its version is strictly lower than this VM's: this VM's Zigbee counter is raised
+# above the peer's (zradio-sync self-raise), it becomes an eligible standby, takes a new term, and asks the peer to
+# hand over (zradio-sync peer-yield); at most once in 5 minutes. A failover or a planned switch stands, because the VM
+# that gave the radios up dropped its claim (used=no, zradio-notify). What IS ahead of a serving VM: the one Home
+# Assistant used when a cut link split the pair; an old active back before the new one was used; a newer copy back
+# while an outdated one serves provisionally.
+#
+# ELECTION=observe (the default): every decision is logged as `would-…` and nothing is acted on. The gate's files go
+# to $RUN/observe/ and $STATE/observe/, which no other tool reads, and each step removes the other mode's files: a
+# change of mode leaves nothing behind for the new one to act on. Read a few days of observe lines, and rehearse a
+# preemption, before ELECTION=act: this tool can take the radios away.
+# zradio-serve check ignores a boot-wait older than the wait plus a slack: a gate that died must not keep a VM out.
+# Journal lines: `zradio: event=election result=…`. Tests: tests/t-gate.sh. Env: ZRADIO_GATE_*, ZRADIO_CONF, ZRADIO_RADIOS.
+set -uo pipefail
+MODE=${1:-}
+LIB=${ZRADIO_LIB:-$(cd "$(dirname "$0")/../lib" 2>/dev/null && pwd)}; [ -r "$LIB/zradio-common.sh" ] || LIB=/usr/local/lib/zradio
+# shellcheck source=../lib/zradio-common.sh
+. "$LIB/zradio-common.sh" || exit 2
+SYNC=${ZRADIO_GATE_SYNC:-/usr/local/sbin/zradio-sync}
+SERVE=${ZRADIO_GATE_SERVE:-/usr/local/sbin/zradio-serve}
+# shellcheck disable=SC2034  # SYSTEMCTL and LOGGER are read by zradio-common.sh's zr_serving and zr_log
+SYSTEMCTL=${ZRADIO_GATE_SYSTEMCTL:-systemctl}
+# shellcheck disable=SC2034
+LOGGER=${ZRADIO_GATE_LOGGER:-logger}
+RUN=${ZRADIO_GATE_RUN:-/run/zradio}
+STATE=${ZRADIO_GATE_STATE:-/var/lib/zradio}
+POKE_EVERY=${ZRADIO_GATE_POKE_EVERY:-300}; PREEMPT_EVERY=${ZRADIO_GATE_PREEMPT_EVERY:-300}
+SERVING_FOR=${ZRADIO_GATE_SERVING_FOR:-60}   # the peer must have served this long before it is poked for a sync
+ROLE_TRIES=${ZRADIO_GATE_ROLE_TRIES:-20}     # s a preempting VM waits for keepalived here to say BACKUP
+IDLE=${ZRADIO_GATE_IDLE:-60}                 # s between two looks when nothing is pending
+BOOT_PACE=3                                  # s between two looks at boot
+WATCH_PACE=10                                # s between two looks while outdated or serving provisionally
+BEAT_PACE=3                                  # s between two light version checks of an unused turn
+GATE_KICK="$RUN/gate-kick"                   # zradio-notify writes it at every role change: look now
+now() { echo "${ZRADIO_GATE_NOW:-$(date +%s)}"; }
+say() { zr_say election "$@"; }
+num() { [[ "${1:-}" =~ ^[0-9]{1,10}$ ]] && echo "$((10#$1))" || echo 0; }
+age() { local t; t=$(num "$(cat "$1" 2>/dev/null)"); echo $(( $(now) - t )); }      # seconds since the epoch a file holds
+zr_markers
+
+gate_own_files() { # gate_own_files <run dir> <state dir>: every file the gate keeps in one mode
+  zr_gate_files "$1" "$2"
+  PREEMPT_TRIED="$1/preempt-tried"    # epoch of the last preemption attempt
+  PREEMPT_TERM="$1/preempt-term"      # the term a preemption took, until the peer handed over
+  PEER_IDLE="$1/peer-idle-since"      # epoch since the peer has not served
+  PEER_SERVING="$1/peer-serving-since"
+  UNFIT="$1/unfit-since"              # epoch since this VM's own check fails
+  POKED="$1/poked"                    # epoch of the last peer-poke
+  GATE_FILES=("$BOOT_WAIT" "$HOLD" "$MAY_SERVE" "$ALONE" "$OUTDATED" "$PREEMPT_TRIED" "$PREEMPT_TERM" "$PEER_IDLE"
+              "$PEER_SERVING" "$UNFIT" "$POKED")
+}
+setup() { # the conf, this VM's version, and the files of the mode in force (those of the other mode are removed)
+  zr_load_conf || { echo "zradio-gate: $ZR_ERR" >&2; exit 2; }
+  zr_load_radios || true
+  zr_version_read "$STATE"
+  mkdir -p "$RUN" "$STATE"
+  if [ "$ELECTION" = act ]; then
+    ACT=1; W=""
+    rm -rf "$RUN/observe" "$STATE/observe"
+    gate_own_files "$RUN" "$STATE"
+  else
+    ACT=0; W="would-"
+    gate_own_files "$RUN" "$STATE"; rm -f "${GATE_FILES[@]}"
+    gate_own_files "$RUN/observe" "$STATE/observe"; mkdir -p "$RUN/observe" "$STATE/observe"
+  fi
+}
+peer_look() { # the peer's hello into H (empty: no answer), P_TERM P_USED P_FLOOR P_PRIO P_SERVING P_VKEY; and MY_VKEY
+  H=$("$SYNC" peer-hello 2>/dev/null | tail -1) || true
+  case "$H" in HELLO\ *) ;; *) H="";; esac
+  P_TERM=$(num "$(zr_field "$H" term)"); P_USED=$(zr_field "$H" used); [ "$P_USED" = yes ] || P_USED=no
+  P_FLOOR=$(num "$(zr_field "$H" zbfloor)"); P_PRIO=$(num "$(zr_field "$H" prio)"); P_SERVING=$(zr_field "$H" serving)
+  P_VKEY=$(zr_vkey "$P_TERM" "$P_USED"); MY_VKEY=$(zr_vkey "$ZR_TERM" "$ZR_USED")
+}
+peer_behind() { [ "$P_VKEY" -lt "$MY_VKEY" ]; }                       # the peer holds an older copy than this VM
+wins_tie() { [ "$PRIORITY" -gt "$P_PRIO" ] || { [ "$PRIORITY" = "$P_PRIO" ] && [[ "$SELF" > "$PEER" ]]; }; }
+outdated_floor() { num "$(sed -n 's/.*zbfloor=//p' "$OUTDATED" 2>/dev/null)"; }
+gate_write() { # gate_write <fn> [args]: <fn> creates election files, under the version lock — and only when no sync has
+  # landed since this look read the version. A landing writes the version and removes those files under the same lock,
+  # so a decision made on the version before it can never be written after it. 1 = nothing written (the next look decides).
+  local seen="$ZR_TERM $ZR_USED" rc=1
+  zr_version_lock || { say loud "the version lock was held for more than $ZR_LOCK_WAIT s: nothing written"; return 1; }
+  zr_version_read "$STATE"
+  if [ "$ZR_TERM $ZR_USED" = "$seen" ]; then "$@"; rc=$?; fi
+  zr_version_unlock
+  return $rc
+}
+hold_if_outdated() { [ ! -e "$OUTDATED" ] || : > "$HOLD"; }    # (gate_write) the hold follows the outdated mark
+mark_outdated() { # (gate_write)
+  echo "term=$P_TERM zbfloor=$P_FLOOR" > "$OUTDATED"; : > "$HOLD"; rm -f "$MAY_SERVE"
+  say "${W}outdated" "the peer holds term $P_TERM, this VM term $ZR_TERM: an older copy — held until a sync lands; \
+it may serve only after the peer has been silent for $ELECTION_WAIT s"
+}
+raise_above() { # raise_above <n>: this VM's Zigbee counter, when it has a synced Zigbee stick; 0 = done or not needed
+  zr_has zigbee synced || return 0
+  [ $ACT = 1 ] || { say would-raise "zradio-sync self-raise --above $1 (observe mode: not run)"; return 0; }
+  "$SYNC" self-raise --above "$1" >/dev/null 2>&1
+}
+raise_or_say() { # raise_or_say <n> <where>: raise_above, and a loud line when it fails (this VM may serve all the same)
+  raise_above "$1" || say loud "$2this outdated VM's Zigbee counter could not be raised; it may serve all the same (Zigbee devices may ignore it)"
+}
+take_term() { zr_version_write "$STATE" $((ZR_TERM + 1)) yes && zr_version_read "$STATE" && echo "$ZR_TERM" > "$PREEMPT_TERM"; }   # (gate_write)
+preempt() { # the peer serves an older copy: take the radios back, once
+  local ans
+  [ -f "$PREEMPT_TRIED" ] && [ "$(age "$PREEMPT_TRIED")" -lt "$PREEMPT_EVERY" ] && return 0
+  now > "$PREEMPT_TRIED"
+  rm -f "$BOOT_WAIT"
+  if [ $ACT = 0 ]; then
+    say would-preempt "the peer serves term=$P_TERM used=$P_USED, this VM holds the newer networks (term=$ZR_TERM used=$ZR_USED): \
+in act mode the radios would be here, or come back here — this VM would raise its Zigbee counter above $P_FLOOR and ask the \
+peer to hand over (observe mode: nothing is changed)"
+    return 0
+  fi
+  say preempt "the peer serves term=$P_TERM used=$P_USED and this VM holds the newer networks (term=$ZR_TERM used=$ZR_USED): taking the radios back"
+  raise_above "$P_FLOOR" || { say loud "preempt: this VM's Zigbee counter could not be raised above the peer's ($P_FLOOR) — \
+not taking over with a counter that may be behind; the peer keeps serving"; return 1; }
+  rm -f "$HOLD"
+  for _ in $(seq 1 "$ROLE_TRIES"); do [ "$(zr_role)" = BACKUP ] && break; sleep 1; done
+  if [ "$(zr_role)" != BACKUP ]; then
+    say loud "preempt: keepalived here did not reach BACKUP (it says $(zr_role)) — the peer is not asked to hand over"; return 1
+  fi
+  # the turn taken back is a new term: the VM that hands over is behind by term from then on, so it stays outdated (held)
+  # until this VM's sync lands. Once: an attempt that failed has taken its term already.
+  if [ "$(cat "$PREEMPT_TERM" 2>/dev/null)" != "$ZR_TERM" ]; then gate_write take_term || return 1; fi
+  ans=$("$SYNC" peer-yield 2>/dev/null | tail -1) || true
+  case "$ans" in
+    YIELDED*) rm -f "$PREEMPT_TERM"; say preempted "the peer handed the radios over; it is outdated now and this VM's tick syncs it";;
+    *) say loud "preempt: the peer did not hand over (${ans:-no answer}) — it keeps serving the older copy; the next attempt is in $PREEMPT_EVERY s"
+       return 1;;
+  esac
+}
+
+boot_alone() { : > "$ALONE"; rm -f "$BOOT_WAIT" "$HOLD"; [ ! -e "$OUTDATED" ] || : > "$MAY_SERVE"; }   # (gate_write)
+boot_release() { # (gate_write) outdated, released at once: the peer answers but has not served for the wait
+  echo "term=$P_TERM zbfloor=$P_FLOOR" > "$OUTDATED"; : > "$MAY_SERVE"; rm -f "$BOOT_WAIT" "$HOLD" "$ALONE"; now > "$PEER_IDLE"
+}
+at_boot() { # boot-wait exists: nothing is claimed before the peer was asked
+  # an upgrade on a VM that serves: nothing to wait for (observe mode asks to the end all the same: step() notes what
+  # act mode would have done)
+  if zr_serving && [ $ACT = 1 ]; then rm -f "$BOOT_WAIT"; return 0; fi
+  if [ -z "$H" ]; then
+    [ "$(age "$BOOT_WAIT")" -ge "$ELECTION_WAIT" ] || return 0
+    [ ! -e "$OUTDATED" ] || raise_or_say "$(outdated_floor)" "boot: "
+    gate_write boot_alone || return 0
+    say "${W}alone" "the peer did not answer for $ELECTION_WAIT s after boot: this VM may claim the radios, provisionally (term=$ZR_TERM used=$ZR_USED)"
+    return 0
+  fi
+  if [ "$P_SERVING" = yes ]; then
+    if peer_behind; then preempt; return 0; fi
+    if [ "$P_TERM" -gt "$ZR_TERM" ]; then gate_write mark_outdated || return 0
+    else
+      rm -f "$HOLD"
+      say "${W}standby" "the peer serves (its term=$P_TERM used=$P_USED turn=$(zr_field "$H" turn); this VM term=$ZR_TERM used=$ZR_USED): standing by"
+    fi
+    rm -f "$BOOT_WAIT" "$ALONE"; return 0
+  fi
+  if [ "$MY_VKEY" -gt "$P_VKEY" ] || { [ "$MY_VKEY" = "$P_VKEY" ] && wins_tie; }; then
+    rm -f "$BOOT_WAIT" "$ALONE" "$HOLD"
+    say "${W}claim" "both VMs are up and neither serves: this VM holds the newer networks, or the same with the higher priority \
+(term=$ZR_TERM used=$ZR_USED priority $PRIORITY; the peer term=$P_TERM used=$P_USED priority $P_PRIO): it may claim"
+    return 0
+  fi
+  [ "$(age "$BOOT_WAIT")" -ge "$ELECTION_WAIT" ] || return 0      # the peer is ahead: wait for it to claim
+  if [ "$P_TERM" -gt "$ZR_TERM" ]; then                            # an older copy: it serves as an outdated VM does
+    raise_or_say "$P_FLOOR" "boot: "                               # (boot-wait stays until then: no claim mid-raise)
+    gate_write boot_release || return 0
+    say "${W}release" "the peer holds term $P_TERM (this VM term $ZR_TERM) but has not served for $ELECTION_WAIT s: \
+this outdated VM may serve, provisionally, until the peer does"
+  else                                                             # the same term: the standby of a failover
+    rm -f "$BOOT_WAIT" "$HOLD" "$ALONE"
+    say "${W}claim" "the peer was the one in use (term=$P_TERM used=$P_USED) but has not served for $ELECTION_WAIT s: \
+this VM, its synced standby (term=$ZR_TERM used=$ZR_USED), may claim as at any failover"
+  fi
+}
+
+while_serving() { # a provisional turn is confirmed once the peer answers and is not ahead
+  # the version advances as soon as Home Assistant uses this turn (zradio-sync beat asks the peer first), not at the
+  # next minute's state line: an old active that returns finds this VM ahead, and the failover stands
+  if [ "$ZR_USED" = no ] && [ "$(cat "$TURN_F" 2>/dev/null)" = confirmed ]; then
+    "$SYNC" beat --quiet >/dev/null 2>&1 || true
+    zr_version_read "$STATE"; MY_VKEY=$(zr_vkey "$ZR_TERM" "$ZR_USED")
+  fi
+  [ -n "$H" ] || return 0
+  if [ -e "$OUTDATED" ] && [ "$P_TERM" -le "$ZR_TERM" ]; then
+    rm -f "$OUTDATED" "$HOLD" "$MAY_SERVE"; say settled "the peer's term ($P_TERM) is not above this VM's ($ZR_TERM): not outdated (any more)"
+  fi
+  [ "$P_VKEY" -le "$MY_VKEY" ] && [ ! -e "$OUTDATED" ] || return 0
+  local not_ahead="the peer answers and is not ahead (its term=$P_TERM used=$P_USED, this VM term=$ZR_TERM used=$ZR_USED)"
+  if [ "$(cat "$TURN_F" 2>/dev/null)" = provisional ]; then
+    echo confirmed > "$TURN_F"; rm -f "$ALONE"; say confirmed "$not_ahead: this serving turn is confirmed"
+  elif [ $ACT = 0 ] && [ -e "$WOULD_TURN" ]; then
+    rm -f "$WOULD_TURN" "$ALONE"; say would-confirmed "$not_ahead: in act mode this turn would be confirmed now"
+  fi
+}
+
+give_up_claim_if_unfit() { # a VM that was the one in use and cannot serve for its own reasons (a stick gone, a start
+  # that failed: its own health check, with nothing of the gate's in the way) gives its claim up after the wait — or
+  # the VM that does serve could never become the newest copy, and this one would take the radios back days later
+  if [ "$ZR_USED" != yes ] || [ -e "$HOLD" ] || [ -e "$BOOT_WAIT" ] || "$SERVE" check >/dev/null 2>&1; then
+    rm -f "$UNFIT"; return 0
+  fi
+  [ -f "$UNFIT" ] || now > "$UNFIT"
+  [ "$(age "$UNFIT")" -ge "$ELECTION_WAIT" ] || return 0
+  gate_write zr_version_write "$STATE" "$ZR_TERM" no || return 0
+  zr_version_read "$STATE"; MY_VKEY=$(zr_vkey "$ZR_TERM" "$ZR_USED")
+  rm -f "$UNFIT"
+  say released "this VM's own health check has failed for $ELECTION_WAIT s (zradio-serve status says why): it cannot serve, \
+and no longer claims to hold the copy in use (term=$ZR_TERM used=no)"
+}
+
+release() { # (gate_write) release <floor>: an outdated VM may serve — if it still is outdated
+  [ -e "$OUTDATED" ] || return 1
+  [ -z "$H" ] || echo "term=$P_TERM zbfloor=$1" > "$OUTDATED"
+  : > "$MAY_SERVE"; rm -f "$HOLD"
+}
+peer_not_serving() { # standing by, the peer silent or up without serving: an outdated VM is released after the wait
+  rm -f "$PEER_SERVING"
+  [ -e "$OUTDATED" ] || { rm -f "$PEER_IDLE"; return 0; }
+  [ -f "$PEER_IDLE" ] || now > "$PEER_IDLE"
+  [ ! -e "$MAY_SERVE" ] && [ "$(age "$PEER_IDLE")" -ge "$ELECTION_WAIT" ] || return 0
+  local floor; floor=$(outdated_floor); [ -z "$H" ] || floor=$P_FLOOR      # the floor the peer names now, if it answers
+  raise_or_say "$floor" ""
+  gate_write release "$floor" || return 0
+  say "${W}release" "the peer has $([ -n "$H" ] && echo "not served" || echo "been silent") for $ELECTION_WAIT s: \
+this outdated VM (term=$ZR_TERM) may serve, provisionally, until the peer returns"
+}
+
+poke_for_sync() { # the sync of this turn: asked for once the peer has served a minute (Home Assistant is back by then)
+  local mine last
+  mine=$(zr_field "$("$SYNC" hello 2>/dev/null)" gen); last=$(zr_field "$H" last)
+  [ "$last" = none ] || [ "$last" != "$mine" ] || return 0
+  [ "$(age "$PEER_SERVING")" -ge "$SERVING_FOR" ] || return 0
+  [ ! -f "$POKED" ] || [ "$(age "$POKED")" -ge "$POKE_EVERY" ] || return 0
+  now > "$POKED"
+  say poke "the serving peer has not synced this VM in its turn (its last sync: $last; this VM holds: ${mine:-none}): \
+asked for the sync now — $("$SYNC" peer-poke 2>/dev/null | tail -1)"
+}
+
+while_standing_by() {
+  [ -e "$OUTDATED" ] || rm -f "$HOLD" "$MAY_SERVE"                 # a sync landed: nothing holds this VM any more
+  give_up_claim_if_unfit
+  if [ -n "$H" ]; then
+    rm -f "$ALONE"                                                 # the peer was asked: "nobody answered at boot" is over
+    if [ -e "$OUTDATED" ] && [ "$P_TERM" -le "$ZR_TERM" ]; then
+      rm -f "$OUTDATED" "$HOLD" "$MAY_SERVE"; say settled "the peer's term ($P_TERM) is not above this VM's ($ZR_TERM) any more: not outdated"
+    fi
+    [ "$P_TERM" -le "$ZR_TERM" ] || [ -e "$OUTDATED" ] || gate_write mark_outdated || return 0
+  fi
+  if [ "$P_SERVING" != yes ]; then peer_not_serving; return 0; fi
+  rm -f "$PEER_IDLE"
+  if [ -e "$MAY_SERVE" ]; then
+    rm -f "$MAY_SERVE"; gate_write hold_if_outdated || return 0; say "${W}held-again" "the peer serves again: this outdated VM is held as before"
+  fi
+  [ -f "$PEER_SERVING" ] || now > "$PEER_SERVING"
+  if peer_behind; then preempt; return 0; fi
+  [ -e "$HOLD" ] || gate_write hold_if_outdated || return 0
+  poke_for_sync
+}
+
+note_would_provisional() { # observe mode: this VM serves where act mode would not have let it (yet), or only provisionally
+  zr_serving && [ ! -e "$WOULD_TURN" ] || return 0
+  [ -e "$BOOT_WAIT" ] || [ -e "$HOLD" ] || [ -e "$ALONE" ] || [ -e "$OUTDATED" ] || return 0
+  echo provisional > "$WOULD_TURN"
+  local why=""
+  [ ! -e "$BOOT_WAIT" ] || why="it would still be asking the peer; "
+  [ ! -e "$OUTDATED" ] || why="${why}it is outdated: $(cat "$OUTDATED" 2>/dev/null); "
+  [ ! -e "$ALONE" ] || why="${why}the peer did not answer at boot; "
+  say would-provisional "this VM serves, and in act mode it would not serve yet or only provisionally (${why}observe mode: it serves as before)"
+}
+
+step() { # one look
+  local rc=0
+  setup; peer_look
+  if [ -e "$BOOT_WAIT" ]; then at_boot || rc=$?
+  elif zr_serving; then while_serving || rc=$?
+  else while_standing_by || rc=$?; fi
+  [ $ACT = 1 ] || note_would_provisional
+  return $rc
+}
+
+case "$MODE" in
+arm)
+  zr_need_root
+  setup
+  if zr_serving; then echo "this VM serves — nothing to arm"; exit 0; fi
+  rm -f "$ALONE" "$WOULD_TURN"
+  now > "$BOOT_WAIT"
+  say "${W}wait" "boot: this VM claims nothing until the peer was asked who holds the newer networks (at most $ELECTION_WAIT s)\
+$([ $ACT = 1 ] || echo ' — observe mode: it is not held back')"
+  exit 0;;
+step) zr_need_root; step; exit $?;;
+run)
+  zr_need_root
+  nap() { local i=0; while [ "$i" -lt "$1" ] && [ ! -e "$GATE_KICK" ]; do sleep 1; i=$((i + 1)); done; }   # a kick ends it
+  unused_turn() { [ "$(cat "$TURN_F" 2>/dev/null)" = confirmed ] && zr_version_read "$STATE" && [ "$ZR_USED" = no ]; }
+  rounds=0
+  while :; do
+    rm -f "$GATE_KICK"
+    step || true
+    rounds=$((rounds + 1)); [ "$rounds" != "${ZRADIO_GATE_ROUNDS:-0}" ] || exit 0          # (the tests end the loop)
+    if [ -e "$BOOT_WAIT" ]; then sleep "$BOOT_PACE"
+    elif unused_turn; then
+      # serving a confirmed turn Home Assistant has not used yet: the light look (local, unless a client is connected —
+      # then the peer is asked once and the version advances) between two full looks
+      i=0
+      while [ "$i" -lt "$IDLE" ] && [ ! -e "$GATE_KICK" ] && unused_turn; do
+        sleep "$BEAT_PACE"; i=$((i + BEAT_PACE)); "$SYNC" beat --quiet >/dev/null 2>&1 || true
+      done
+    elif [ -e "$OUTDATED" ] || [ "$(cat "$TURN_F" 2>/dev/null)" = provisional ]; then nap "$WATCH_PACE"
+    else nap "$IDLE"; fi
+  done;;
+status)
+  setup
+  echo "election: $ELECTION (standard wait $ELECTION_WAIT s); this VM: term $ZR_TERM, used $ZR_USED\
+$([ -f "$TURN_F" ] && echo ", serving turn $(cat "$TURN_F")")"
+  [ -e "$BOOT_WAIT" ] && echo "boot-wait: asking the peer ($(age "$BOOT_WAIT") s)"
+  [ -e "$OUTDATED" ] && echo "outdated: $(cat "$OUTDATED")$([ -e "$HOLD" ] && echo ' — held' || echo ' — may serve')"
+  [ -e "$ALONE" ] && echo "gate-alone: nobody answered at boot; a turn started now is provisional"
+  exit 0;;
+-h|--help) sed -n '2,/^set -uo pipefail$/{/^set -uo pipefail$/!p}' "$0"; exit 0;;
+*) echo "usage: zradio-gate arm|run|step|status (--help)" >&2; exit 2;;
+esac

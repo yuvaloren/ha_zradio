@@ -1,0 +1,14 @@
+# The radio pair's serving role. NOT enabled: keepalived's notify
+# (/usr/local/sbin/zradio-notify) starts it when this VM takes the floating address and stops it when it gives the address up.
+[Unit]
+Description=zradio: this VM serves the sticks (Z-Wave receiver on + ser2net); started and stopped by keepalived's notify
+After=network-online.target systemd-udev-settle.service zradio-quiet.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/zradio-serve up
+ExecStop=/usr/local/sbin/zradio-serve down
+TimeoutStartSec=90
+TimeoutStopSec=90

@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+# t-install.sh — guest/install.sh against a fake radio VM: every path it writes under a temp root
+# (ZRADIO_INSTALL_ROOT); systemctl, apt-get, dpkg-query, keepalived, podman, id and ip are fakes on PATH (recorded);
+# zradio-detect is a fake that writes the radios.conf / radios.json a detection would (its own tests: t-detect.sh);
+# the zigpy venv is made by a fake. zradio-render, zradio-sync (keys) and the common loader are the real ones.
+. "$(dirname "$0")/lib.sh"
+TOOL="$KIT/guest/install.sh"
+. "$TESTS_DIR/fake-guest.sh"
+inst() { local d=$1; shift; PATH="$d/bin:$PATH" ZRADIO_INSTALL_ROOT="$d/root" ZRADIO_INSTALL_DETECT="$d/detect" ZRADIO_INSTALL_ZIGPY_SETUP="$d/zigpy-setup" bash "$TOOL" "$@" > "$d/out" 2>&1; RC=$?; }
+R() { printf '%s/root%s' "$1" "$2"; }
+
+echo "-- report mode: WOULD lines, nothing written, nothing installed"
+vm "$T/r"; inst "$T/r" --conf "$T/r/my.conf"
+check "exit 0, REPORT ONLY" bash -c '[ "$2" = 0 ] && grep -q "REPORT ONLY — nothing was changed" "$1/out"' _ "$T/r" "$RC"
+check "the conf is read back in one line" has "$T/r/out" "radio2, 10.20.30.6 ↔ 10.20.30.5, the floating address 10.20.30.50/24 (VRID 50, priority 100), ports 6639 (Z-Wave) / 6638 (Zigbee)"
+check "WOULD: the packages, the detection, the units" bash -c 'for w in "apt-get install -y keepalived" "apt-get install -y ser2net" "WOULD zradio-detect --write" "WOULD install /usr/local/sbin/zradio-serve (755)" "WOULD systemctl daemon-reload"; do grep -qF "$w" "$1/out" || exit 1; done' _ "$T/r"
+check "nothing written under the root, no apt-get, no enable" bash -c '[ ! -e "$1/root/usr" ] && [ ! -e "$1/root/etc/zradio" ] && ! grep -qE "^(apt-get|podman pull|systemctl (enable|daemon-reload))" "$1/calls"' _ "$T/r"
+
+echo "-- --run on a new VM whose sticks hold the networks"
+vm "$T/w"; inst "$T/w" --conf "$T/w/my.conf" --run
+check "exit 0" eq "$RC" 0
+check "the nine tools 0755 and the library" bash -c 'for f in zradio-serve zradio-notify zradio-sync zradio-switch zradio-change-watch zradio-render zradio-detect zradio-apply zradio-gate; do [ "$(stat -c %a "$1/root/usr/local/sbin/$f")" = 755 ] || exit 1; done; for f in zradio-common.sh zradio-probe.py zui-restore.py usb-ids.json keepalived.conf.tmpl; do [ -f "$1/root/usr/local/lib/zradio/$f" ] || exit 1; done' _ "$T/w"
+check "the conf is in place, byte for byte" cmp -s "$T/w/my.conf" "$(R "$T/w" /etc/zradio/zradio.conf)"
+check "keepalived and ser2net installed; both stopped again and not enabled by their packages" bash -c 'grep -q "^apt-get install -y -q keepalived" "$1/calls" && grep -q "^apt-get install -y -q ser2net" "$1/calls" && grep -q "^systemctl disable --now ser2net" "$1/calls" && grep -q "^systemctl disable --now keepalived" "$1/calls" && [ "$(cat "$1/ser2net")" = 0 ]' _ "$T/w"
+check "detection ran once, with --write" eq "$(grep -c '^zradio-detect --write$' "$T/w/calls")" 1
+check "a synced Z-Wave stick: podman installed, the pinned image pulled" bash -c 'grep -q "^apt-get install -y -q podman" "$1/calls" && grep -q "^podman pull -q docker.io/zwavejs/zwave-js-ui:11.25.2" "$1/calls"' _ "$T/w"
+check "a synced Zigbee stick: zigpy in its own venv" bash -c 'grep -q "^zigpy-setup .*/opt/zradio/zigpy" "$1/calls" && [ -x "$1/root/opt/zradio/zigpy/bin/zigpy" ]' _ "$T/w"
+# the real line (no setup hook): python3 -m venv, then pip with the PINNED release from zradio.conf's default
+vm "$T/pin"; REALPY=$(command -v python3)
+fake "$T/pin/bin" python3 "if [ \"\$1 \$2\" = '-m venv' ]; then mkdir -p \"\$3/bin\" && printf '#!/bin/sh\necho \"pip \$*\" >> %s\nprintf \"#!/bin/sh\\\\n\" > %s/bin/zigpy; chmod +x %s/bin/zigpy\n' '$T/pin/calls' \"\$3\" \"\$3\" > \"\$3/bin/pip\" && chmod +x \"\$3/bin/pip\"; else exec '$REALPY' \"\$@\"; fi"
+PATH="$T/pin/bin:$PATH" ZRADIO_INSTALL_ROOT="$T/pin/root" ZRADIO_INSTALL_DETECT="$T/pin/detect" bash "$TOOL" --conf "$T/pin/my.conf" --run > "$T/pin/out" 2>&1
+check "zigpy-cli is installed at a pinned release (2.0.0 unless zradio.conf says otherwise), not whatever is newest that day" bash -c 'grep -qx "pip install -q zigpy-cli==2.0.0" "$1/calls" && grep -q "zigpy-cli 2.0.0 installed in its own venv" "$1/out"' _ "$T/pin"
+vm "$T/pin2"; echo "ZIGPY_VERSION=latest" >> "$T/pin2/my.conf"; inst "$T/pin2" --conf "$T/pin2/my.conf" --run
+check "ZIGPY_VERSION that is not a release number: the conf is refused, nothing installed" bash -c '[ "$2" != 0 ] && grep -q "ZIGPY_VERSION .latest.: a zigpy-cli release" "$1/out" && ! grep -q "^apt-get" "$1/calls"' _ "$T/pin2" "$RC"
+check "keepalived.conf rendered for this VM (eth1 holds SELF) and checked with keepalived -t" bash -c 'grep -qx "    interface eth1" "$1/root/etc/keepalived/keepalived.conf" && grep -qx "    unicast_src_ip 10.20.30.6" "$1/root/etc/keepalived/keepalived.conf" && grep -q "^keepalived -t -f " "$1/calls"' _ "$T/w"
+check "ser2net.yaml: both radios on the floating address; the package's file kept once as .dist" bash -c '[ "$(grep -c "accepter: tcp,10.20.30.50," "$1/root/etc/ser2net.yaml")" = 2 ] && grep -q "the package.s file" "$1/root/etc/ser2net.yaml.dist"' _ "$T/w"
+check "the nightly timer at the default time" has "$(R "$T/w" /etc/systemd/system/zradio-sync.timer)" "OnCalendar=*-*-* 04:30:00"
+check "the units and the keepalived drop-in (silent sticks first, Restart=always, a stop stops the serving)" bash -c 'for u in zradio.target zradio-gate.service zradio-serve.service zradio-quiet.service zradio-hush.service zradio-sync.service zradio-sync-tick.timer zradio-state.timer zradio-change-watch.service; do [ -f "$1/root/etc/systemd/system/$u" ] || exit 1; done; D="$1/root/etc/systemd/system/keepalived.service.d/10-zradio.conf"; grep -qx "After=zradio-quiet.service" "$D" && grep -qx "Restart=always" "$D" && grep -qx "ExecStopPost=/usr/local/sbin/zradio-notify INSTANCE RADIO STOP 0" "$D"' _ "$T/w"
+check "enabled, nothing started; ser2net never enabled" bash -c 'grep -q "^systemctl enable zradio.target zradio-quiet.service keepalived.service zradio-sync.timer zradio-sync-tick.timer zradio-state.timer zradio-change-watch.service zradio-gate.service" "$1/calls" && ! grep -qE "^systemctl (start|restart|enable .*ser2net)" "$1/calls"' _ "$T/w"
+check "the sync key is made (0600) and the line for the other VM is printed with both public keys" bash -c '[ "$(stat -c %a "$1/root/etc/zradio/sync.key")" = 600 ] && grep -qE "^      zradio-sync trust --sync-key .ssh-ed25519 [A-Za-z0-9+/=]+. --host-key .ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeHostKey" "$1/out"' _ "$T/w"
+check "no private key in the output" bash -c '! grep -q "PRIVATE KEY" "$1/out"' _ "$T/w"
+check "sticks that hold networks: not marked 'not filled'" bash -c '[ ! -e "$1/root/var/lib/zradio/standby-dirty" ]' _ "$T/w"
+check "the last line says who starts first" has "$T/w/out" "on the VM that holds the networks FIRST"
+
+echo "-- a second run: everything is current, nothing is installed or detected again"
+: > "$T/w/calls"; inst "$T/w" --run
+check "exit 0 without --conf (the installed conf is used)" eq "$RC" 0
+check "no DONE … installed line, no apt-get, no detection, no pull" bash -c '! grep -q "^DONE  .* installed" "$1/out" && ! grep -qE "^(apt-get|zradio-detect|podman pull|zigpy-setup)" "$1/calls"' _ "$T/w"
+cp "$T/w/root/etc/zradio/sync.key" "$T/w/key1"; inst "$T/w" --run
+check "the sync key is the same one" cmp -s "$T/w/key1" "$(R "$T/w" /etc/zradio/sync.key)"
+inst "$T/w" --run --detect --use zigbee=/dev/ttyUSB3
+check "--detect looks again, --use is passed on" has "$T/w/calls" "zradio-detect --write --use zigbee=/dev/ttyUSB3"
+
+echo "-- --initial-role (what the VM is on the day of the install; the two swap later): the primary's sticks stay as they are; the standby does not serve before the primary's first sync"
+vm "$T/rs" both; inst "$T/rs" --conf "$T/rs/my.conf" --initial-role standby --run
+check "standby whose sticks HOLD a network (an old copy, another house's): marked NOT FILLED all the same, and told what will be overwritten" bash -c '[ "$2" = 0 ] && [ -e "$1/root/var/lib/zradio/standby-dirty" ] && grep -q "WARN  this VM starts as the STANDBY: it is marked NOT FILLED" "$1/out" && grep -q "the zigbee zwave stick(s) hold a network today: it will be OVERWRITTEN" "$1/out" && grep -q "the two VMs are equals and swap" "$1/out" && [ "$(cat "$1/root/var/lib/zradio/initial-role")" = standby ] && grep -q "^install.sh: the initial standby" "$1/root/var/lib/zradio/standby-dirty"' _ "$T/rs" "$RC"
+sc0() { : > "$1/tty"; ZRADIO_RADIOS="$1/root/etc/zradio/radios.conf" ZRADIO_SERVE_STATE="$1/root/var/lib/zradio" ZRADIO_SERVE_RUN="$1/run" ZRADIO_SERVE_ZWAVE_TTY="$1/tty" ZRADIO_SERVE_ZIGBEE_TTY="$1/tty" bash "$KIT/guest/sbin/zradio-serve" check; }
+sc0 "$T/rs"; check "…zradio-serve check refuses to serve: that network cannot reach the air from here" eq "$?" 1
+rm -f "$T/rs/root/var/lib/zradio/standby-dirty"      # months later: a sync filled it, there was a failover, it is the VM that serves or served
+inst "$T/rs" --initial-role standby --detect --run
+check "THE SWAP: the same line run again later does not mark the VM — the initial role is used once" bash -c '[ "$2" = 0 ] && [ ! -e "$1/root/var/lib/zradio/standby-dirty" ] && grep -q "OK    this VM was installed as the initial standby before: that is asked once, and nothing about it was changed" "$1/out" && ! grep -q "starts as the STANDBY" "$1/out"' _ "$T/rs" "$RC"
+: > "$T/rs/root/var/lib/zradio/standby-dirty"        # zradio-sync's own mark (empty): a set is being written onto the sticks
+inst "$T/rs" --initial-role primary --detect --run
+check "a VM in the middle of being filled by a sync, said to be the primary: refused, zradio-sync's mark stays" bash -c '[ "$2" = 1 ] && [ -e "$1/root/var/lib/zradio/standby-dirty" ] && [ ! -s "$1/root/var/lib/zradio/standby-dirty" ] && grep -q "FAIL  this VM is to start as the PRIMARY, but a set from the other VM was being written" "$1/out" && [ "$(cat "$1/root/var/lib/zradio/initial-role")" = standby ]' _ "$T/rs" "$RC"
+sc0 "$T/rs"; check "…and it still does not serve" eq "$?" 1
+rm -f "$T/rs/root/var/lib/zradio/standby-dirty" "$T/rs/root/var/lib/zradio/initial-role"; echo '{"gen":"g1"}' > "$T/rs/root/var/lib/zradio/synced.json"
+inst "$T/rs" --initial-role standby --detect --run       # a VM from before the role was asked, filled by a sync
+check "a standby that a sync has filled and that never had an initial role: not marked, the role is kept" bash -c '[ "$2" = 0 ] && [ ! -e "$1/root/var/lib/zradio/standby-dirty" ] && grep -q "filled by a sync before" "$1/out" && [ "$(cat "$1/root/var/lib/zradio/initial-role")" = standby ]' _ "$T/rs" "$RC"
+vm "$T/rc" both; inst "$T/rc" --conf "$T/rc/my.conf" --initial-role standby --run; inst "$T/rc" --initial-role primary --detect --run
+check "the wrong answer, corrected before any sync (standby -> primary): the installer lifts its own mark, and says what it was" bash -c '[ "$2" = 0 ] && [ ! -e "$1/root/var/lib/zradio/standby-dirty" ] && [ "$(cat "$1/root/var/lib/zradio/initial-role")" = primary ] && grep -q "WARN  this VM was installed as the initial standby before; it is the initial primary now" "$1/out"' _ "$T/rc" "$RC"
+inst "$T/rc" --initial-role standby --detect --run
+check "…and back (primary -> standby): marked again, by the installer" bash -c '[ "$2" = 0 ] && grep -q "^install.sh:" "$1/root/var/lib/zradio/standby-dirty" && [ "$(cat "$1/root/var/lib/zradio/initial-role")" = standby ]' _ "$T/rc" "$RC"
+vm "$T/rs2" blank; inst "$T/rs2" --conf "$T/rs2/my.conf" --initial-role standby --run
+check "standby with empty sticks: marked the same way" bash -c '[ "$2" = 0 ] && [ -e "$1/root/var/lib/zradio/standby-dirty" ] && grep -q "(the zigbee zwave stick(s) are empty)" "$1/out"' _ "$T/rs2" "$RC"
+vm "$T/rp" both; inst "$T/rp" --conf "$T/rp/my.conf" --initial-role primary --run
+check "primary whose sticks hold the networks: not marked, said" bash -c '[ "$2" = 0 ] && [ ! -e "$1/root/var/lib/zradio/standby-dirty" ] && grep -q "OK    this VM starts as the PRIMARY: its zigbee zwave stick(s) hold the networks and stay as they are" "$1/out" && [ "$(cat "$1/root/var/lib/zradio/initial-role")" = primary ]' _ "$T/rp" "$RC"
+vm "$T/rp2" blank; inst "$T/rp2" --conf "$T/rp2/my.conf" --initial-role primary --run
+check "primary whose sticks are EMPTY: refused — a new house says --first; devices on the other node means this one is the standby" bash -c '[ "$2" = 1 ] && grep -q "FAIL  this VM is to start as the PRIMARY, but its zigbee zwave stick(s) hold no network" "$1/out" && grep -q "then that node is the primary and this one the standby" "$1/out" && ! grep -q "enable.*zradio.target" "$1/calls"' _ "$T/rp2" "$RC"
+check "…and it is left marked NOT FILLED: started by hand all the same, it does not serve the empty sticks" bash -c '[ -e "$1/root/var/lib/zradio/standby-dirty" ] && ! grep -q "this VM starts as the PRIMARY" "$1/out" && [ ! -e "$1/root/var/lib/zradio/initial-role" ]' _ "$T/rp2"
+sc0 "$T/rp2"; check "…zradio-serve check says no" eq "$?" 1
+inst "$T/rp2" --initial-role primary --first --detect --run
+check "…the same with --first (a new house): accepted, may serve" bash -c '[ "$2" = 0 ] && [ ! -e "$1/root/var/lib/zradio/standby-dirty" ] && grep -q "starts as the PRIMARY: --first: the zigbee zwave stick(s) hold no network yet" "$1/out" && [ "$(cat "$1/root/var/lib/zradio/initial-role")" = primary ]' _ "$T/rp2" "$RC"
+inst "$T/rp" --initial-role standby --run
+check "a later run WITHOUT --detect does not change the role: said, the primary is not marked" bash -c '[ "$2" = 0 ] && grep -q "role standby is applied when the radios are looked at, once: nothing about it was changed on this run" "$1/out" && [ ! -e "$1/root/var/lib/zradio/standby-dirty" ] && [ "$(cat "$1/root/var/lib/zradio/initial-role")" = primary ]' _ "$T/rp" "$RC"
+vm "$T/rx"; inst "$T/rx" --conf "$T/rx/my.conf" --initial-role standby --first --run
+check "--initial-role standby --first: refused before anything" bash -c '[ "$2" = 2 ] && [ ! -s "$1/calls" ]' _ "$T/rx" "$RC"
+inst "$T/rx" --conf "$T/rx/my.conf" --initial-role master --run
+check "--initial-role that is neither primary nor standby: refused before anything" bash -c '[ "$2" = 2 ] && [ ! -s "$1/calls" ]' _ "$T/rx" "$RC"
+
+echo "-- without --initial-role (as before): a new standby with blank sticks is marked 'not filled'; --first lifts that"
+vm "$T/b" blank; inst "$T/b" --conf "$T/b/my.conf" --run
+check "exit 0, the marker is there, and the reason is said" bash -c '[ "$2" = 0 ] && [ -e "$1/root/var/lib/zradio/standby-dirty" ] && grep -q "WARN  the zigbee zwave stick(s) here hold no network: this VM is marked NOT FILLED" "$1/out"' _ "$T/b" "$RC"
+sc() { : > "$1/tty"; ZRADIO_RADIOS="$1/root/etc/zradio/radios.conf" ZRADIO_SERVE_STATE="$1/root/var/lib/zradio" ZRADIO_SERVE_RUN="$1/run" ZRADIO_SERVE_ZWAVE_TTY="$1/tty" ZRADIO_SERVE_ZIGBEE_TTY="$1/tty" bash "$KIT/guest/sbin/zradio-serve" check; }
+sc "$T/b"; check "zradio-serve check refuses to serve on that marker (the sticks' ttys are there)" eq "$?" 1
+rm -f "$T/b/root/var/lib/zradio/standby-dirty"; sc "$T/b"; check "…and passes once a sync has cleared it" eq "$?" 0
+vm "$T/b2" blank; inst "$T/b2" --conf "$T/b2/my.conf" --run --first
+check "--first: no marker (a brand-new pair: this VM may serve blank sticks)" bash -c '[ "$2" = 0 ] && [ ! -e "$1/root/var/lib/zradio/standby-dirty" ] && grep -q "OK    --first" "$1/out"' _ "$T/b2" "$RC"
+
+echo "-- only what the radios need"
+vm "$T/s" served; inst "$T/s" --conf "$T/s/my.conf" --run
+check "served-only sticks: no podman, no image, no zigpy; ser2net.yaml still has both" bash -c '[ "$2" = 0 ] && ! grep -qE "podman|zigpy-setup" "$1/calls" && [ "$(grep -c "^connection:" "$1/root/etc/ser2net.yaml")" = 2 ]' _ "$T/s" "$RC"
+vm "$T/z" zwave-only; inst "$T/z" --conf "$T/z/my.conf" --run
+check "a Z-Wave stick only: podman, no zigpy, one connection" bash -c '[ "$2" = 0 ] && grep -q "podman pull" "$1/calls" && ! grep -q zigpy-setup "$1/calls" && [ "$(grep -c "^connection:" "$1/root/etc/ser2net.yaml")" = 1 ]' _ "$T/z" "$RC"
+
+echo "-- refusals and failures"
+vm "$T/x1"; printf '%s\n' NAME=radio2 SELF=10.20.30.6 PEER=10.20.30.6 VIP=10.20.30.50/24 VRID=50 PRIORITY=100 > "$T/x1/my.conf"; inst "$T/x1" --conf "$T/x1/my.conf" --run
+check "a conf that does not check: REFUSED, nothing changed" bash -c '[ "$2" = 1 ] && grep -q "FAIL  SELF and PEER are both" "$1/out" && grep -q "REFUSED" "$1/out" && [ ! -e "$1/root/usr" ] && ! grep -q "^apt-get" "$1/calls"' _ "$T/x1" "$RC"
+vm "$T/x2"; inst "$T/x2" --run
+check "no conf anywhere: REFUSED, says where it belongs" bash -c '[ "$2" = 1 ] && grep -q "copy zradio.conf.example there" "$1/out"' _ "$T/x2" "$RC"
+vm "$T/x3"; : > "$T/x3/detect-fail"; inst "$T/x3" --conf "$T/x3/my.conf" --run
+check "no stick found: exit 1 after the files and packages, before any service file" bash -c '[ "$2" = 1 ] && grep -q "FAIL  zradio-detect did not end clean" "$1/out" && [ ! -e "$1/root/etc/keepalived/keepalived.conf" ] && ! grep -q "^systemctl enable" "$1/calls"' _ "$T/x3" "$RC"
+vm "$T/x4"; : > "$T/x4/kt-fail"; inst "$T/x4" --conf "$T/x4/my.conf" --run
+check "keepalived -t rejects the rendered file: exit 1, nothing enabled" bash -c '[ "$2" = 1 ] && grep -q "FAIL  keepalived -t" "$1/out" && ! grep -q "^systemctl enable" "$1/calls"' _ "$T/x4" "$RC"
+vm "$T/x5"; : > "$T/x5/apt-fail"; inst "$T/x5" --conf "$T/x5/my.conf" --run
+check "apt-get fails: exit 1 at the package, no detection" bash -c '[ "$2" = 1 ] && grep -q "FAIL  apt-get install keepalived failed" "$1/out" && ! grep -q "^zradio-detect" "$1/calls"' _ "$T/x5" "$RC"
+
+echo "-- a re-run on a VM that serves: detection is not repeated, and a changed port is said, not sprung on Home Assistant"
+vm "$T/a"; inst "$T/a" --conf "$T/a/my.conf" --run; echo 1 > "$T/a/ser2net"; echo 1 > "$T/a/keepalived"; : > "$T/a/calls"
+echo "ZWAVE_PORT=7001" >> "$T/a/my.conf"; inst "$T/a" --conf "$T/a/my.conf" --run
+check "exit 0; no detection, ser2net not restarted or stopped" bash -c '[ "$2" = 0 ] && ! grep -q "^zradio-detect" "$1/calls" && ! grep -qE "^systemctl (restart|stop|disable --now) ser2net" "$1/calls"' _ "$T/a" "$RC"
+check "the new port is in the file and a WARN says when it takes effect" bash -c 'grep -q "accepter: tcp,10.20.30.50,7001" "$1/root/etc/ser2net.yaml" && grep -q "WARN  /etc/ser2net.yaml changed and ser2net is active" "$1/out"' _ "$T/a"
+check "--help names the steps" bash -c 'bash "$1" --help | grep -q "NOTHING IS STARTED"' _ "$TOOL"
+
+echo "-- a VM whose address comes from DHCP: a conf without SELF, and without PEER (the pair's first VM)"
+C() { printf '%s/root/etc/zradio/zradio.conf' "$1"; }
+vm "$T/dh"; printf '%s\n' "# a pair on DHCP" NAME=attic1 VIP=192.168.1.50 VRID=50 PRIORITY=110 > "$T/dh/dhcp.conf"
+inst "$T/dh" --conf "$T/dh/dhcp.conf" --initial-role primary --run
+check "exit 0; this machine's own address is in the installed conf as SELF, the floating address got its prefix, and there is no PEER" bash -c '[ "$3" = 0 ] && grep -qx "SELF=192.168.1.44" "$1" && grep -qx "VIP=192.168.1.50/24" "$1" && ! grep -q "^PEER=" "$1" && ! grep -q "SELF" "$2/dhcp.conf"' _ "$(C "$T/dh")" "$T/dh" "$RC"
+check "said: which address, on which interface, that it is to be RESERVED — and that this VM has no peer yet" bash -c 'grep -q "WARN  SELF: .*192.168.1.44/24 on eth0.*RESERVE it for this VM in your DHCP server" "$1/out" && grep -q "WARN  no PEER: this VM has no peer yet" "$1/out" && grep -q "attic1, 192.168.1.44 ↔ no peer yet, the floating address 192.168.1.50/24" "$1/out"' _ "$T/dh"
+check "its keepalived.conf has no unicast lines: it holds the floating address alone" bash -c '! grep -q "unicast_" "$1/root/etc/keepalived/keepalived.conf" && grep -q "192.168.1.50/24 dev eth0" "$1/root/etc/keepalived/keepalived.conf"' _ "$T/dh"
+inst "$T/dh" --conf "$T/dh/dhcp.conf" --run
+check "the same line again: nothing is rewritten" bash -c '[ "$2" = 0 ] && grep -q "OK    /etc/zradio/zradio.conf is current" "$1/out" && grep -q "OK    /etc/keepalived/keepalived.conf is current" "$1/out"' _ "$T/dh" "$RC"
+echo 1 > "$T/dh/keepalived"          # the VM is in the pair by now: keepalived runs
+inst "$T/dh" --peer 192.168.1.45 --from-node --run
+check "--peer (the second VM exists now): PEER is in the conf, keepalived.conf has the unicast lines, nothing is detected again" bash -c '[ "$3" = 0 ] && grep -qx "PEER=192.168.1.45" "$1" && grep -qx "SELF=192.168.1.44" "$1" && grep -A2 "unicast_src_ip 192.168.1.44" "$2/root/etc/keepalived/keepalived.conf" | grep -q "^ *192.168.1.45$" && [ "$(grep -c "^zradio-detect" "$2/calls")" = 1 ]' _ "$(C "$T/dh")" "$T/dh" "$RC"
+check "…and the keepalived that runs is reloaded, with what that costs said" bash -c 'grep -q "^systemctl reload keepalived" "$1/calls" && grep -q "DONE  keepalived reloaded: this VM sends its adverts to its peer 192.168.1.45 now.*about 4 seconds" "$1/out" && ! grep -q "systemctl restart keepalived" "$1/out"' _ "$T/dh"
+inst "$T/dh" --conf "$T/dh/dhcp.conf" --run
+check "a later run with the first conf (it names no peer) does not take the peer away" bash -c '[ "$2" = 0 ] && grep -qx "PEER=192.168.1.45" "$1" && grep -q "OK    /etc/zradio/zradio.conf is current"  "$3/out"' _ "$(C "$T/dh")" "$RC" "$T/dh"
+inst "$T/dh" --peer 192.168.1 --run
+check "--peer with something that is no address: refused, nothing changed" bash -c '[ "$2" = 1 ] && grep -q "FAIL  --peer .192.168.1.: the other radio VM.s IPv4 address" "$3/out" && grep -qx "PEER=192.168.1.45" "$1"' _ "$(C "$T/dh")" "$RC" "$T/dh"
+vm "$T/dh2"; printf '%s\n' NAME=attic1 VIP=10.20.30.50 VRID=50 PRIORITY=110 IFACE=eth1 > "$T/dh2/c"; inst "$T/dh2" --conf "$T/dh2/c" --initial-role primary --run
+check "IFACE in the conf: the address on THAT interface is the VM's" bash -c '[ "$2" = 0 ] && grep -qx "SELF=10.20.30.6" "$1" && grep -qx "VIP=10.20.30.50/24" "$1"' _ "$(C "$T/dh2")" "$RC"
+vm "$T/dh3"; fake "$T/dh3/bin" ip 'case "$*" in *route*) echo "default via 10.20.30.1 dev eth1 proto dhcp src 10.20.30.6 metric 100";; *) printf "2: eth0    inet 192.168.1.44/24 scope global eth0\n3: eth1    inet 10.20.30.6/24 scope global dynamic eth1\n";; esac'
+printf '%s\n' NAME=attic1 VIP=10.20.30.50 VRID=50 PRIORITY=110 > "$T/dh3/c"; inst "$T/dh3" --conf "$T/dh3/c" --initial-role primary --run
+check "no IFACE: the address on the default route's interface, not the first one listed" bash -c '[ "$2" = 0 ] && grep -qx "SELF=10.20.30.6" "$1"' _ "$(C "$T/dh3")" "$RC"
+vm "$T/dh4"; printf '%s\n' NAME=attic1 VIP=10.9.9.50 VRID=50 PRIORITY=110 > "$T/dh4/c"; inst "$T/dh4" --conf "$T/dh4/c" --initial-role primary --run
+check "a floating address outside the VM's own network: refused before anything is changed" bash -c '[ "$2" = 1 ] && grep -q "FAIL  the floating address 10.9.9.50 is not in this VM.s network (its own address is 192.168.1.44/24)" "$1/out" && [ ! -e "$1/root/etc/zradio/zradio.conf" ] && ! grep -q "^apt-get" "$1/calls"' _ "$T/dh4" "$RC"
+vm "$T/dh5"; fake "$T/dh5/bin" ip ':'; printf '%s\n' NAME=attic1 VIP=192.168.1.50 VRID=50 PRIORITY=110 > "$T/dh5/c"; inst "$T/dh5" --conf "$T/dh5/c" --initial-role primary --run
+check "no SELF in the conf and no address on the machine: refused, saying so" bash -c '[ "$2" = 1 ] && grep -q "FAIL  .* names no SELF, and this machine has no IPv4 address to take" "$1/out" && [ ! -e "$1/root/etc/zradio/zradio.conf" ]' _ "$T/dh5" "$RC"
+vm "$T/dh6"; grep -v '^PEER=' "$T/dh6/my.conf" > "$T/dh6/c"; inst "$T/dh6" --conf "$T/dh6/c" --initial-role primary --run
+check "a fixed SELF and no PEER: installed as a VM without a peer; its address is its own business (no RESERVE line)" bash -c '[ "$2" = 0 ] && grep -q "WARN  no PEER" "$1/out" && ! grep -q "RESERVE" "$1/out" && ! grep -q "unicast_" "$1/root/etc/keepalived/keepalived.conf"' _ "$T/dh6" "$RC"
+
+echo "-- the table of known sticks in the VM: the node's, or built here into the kit's gen/"
+kitcopy() { rm -rf "$1/kit"; mkdir -p "$1/kit"; cp -R "$KIT/guest" "$KIT/zradio.conf.example" "$1/kit/"; }
+vm "$T/t1"; kitcopy "$T/t1"; TOOL="$T/t1/kit/guest/install.sh" inst "$T/t1" --conf "$T/t1/my.conf" --run
+check "on its own (no node): built here, into the kit's gen/, installed as /usr/local/lib/zradio/usb-ids.json" bash -c '[ "$2" = 0 ] && grep -q "OK    the table of the sticks the kit knows, built now into $1/kit/gen: 25 sticks" "$1/out" && cmp -s "$1/kit/gen/usb-ids.json" "$1/root/usr/local/lib/zradio/usb-ids.json" && [ "$(ls "$1/kit")" = "$(printf "gen\nguest\nzradio.conf.example")" ]' _ "$T/t1" "$RC"
+vm "$T/t2"; kitcopy "$T/t2"; mkdir -p "$T/t2/kit/gen"; echo '{"format": "zradio usb ids v1", "entries": [], "home_assistant_core_commit": "from-the-node"}' > "$T/t2/kit/gen/usb-ids.json"
+ZRADIO_USB_IDS_SOURCE="$T/t2/nowhere" TOOL="$T/t2/kit/guest/install.sh" inst "$T/t2" --conf "$T/t2/my.conf" --from-node --run
+check "run by the node: the node's table is used as it is — nothing fetched, nothing rebuilt" bash -c 'grep -q "OK    the table of the sticks the kit knows came with the kit (the node built it)" "$1/out" && grep -q from-the-node "$1/root/usr/local/lib/zradio/usb-ids.json"' _ "$T/t2"
+vm "$T/t3"; kitcopy "$T/t3"; ZRADIO_USB_IDS_SOURCE="$T/t3/nowhere" TOOL="$T/t3/kit/guest/install.sh" inst "$T/t3" --conf "$T/t3/my.conf" --run
+check "on its own, and Home Assistant's lists cannot be read: refused before anything is changed" bash -c '[ "$2" = 1 ] && grep -q "FAIL  the table of the sticks the kit knows could not be built: Home Assistant.s USB list for zha" "$1/out" && grep -q "REFUSED" "$1/out" && [ ! -e "$1/root/usr" ] && [ ! -e "$1/kit/gen/usb-ids.json" ]' _ "$T/t3" "$RC"
+gen() { ZRADIO_USB_IDS_SOURCE="$2" python3 "$KIT/guest/lib/zradio-usb-ids.py" --out "$1" > /dev/null 2>&1; }
+mkdir -p "$T/u/src"; cp -R "$TESTS_DIR/fixtures/ha-core/." "$T/u/src/"; rm "$T/u/src/zwave_js/manifest.json"; echo old > "$T/u/ids.json"; gen "$T/u/ids.json" "$T/u/src"; RC=$?
+check "the generator: one list missing → exit 1, and the file it was to write is left as it was (no half table)" bash -c '[ "$2" = 1 ] && [ "$(cat "$1/ids.json")" = old ] && [ ! -e "$1/ids.json.tmp" ]' _ "$T/u" "$RC"
+gen "$T/u/a.json" "$TESTS_DIR/fixtures/ha-core"; gen "$T/u/b.json" "$TESTS_DIR/fixtures/ha-core"
+check "…the same sources give the same table, byte for byte" cmp -s "$T/u/a.json" "$T/u/b.json"
+
+echo "-- which kit this VM runs (the node's ./install.sh compares it at an update)"
+check "a run installs the kit's version stamp: VERSION and CONTENT, the same as the kit's gen/kit-version" bash -c 'f="$1/root/usr/local/lib/zradio/kit-version"; grep -q "^VERSION=." "$f" && grep -qE "^CONTENT=[0-9a-f]{16}$" "$f" && cmp -s "$f" "$2/gen/kit-version"' _ "$T/w" "$KIT"
+vm "$T/k1"; kitcopy "$T/k1"; mkdir -p "$T/k1/kit/gen"; cp "$KIT/gen/usb-ids.json" "$T/k1/kit/gen/"; printf 'VERSION=v9.9.9\nCONTENT=abcdefabcdefabcd\n' > "$T/k1/kit/gen/kit-version"
+TOOL="$T/k1/kit/guest/install.sh" inst "$T/k1" --conf "$T/k1/my.conf" --from-node --run
+check "run by the node: the node's stamp is the one installed (its VERSION names the download)" bash -c '[ "$2" = 0 ] && grep -q "^VERSION=v9.9.9$" "$1/root/usr/local/lib/zradio/kit-version"' _ "$T/k1" "$RC"
+vm "$T/k2"; : > "$T/k2/apt-fail"; inst "$T/k2" --conf "$T/k2/my.conf" --run
+check "a run that fails does not claim the new kit: no stamp installed" bash -c '[ "$2" != 0 ] && [ ! -e "$1/root/usr/local/lib/zradio/kit-version" ]' _ "$T/k2" "$RC"
+
+echo "-- a VM that hangs or panics comes back by itself"
+vm "$T/kp"; inst "$T/kp" --conf "$T/kp/my.conf" --run
+check "kernel.panic: the VM reboots 10 s after a panic, and the setting is applied at once" bash -c 'grep -q "^kernel.panic = 10$" "$1/root/etc/sysctl.d/90-zradio.conf" && grep -q "kernel.panic = 10 is in effect" "$1/out"' _ "$T/kp"
+check "no watchdog device here: no watchdog setting, and said" bash -c '[ ! -e "$1/root/etc/systemd/system.conf.d/90-zradio-watchdog.conf" ] && grep -q "no watchdog device" "$1/out"' _ "$T/kp"
+vm "$T/wd"; : > "$T/wd/watchdog"; ZRADIO_INSTALL_WATCHDOG="$T/wd/watchdog" inst "$T/wd" --conf "$T/wd/my.conf" --run
+check "a watchdog device: systemd feeds it (RuntimeWatchdogSec=30s), and systemd is re-executed to take it now" bash -c '[ "$2" = 0 ] && grep -q "^RuntimeWatchdogSec=30s$" "$1/root/etc/systemd/system.conf.d/90-zradio-watchdog.conf" && grep -q "^systemctl daemon-reexec" "$1/calls"' _ "$T/wd" "$RC"
+: > "$T/wd/calls"; ZRADIO_INSTALL_WATCHDOG="$T/wd/watchdog" inst "$T/wd" --run
+check "…run again: nothing changed, systemd not re-executed" bash -c '[ "$2" = 0 ] && ! grep -q "daemon-reexec" "$1/calls" && grep -q "/etc/systemd/system.conf.d/90-zradio-watchdog.conf is current" "$1/out"' _ "$T/wd" "$RC"
+finish

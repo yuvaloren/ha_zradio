@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# install.sh — one radio VM of a zradio pair on THIS Proxmox VE node. Run it as root on each of the two nodes:
+#     ./install.sh
+# It asks what it needs, shows what it would do, and does it after a yes: the VM (Debian 13), this node's Z-Wave
+# and/or Zigbee sticks passed through, the kit installed inside (through the guest agent), a watchdog that resets a
+# hung VM. No Proxmox HA: the two VMs decide between them which one serves. The VM takes its own address from DHCP; the one address
+# asked for is the floating one Home Assistant connects to. On the second node it takes the network from the first VM
+# and introduces the two to each other. On a node whose radio VM exists, the same command UPDATES that VM and the
+# pair's other one to this kit (or says they are up to date).
+#
+# Without a terminal nothing is asked: every answer is an option, and nothing is changed without --run.
+#   --answers FILE           the options below as lines of a file, KEY=value (answers.example); for unattended runs
+#   --sticks                 list this node's sticks and stop                --update NAME   which VM to update
+#   --initial-role primary|standby
+#                            primary: this node's sticks hold your networks and stay as they are.
+#                            standby: this node's sticks WILL BE WIPED by the first sync.
+#                            Only for the start: afterward the two VMs swap. (--first: a new house, no network yet)
+#   --name NAME              the VM's name (default: zradio1; the pair's second VM after the first: attic1 -> attic2)
+#   --vip A.B.C.D            the floating address: a free one of the VMs' network that DHCP does not hand out
+#   --bridge BR              the network the VMs are on (default vmbr0). The VM's own address comes from DHCP there:
+#                            RESERVE it for the VM in the DHCP server afterward (the run ends with the address).
+#   --self A.B.C.D/NN  --peer A.B.C.D  --gateway A.B.C.D  --vip A.B.C.D/NN
+#                            fixed addresses instead of DHCP: this VM, the other VM, the gateway
+#   --pair-bridge BR         a link of its own between the nodes for --self; the floating address is on it too
+#   --join NAME              the first radio VM, to pair with (found by itself when there is one);  --no-pair
+#   --start                  put the VM into the pair at the end        --run   do it
+#   more: --vrid --priority --pair-mac --usb-mapping --vmid --storage --snippets --memory --cores --disk --hookscript
+#         --ssh-keys --conf KEY=VALUE --no-usb --allow-no-radios --image-dir   (docs/DESIGN.md, "Options")
+#
+# Needs to reach GitHub: the table of known sticks is built from Home Assistant's USB lists at every run, into gen/.
+# Tests: tests/t-host.sh, t-update.sh, t-e2e.sh (Proxmox and the guests are fakes there). Not yet run on a real node.
+set -uo pipefail
+HERE=$(cd "$(dirname "$0")" && pwd)
+KIT=${ZRADIO_VM_KIT:-$HERE}
+SYS=${ZRADIO_VM_SYS:-/sys/bus/usb/devices}
+NETSYS=${ZRADIO_VM_NET:-/sys/class/net}
+PVE=${ZRADIO_VM_PVE:-/etc/pve}
+CACHE=${ZRADIO_VM_CACHE:-/var/lib/vz/template/cache}
+WAIT=${ZRADIO_VM_WAIT:-5}
+IMAGE_NAME=debian-13-generic-amd64.qcow2
+RUN=0
+NODE=$(hostname -s)
+# shellcheck source=host/lib.sh
+. "$HERE/host/lib.sh"
+
+# ----------------------------------------------------------------------------------------------------- the answers
+NAME="" ROLE="" SELF="" PEER="" VIP="" VRID="" PRIORITY="" BRIDGE="" PAIR_BRIDGE="" GATEWAY="" PAIR_MAC="" VMID="" STORAGE="" SNIP=local
+MEMORY=2048 CORES=2 DISK=8G HOOK="" KEYS=${ZRADIO_VM_KEYS:-/root/.ssh/authorized_keys} FIRST=0 START=0 NORADIOS=0 NOUSB=0
+IMAGE_DIR=https://cloud.debian.org/images/cloud/trixie/latest
+USBMAPS=() EXTRA=() STICKS=0 JOIN="" PAIR=1 PASS=() UPDATE=""
+# --answers FILE: the options as lines, KEY=value (INITIAL_ROLE=primary, SELF=…, USB_MAPPING=… once per mapping) and
+# yes/no for the ones without a value (FIRST=yes, START=yes, NO_PAIR=yes …). An option on the command line wins.
+# RUN is not an answer: nothing is changed without --run on the command line.
+A=(); F=()
+while [ $# -gt 0 ]; do if [ "$1" = --answers ]; then
+    [ -r "${2:-}" ] || die "--answers '${2:-}': no such file"
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in ''|'#'*) continue;; esac
+      [[ "$line" =~ ^([A-Z][A-Z_]*)=(.*)$ ]] || die "--answers $2: not KEY=value: $line"
+      k=${BASH_REMATCH[1]}; v=${BASH_REMATCH[2]}; o="--$(printf '%s' "$k" | tr 'A-Z_' 'a-z-')"
+      case "$k" in
+        RUN|ANSWERS|STICKS|HELP) die "--answers $2: $k is not an answer (it belongs on the command line)";;
+        FIRST|START|NO_PAIR|NO_USB|ALLOW_NO_RADIOS) case "$v" in yes) F+=("$o");; no) ;; *) die "--answers $2: $k is yes or no";; esac;;
+        *) F+=("$o" "$v");;
+      esac
+    done < "$2"; shift 2
+  else A+=("$1"); shift; fi; done
+set -- ${F[@]+"${F[@]}"} ${A[@]+"${A[@]}"}
+while [ $# -gt 0 ]; do case "$1" in
+  -h|--help) sed -n '2,/^set -uo pipefail$/{/^set -uo pipefail$/!p}' "$0"; exit 0;;
+  --sticks) STICKS=1; shift;; --run) RUN=1; shift;; --first) FIRST=1; shift;; --start) START=1; shift;; --no-pair) PAIR=0; shift;;
+  --allow-no-radios) NORADIOS=1; PASS+=("$1"); shift;; --no-usb) NOUSB=1; PASS+=("$1"); shift;;
+  --name) NAME=$2; shift 2;; --initial-role) ROLE=$2; shift 2;; --self) SELF=$2; shift 2;; --peer) PEER=$2; shift 2;; --vip) VIP=$2; shift 2;; --vrid) VRID=$2; shift 2;;
+  --priority) PRIORITY=$2; shift 2;; --bridge) BRIDGE=$2; shift 2;; --pair-bridge) PAIR_BRIDGE=$2; shift 2;; --gateway) GATEWAY=$2; shift 2;; --join) JOIN=$2; shift 2;; --update) UPDATE=$2; shift 2;;
+  --pair-mac) PAIR_MAC=$2; PASS+=("$1" "$2"); shift 2;; --vmid) VMID=$2; PASS+=("$1" "$2"); shift 2;; --storage) STORAGE=$2; PASS+=("$1" "$2"); shift 2;; --snippets) SNIP=$2; PASS+=("$1" "$2"); shift 2;;
+  --memory) MEMORY=$2; PASS+=("$1" "$2"); shift 2;; --cores) CORES=$2; PASS+=("$1" "$2"); shift 2;; --disk) DISK=$2; PASS+=("$1" "$2"); shift 2;; --hookscript) HOOK=$2; PASS+=("$1" "$2"); shift 2;;
+  --ssh-keys) KEYS=$2; PASS+=("$1" "$2"); shift 2;; --image-dir) IMAGE_DIR=$2; PASS+=("$1" "$2"); shift 2;; --usb-mapping) USBMAPS+=("$2"); PASS+=("$1" "$2"); shift 2;; --conf) EXTRA+=("$2"); PASS+=("$1" "$2"); shift 2;;
+  *) echo "unknown option: $1 (./install.sh --help)" >&2; exit 2;; esac; done
+[ "$(id -u)" = 0 ] || die "run as root on the Proxmox node"
+command -v qm >/dev/null 2>&1 && command -v pvesh >/dev/null 2>&1 || die "no qm / pvesh here: this runs on a Proxmox VE node"
+for f in install.sh sbin/zradio-serve lib/zradio-common.sh lib/zradio-usb-ids.py lib/usb-annotations.json units/zradio.target; do [ -r "$KIT/guest/$f" ] || die "the kit's guest/$f is missing next to this script"; done
+# The table of sticks the kit knows is not kept in git: it is built here, at every run, into the kit's own gen/ folder
+# (the only place the kit writes what it generates), from Home Assistant's USB lists at the commit the kit pins and the
+# kit's notes on each stick. The VM gets it inside the kit (step 3).
+GEN="$KIT/gen"; TABLE="$GEN/usb-ids.json"
+mkdir -p "$GEN" || die "cannot make $GEN (the kit's folder for what it generates)"
+IDS_SAID=$(python3 "$KIT/guest/lib/zradio-usb-ids.py" --out "$TABLE" 2>&1) \
+  || die "the table of the sticks the kit knows could not be built: $(printf '%s\n' "$IDS_SAID" | grep -m1 FAIL | sed 's/^FAIL  //'). It is built from Home Assistant's USB lists on GitHub: this node has to reach raw.githubusercontent.com"
+TABLE_SAID=$(printf '%s\n' "$IDS_SAID" | sed -n 's/^usb-ids.json: //p')
+bash "$KIT/guest/lib/zradio-kit-stamp.sh" "$KIT" || die "could not stamp the kit's version (guest/lib/zradio-kit-stamp.sh)"
+KIT_VERSION=$(kv VERSION "$(cat "$GEN/kit-version")"); KIT_CONTENT=$(kv CONTENT "$(cat "$GEN/kit-version")")
+if [ $STICKS = 1 ]; then
+  echo "The sticks on $NODE that the kit knows (the VM itself finds out which is what):"
+  show_sticks || { echo "      none. A stick the kit's table does not know can still be passed through: make a USB mapping for it and use --usb-mapping."; exit 1; }
+  exit 0
+fi
+
+VMS=$(vm_lines)
+
+# A radio VM of the kit on this node already (and no --name for another one): this run updates it, and the pair's
+# other VM, instead of building one. --update NAME says which, where there are several.
+MINE=$(kit_vms here)
+if [ -n "$UPDATE" ] || { [ -n "$MINE" ] && [ $NOUSB = 0 ] && { [ -z "$NAME" ] || printf '%s\n' "$MINE" | awk -v n="$NAME" '$2 == n { f = 1 } END { exit !f }'; }; }; then
+  # shellcheck source=host/update.sh
+  . "$HERE/host/update.sh"
+else
+  # shellcheck source=host/new-vm.sh
+  . "$HERE/host/new-vm.sh"
+fi

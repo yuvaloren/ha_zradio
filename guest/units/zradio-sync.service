@@ -1,0 +1,10 @@
+# zradio-sync.service — one sync of the standby radio VM's sticks from the active's (zradio-sync run). Started by
+# zradio-sync.timer every night on BOTH radio VMs: on the one that is not the active it exits 0 at once.
+# Installed by guest/install.sh.
+[Unit]
+Description=zradio: sync the standby's sticks from the active's
+After=keepalived.service
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/zradio-sync run --reason nightly
+TimeoutStartSec=900

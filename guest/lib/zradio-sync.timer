@@ -1,0 +1,11 @@
+# zradio-sync.timer — the nightly sync of the standby's sticks. Rendered by guest/install.sh (zradio-render --timer)
+# from SYNC_AT and SYNC_TZ of /etc/zradio/zradio.conf; enabled on both radio VMs (the standby's run ends at once).
+# Pick a time when nothing else reads the radios: a sync pauses them for about 12 s.
+[Unit]
+Description=zradio: nightly sync of the standby's sticks
+[Timer]
+OnCalendar=*-*-* @SYNC_AT@:00@SYNC_TZ@
+AccuracySec=1s
+Persistent=false
+[Install]
+WantedBy=timers.target

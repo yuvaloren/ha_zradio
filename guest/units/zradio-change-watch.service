@@ -1,0 +1,12 @@
+# zradio-change-watch.service — zradio-change-watch: notices a Z-Wave / Zigbee device being added or removed (in
+# the packets Home Assistant sends to the sticks' ports; it never connects to them) and syncs the standby five quiet
+# minutes later. Runs on both radio VMs; only the active sees anything. Installed by guest/install.sh.
+[Unit]
+Description=zradio: sync the standby after a device is added or removed
+After=network-online.target
+[Service]
+ExecStart=/usr/bin/python3 /usr/local/sbin/zradio-change-watch run
+Restart=always
+RestartSec=5
+[Install]
+WantedBy=multi-user.target

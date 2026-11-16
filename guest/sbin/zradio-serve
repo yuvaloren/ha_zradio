@@ -1,0 +1,207 @@
+#!/usr/bin/env bash
+# zradio-serve — a radio VM's two roles: serving this node's sticks to Home Assistant, or standing by with them silent.
+# Runs INSIDE a radio VM as root. zradio-serve.service runs `up` and `down`; keepalived's notify (zradio-notify) starts
+# and stops that unit. The floating ADDRESS is keepalived's, never this script's.
+#
+#   zradio-serve up       serve: the Z-Wave receiver on, then ser2net. A new turn drops this VM's sync records
+#                         (synced.json, last-sync.json), so zradio-sync's tick syncs the peer once in every turn.
+#   zradio-serve down     stand by, silent: ser2net stopped, the Z-Wave receiver off, the Zigbee coordinator reset.
+#                         Also at boot, before keepalived (zradio-quiet.service): a stick powers up listening.
+#   zradio-serve hush     a standby silenced again: the receiver off; the coordinator reset only if it runs a network.
+#                         On every BACKUP (zradio-hush.service) and every 15 min (zradio-sync tick): a stick that
+#                         re-enumerates comes back listening. Nothing is done on a VM that serves, is about to, or is
+#                         being written to.
+#   zradio-serve check    keepalived's health check: exit 0 = this VM may hold the address
+#   zradio-serve status   the role as it is: ser2net, the ttys, the markers
+#
+# What is done to a stick depends on its level in radios.conf (zradio-detect): `synced` sticks are switched as above;
+# a `served` stick is never touched (the kit has no proven way to silence it: the standby's must hold no network).
+# Measured on the reference sticks: with SetRFReceiveMode off a Z-Wave stick hears nothing (it survives a soft reset,
+# not a power cycle); a reset Z-Stack coordinator stays off the air until a host starts it (state 8 or 9 after the
+# reset = it started by itself: a second coordinator on the air, said loudly).
+#
+# check fails (keepalived: FAULT, the address goes to the peer) when: radios.conf names no radio, or a stick's tty is
+# missing; no interface holds SELF (an address from DHCP that changed: the peer cannot hear this VM); a set is being
+# written or was not written to the end (applying, standby-dirty); a stick stopped answering (stick-wedged); `up`
+# failed less than $FAILED_FOR s ago (serve-failed); or the election's gate holds this VM (boot-wait, hold: ELECTION=act).
+# A serving turn is `confirmed` or `provisional` ($RUN/turn): provisional when, in act mode, this VM serves without
+# knowing that nobody is ahead of it (outdated, or nobody answered at boot); it never advances the version.
+# up, down and hush hold the sticks lock (zr_sticks_lock), as do zradio-sync's read and a standby's marking before a
+# write: one runs at a time, and whatever comes later has the last word.
+# Journal lines: `zradio: event=serve result=…`. Tests: tests/t-serve.sh. Env: ZRADIO_SERVE_*, ZRADIO_RADIOS.
+set -uo pipefail
+MODE=${1:-}
+LIB=${ZRADIO_LIB:-$(cd "$(dirname "$0")/../lib" 2>/dev/null && pwd)}; [ -r "$LIB/zradio-common.sh" ] || LIB=/usr/local/lib/zradio
+# shellcheck source=../lib/zradio-common.sh
+. "$LIB/zradio-common.sh" || exit 2
+SYSTEMCTL=${ZRADIO_SERVE_SYSTEMCTL:-systemctl}
+PROBE=${ZRADIO_SERVE_PROBE:-$LIB/zradio-probe.py}
+# shellcheck disable=SC2034  # LOGGER and RUN are read by zradio-common.sh (zr_log, zr_markers)
+LOGGER=${ZRADIO_SERVE_LOGGER:-logger}
+# shellcheck disable=SC2034
+RUN=${ZRADIO_SERVE_RUN:-/run/zradio}
+STATE=${ZRADIO_SERVE_STATE:-/var/lib/zradio}
+ZR_RF_TRIES=${ZRADIO_SERVE_TRIES:-$ZR_RF_TRIES}
+ZR_RF_PAUSE=${ZRADIO_SERVE_PAUSE:-$ZR_RF_PAUSE}
+FAILED_FOR=${ZRADIO_SERVE_HOLD:-300}  # s a failed `up` keeps this VM out of the election (or it would claim every few s)
+GATE_SLACK=240                     # s a boot-wait may outlive ELECTION_WAIT: the gate's last look (a peer hello, a
+                                   # Zigbee counter raise) can run past the wait; older = the gate died
+ZIGBEE_RUNNING="8|9"               # Z-Stack device states StartingAsCoordinator, StartedAsCoordinator
+zr_markers
+RADIOS_OK=1; zr_load_radios || RADIOS_OK=0
+ZW=${ZRADIO_SERVE_ZWAVE_TTY:-$ZWAVE_TTY}
+ZB=${ZRADIO_SERVE_ZIGBEE_TTY:-$ZIGBEE_TTY}
+
+say() { zr_say serve "$@"; }
+ERR=$(mktemp) || exit 1; trap 'rm -f "$ERR"' EXIT
+probe_json() { python3 "$PROBE" "$@" --json 2>"$ERR"; }
+why() { grep -E '^   FAIL' "$ERR" | head -1 | cut -c1-160; }
+receiver() { zr_receiver "$1" "$ZW" "$ERR"; }
+age_of() { local m; m=$(stat -c %Y "$1" 2>/dev/null) || { echo 999999; return; }; echo $(( $(date +%s) - m )); }
+ttys() { zr_has zwave && printf '%s\n' "$ZW"; zr_has zigbee && printf '%s\n' "$ZB"; return 0; }   # the ttys this VM must have
+missing() { local t out=""; while IFS= read -r t; do [ -e "$t" ] || out="$out $t"; done < <(ttys); printf '%s' "${out# }"; }
+served_only() {
+  local out=""
+  zr_has zwave served && out="Z-Wave ($ZWAVE_FAMILY)"
+  zr_has zigbee served && out="${out:+$out and }Zigbee ($ZIGBEE_FAMILY)"
+  printf '%s' "$out"
+}
+need_radios() { # up / check: a radios.conf that names at least one radio
+  [ $RADIOS_OK = 1 ] || { WHY="step=radios — $ZR_ERR"; return 1; }
+  zr_has zwave || zr_has zigbee || { WHY="step=radios — $ZR_RADIOS names no radio (ZWAVE=none, ZIGBEE=none)"; return 1; }
+}
+fail_up() { : > "$FAILED"; say failed "$1"; exit 1; }   # fail_up <text>: not serving, out of the election for $FAILED_FOR s
+sticks_lock() {
+  zr_sticks_lock || { say loud "step=lock — the sticks were held for more than $ZR_LOCK_WAIT s (another zradio-serve, or a sync)"; exit 1; }
+}
+master_or_serving() { zr_serving || [ "$(zr_role)" = MASTER ]; }
+
+case "$MODE" in
+up)
+  zr_need_root
+  sticks_lock
+  if zr_serving; then rm -f "$FAILED"; say up-already "ser2net is active: this VM serves already — nothing done"; exit 0; fi
+  need_radios || fail_up "$WHY: not serving"
+  gone=$(missing)
+  [ -z "$gone" ] || fail_up "step=tty — no $gone: a stick is gone; not serving"
+  [ ! -e "$WEDGED" ] || fail_up "step=wedged — $WEDGED ($(cat "$WEDGED" 2>/dev/null)): a stick here stopped answering; not serving until \
+the sticks answer a probe (zradio-serve hush tries; a hung stick wants a power cycle: stop and start this VM)"
+  [ ! -e "$DIRTY" ] || fail_up "step=dirty — $DIRTY: a synced image was not written to the end on these sticks; not serving \
+(zradio-sync reapply, or a new sync, clears it)"
+  if zr_has zwave synced && ! receiver on; then
+    fail_up "step=zwave-receiver — SetRFReceiveMode on did not answer in $ZR_RF_TRIES tries ($(why)): not serving, out of the election for $FAILED_FOR s"
+  fi
+  # the kind of turn is written BEFORE the ports open: the peer never sees a serving VM without one
+  turn=confirmed
+  if zr_load_conf 2>/dev/null && [ "$ELECTION" = act ] && { [ -e "$OUTDATED" ] || [ -e "$ALONE" ]; }; then turn=provisional; fi
+  echo "$turn" > "$TURN_F"
+  if ! "$SYSTEMCTL" start ser2net || ! zr_serving; then
+    rm -f "$TURN_F"; fail_up "step=ser2net — ser2net did not start: not serving, out of the election for $FAILED_FOR s"
+  fi
+  # a new turn: these sticks are no longer "a copy of sync X" (synced.json), and what this VM sent in an earlier turn
+  # (last-sync.json) says nothing about the peer now. With both gone, the tick syncs the peer once in this turn — the
+  # sync that lifts the returning VM's Zigbee frame counter above this one's.
+  rm -f "$STATE/synced.json" "$STATE/last-sync.json" "$FAILED"
+  if [ $turn = provisional ]; then
+    if [ -e "$OUTDATED" ]; then why_p="it is outdated: $(cat "$OUTDATED" 2>/dev/null)"; else why_p="the peer did not answer at boot"; fi
+    say provisional "this VM serves without knowing that it holds the newest networks ($why_p): its version does not advance, \
+and a more advanced peer takes the radios back when it returns"
+  fi
+  if zr_has zwave synced; then say up "the Z-Wave receiver is on and ser2net is started — Home Assistant connects (ZHA starts the coordinator)"
+  else say up "ser2net is started — Home Assistant connects"; fi
+  exit 0;;
+
+down)
+  zr_need_root
+  sticks_lock; rc=0; gone=""; did=""
+  rm -f "$TURN_F" "$WOULD_TURN"
+  if zr_serving; then "$SYSTEMCTL" stop ser2net || true; fi
+  if zr_serving; then say loud "step=ser2net — ser2net did not stop: this VM still answers Home Assistant"; exit 1; fi
+  [ $RADIOS_OK = 1 ] || { say down-partial "ser2net is stopped; $ZR_ERR: no stick is known here, none was silenced"; exit 0; }
+  if zr_has zwave synced; then
+    if [ ! -e "$ZW" ]; then gone="$gone $ZW"
+    elif receiver off; then did="$did, the Z-Wave receiver is off"
+    else say loud "step=zwave-receiver — SetRFReceiveMode off did not answer in $ZR_RF_TRIES tries ($(why)): this stick still listens to the mesh"; rc=1; fi
+  fi
+  if zr_has zigbee synced; then
+    if [ ! -e "$ZB" ]; then gone="$gone $ZB"
+    elif ! J=$(probe_json --zigbee "$ZB" --zigbee-reset); then
+      say loud "step=zigbee — the coordinator reset did not answer ($(why)): its state is unknown"; rc=1
+    else
+      st=$(zr_json - zigbee.device_state <<<"$J")
+      if [[ "$st" =~ ^($ZIGBEE_RUNNING)$ ]]; then
+        say loud "step=zigbee — the coordinator is in state $(zr_json - zigbee.device_state_name <<<"$J") ($st) after the reset: \
+it runs the network by itself, a second coordinator is on the air"; rc=1
+      else did="$did, the coordinator is reset"; fi
+    fi
+  fi
+  so=$(served_only); [ -z "$so" ] || did="$did; $so is served only: not touched (its standby stick must hold no network)"
+  if [ $rc = 0 ] && [ -z "$gone" ]; then say down "ser2net is stopped$did — silent standby"
+  elif [ $rc = 0 ]; then say down-partial "ser2net is stopped; no tty for$gone: that stick could not be silenced (hush does it when the tty is back)"; fi
+  exit $rc;;
+
+hush)
+  zr_need_root
+  if master_or_serving; then echo "this VM serves or is about to — nothing to hush"; exit 0; fi
+  [ $RADIOS_OK = 1 ] || { echo "$ZR_ERR — nothing to hush"; exit 0; }
+  sticks_lock
+  # again under the lock: an up that ran meanwhile has the last word, and a write that has begun is not disturbed
+  if master_or_serving; then echo "this VM serves — nothing to hush"; exit 0; fi
+  if [ -e "$APPLYING" ]; then echo "a synced set is being written — nothing to hush"; exit 0; fi
+  rc=0
+  if zr_has zwave synced && [ -e "$ZW" ] && ! receiver off; then
+    say loud "step=zwave-receiver — hush: SetRFReceiveMode off did not answer in $ZR_RF_TRIES tries ($(why)): this standby stick may listen to the mesh"; rc=1
+  fi
+  if zr_has zigbee synced && [ -e "$ZB" ]; then
+    if ! J=$(probe_json --zigbee "$ZB"); then say loud "step=zigbee — hush: the coordinator did not answer a read ($(why))"; rc=1
+    else
+      st=$(zr_json - zigbee.device_state <<<"$J")
+      if [[ "$st" =~ ^($ZIGBEE_RUNNING)$ ]]; then
+        say loud "step=zigbee — hush: the standby's coordinator runs the network (state $st): reset now"
+        probe_json --zigbee "$ZB" --zigbee-reset >/dev/null || rc=1
+      fi
+    fi
+  fi
+  if [ -e "$WEDGED" ]; then
+    if [ $rc = 0 ] && [ -z "$(missing)" ]; then
+      rm -f "$WEDGED"; say unwedged "both sticks answer again: stick-wedged is removed, this VM may stand by and serve"
+    else echo "stick-wedged stays: a stick still does not answer (a hung stick wants a power cycle: stop and start this VM)"; fi
+  fi
+  [ $rc = 0 ] && echo "hush: the receiver is off, the coordinator is not on the air"
+  exit $rc;;
+
+check)
+  need_radios || exit 1
+  [ -z "$(missing)" ] || exit 1
+  if zr_load_conf 2>/dev/null; then zr_holds_self || exit 1; fi    # (ELECTION_WAIT keeps its default without a conf)
+  for m in "$APPLYING" "$DIRTY" "$WEDGED" "$HOLD"; do [ ! -e "$m" ] || exit 1; done
+  [ -e "$BOOT_WAIT" ] && [ "$(age_of "$BOOT_WAIT")" -lt $((ELECTION_WAIT + GATE_SLACK)) ] && exit 1
+  [ -e "$FAILED" ] && [ "$(age_of "$FAILED")" -lt "$FAILED_FOR" ] && exit 1
+  exit 0;;
+
+status)
+  zr_serving && echo "ser2net: active (serving)" || echo "ser2net: not active (standby)"
+  if [ $RADIOS_OK = 1 ]; then
+    echo "radios: Z-Wave $ZWAVE${ZWAVE_FAMILY:+ ($ZWAVE_FAMILY)}, Zigbee $ZIGBEE${ZIGBEE_FAMILY:+ ($ZIGBEE_FAMILY)}"
+    while IFS= read -r t; do [ -e "$t" ] && echo "tty: $t present" || echo "tty: $t MISSING"; done < <(ttys)
+  else echo "radios: $ZR_ERR"; fi
+  [ -e "$APPLYING" ] && echo "marker: $APPLYING (a synced image is being written)"
+  [ -e "$DIRTY" ] && echo "marker: $DIRTY (a synced image was not written to the end: this VM may not serve)"
+  [ -e "$WEDGED" ] && echo "marker: $WEDGED ($(cat "$WEDGED" 2>/dev/null): a stick stopped answering; this VM may not serve until the sticks answer a probe)"
+  [ -e "$FAILED" ] && echo "marker: $FAILED ($(age_of "$FAILED") s old; holds this VM out for $FAILED_FOR s)"
+  [ -e "$BOOT_WAIT" ] && echo "marker: $BOOT_WAIT (asking the peer who holds the newer networks before this VM may claim)"
+  [ -e "$HOLD" ] && echo "marker: $HOLD (this VM holds an older copy: it may serve only after the peer has been silent for the standard wait)"
+  if zr_load_conf 2>/dev/null; then
+    zr_holds_self || echo "address: this VM does not hold its address $SELF any more (it holds ${ZR_HOLDS:-none}): the other VM cannot hear it, \
+so it does not serve. An address from DHCP that changed: give this VM $SELF back (a reservation in the DHCP server), or pair the two again on the new one"
+    [ -n "$PEER" ] || echo "peer: none yet (the pair's other VM is not installed: this VM holds the floating address alone)"
+  fi
+  [ -e "$OUTDATED" ] && echo "outdated: the peer was ahead ($(cat "$OUTDATED" 2>/dev/null)); a sync clears this"
+  zr_version_read "$STATE"; echo "version: term $ZR_TERM, used $ZR_USED$([ -f "$TURN_F" ] && echo "; this turn is $(cat "$TURN_F")")"
+  [ -f "$ROLE_F" ] && echo "keepalived's last word: $(cat "$ROLE_F")"
+  exit 0;;
+
+-h|--help) sed -n '2,/^set -uo pipefail$/{/^set -uo pipefail$/!p}' "$0"; exit 0;;
+
+*) echo "usage: zradio-serve up|down|hush|check|status (--help)" >&2; exit 2;;
+esac
