@@ -72,16 +72,48 @@ Both nodes must reach that machine on TCP port 5403. The node of step 2 also nee
 ## Connecting Home Assistant
 
 Home Assistant connects to the floating address, never to a VM: whichever VM serves holds it. The installer's last
-lines give the two addresses. Home Assistant's host must reach them, and each port takes one client at a time.
+lines give the two addresses, and a line for Home Assistant's terminal. Home Assistant's host must reach the
+addresses, and each port takes one client at a time.
 
-**Z-Wave.** Home Assistant's Z-Wave integration talks to a Z-Wave JS server, and that server opens the stick. In the
-server (the Z-Wave JS UI app or container), set the serial port to `tcp://<floating address>:6639` and keep your
-network's S0/S2 keys. The Z-Wave integration then connects to the server as usual. The port is neither
-authenticated nor encrypted: keep it on a trusted network.
+**What to set, for your Home Assistant.** In Home Assistant's terminal (Settings > Apps > Terminal & SSH; "Add-ons"
+in older versions), the kit's install line:
 
-**Zigbee (ZHA).** A new setup: add Zigbee Home Automation, choose manual setup if asked, radio type ZNP (TI CC2652)
-or EZSP (Silicon Labs), serial path `socket://<floating address>:6638`, 115200 baud. ZHA that used a stick on its
-own machine: "Migrate radio", manual setup, the same `socket://` address. The stick already holds the network.
+```
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/yuvaloren/ha_zradio/main/get.sh)" _ --radios <floating address>
+```
+
+Without `--radios` it looks for the address in Home Assistant's own settings (ZHA or the Z-Wave JS app may use it
+already) and asks. If you do not know the address: the install line on either Proxmox node says how the pair is and
+ends with this line, the address filled in; and each radio VM's Notes in Proxmox name it. It does not search the
+network for the pair: the pair's two ports are all that would answer, and touching them cuts Home Assistant off.
+
+It installs nothing and changes nothing. It reads how Home Assistant's Z-Wave and Zigbee are connected now, and says
+`OK`, or the steps for your setup, with the names of the menus (Home Assistant 2026.11's). Run it again afterward
+and it checks them. It does not do the steps for you: Home Assistant changes these paths only in its own dialogs,
+which stop the integration and try the stick before they save.
+
+The same steps by hand:
+
+**Zigbee (ZHA).** The path is `socket://<floating address>:6638`.
+
+- ZHA that used a stick on its own machine, with that stick now in the pair: Settings > Devices & services > Zigbee
+  Home Automation > Configure > "Change the current adapter's settings" (not "Migrate to a new adapter"), and type
+  the path as the serial device path. If it asks how to migrate: "Migrate manually", then "Keep adapter network
+  settings". The stick already holds the network.
+- A new ZHA: Add integration > Zigbee Home Automation, and the same path. With sticks that hold your network, choose
+  "Set up manually", then "Keep adapter network settings". "Set up automatically" erases the stick and creates a new
+  network: that one is for a new house.
+
+**Z-Wave.** Home Assistant's Z-Wave integration talks to a Z-Wave JS server, and that server opens the stick. The
+path is `tcp://<floating address>:6639`; your network's S0/S2 keys stay as they are.
+
+- Z-Wave JS UI (the app, or a container of your own): in its own page, Settings > Z-Wave > Serial Port. The Z-Wave
+  integration itself needs no change. The install line above cannot look into this server; it says so.
+- Home Assistant's own Z-Wave JS app: Settings > Devices & services > Z-Wave > the three dots > Reconfigure >
+  "Reconfigure the current adapter" > USB: "Use Socket", and the path as the socket device path.
+
+The ports are neither authenticated nor encrypted: keep them on a trusted network. The reference pair runs ZHA and
+Z-Wave JS UI; the Z-Wave JS app's socket path has not been run with the kit.
 
 **Replacing a pair you already have:** give the new pair the same floating address and ports, and Home Assistant
 needs no change. It reconnects by itself.
@@ -122,7 +154,8 @@ Measured on the pair this kit was extracted from (about 50 Z-Wave nodes):
 - Versions: a release is a git tag; the installers stamp each VM with the kit it runs (docs/DESIGN.md, "Updating").
 - Tests: `bash tests/run.sh` on Linux, `bash tests/docker.sh` anywhere else (macOS lacks the GNU tools they need).
   No hardware needed; they also run on every push (`.github/workflows/tests.yml`). `bash tests/vote-real.sh` (needs
-  docker) tests the third vote's container with the real programs.
+  docker) tests the third vote's container with the real programs, and `bash tests/hass-real.sh` Home Assistant's
+  side on the kind of machine its terminal is.
 - To see the install without a Proxmox node: `tests/try.sh` (needs docker) is a shell on a pretend two-node cluster
   where `./install.sh` asks and prints what it would on a real one. Proxmox, the VMs and the sticks are fakes.
 - MIT. The list of known sticks is built at install time from Home Assistant core's USB lists (Apache-2.0); the

@@ -459,6 +459,6 @@ if [ $DHCP = 1 ]; then
   echo "   In your DHCP server (the router): RESERVE $VSELF for $NAME${VMAC:+ (MAC $VMAC)}, and keep ${VIP%/*} out of the range it hands out."
   echo "   The pair knows $NAME by $VSELF: a VM whose address changes stops serving until it has that address back."
 fi
-echo "   In Home Assistant:$(has_kind "$ZW" && echo "  Z-Wave JS → tcp://${VIP%/*}:$zp")$(has_kind "$ZB" && echo "  ZHA → socket://${VIP%/*}:$gp")"
+ha_lines "${VIP%/*}" "$zp" "$gp" "$(has_kind "$ZW" && echo 1 || echo 0)" "$(has_kind "$ZB" && echo 1 || echo 0)"
 echo "   Who serves, and why: qm guest exec $VMID -- zradio-serve status"
 exit 0

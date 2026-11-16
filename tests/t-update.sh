@@ -46,6 +46,7 @@ echo "-- the same again: up to date"
 check "up to date: said, exit 0, nothing sent, no installer run" bash -c '[ "$2" = 0 ] && grep -q "^== up to date: attic1 attic2 run " "$1/out" && grep -q "OK    attic1 on nodea runs this kit already" "$1/out" && [ "$(pieces "$1")" = 0 ] && ! grep -q "guest/install.sh" "$1/calls"' _ "$T/a" "$RC"
 sed -i 's/^VERSION=.*/VERSION=something-else/' "$T/a/g/109/root/usr/local/lib/zradio/kit-version"; zvm "$T/a"
 check "the same files under another version name: still up to date (CONTENT decides, not VERSION)" bash -c 'grep -q "^== up to date" "$1/out"' _ "$T/a"
+check "…and it ends with where Home Assistant connects and the line for Home Assistant's terminal: the pair's floating address, looked up in the VM" bash -c 'grep -q "^   In Home Assistant:  Z-Wave JS → tcp://192.168.1.20:6639  ZHA → socket://192.168.1.20:6638$" "$1/out" && [ "$(tail -1 "$1/out")" = "      bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/yuvaloren/ha_zradio/main/get.sh)\" _ --radios 192.168.1.20" ]' _ "$T/a"
 sed -i 's/^CONTENT=.*/CONTENT=1111111111111111/' "$T/a/g/110/root/usr/local/lib/zradio/kit-version"; : > "$T/a/calls"; zvm "$T/a" --run
 check "one VM with other files: only that one is updated" bash -c '[ "$2" = 0 ] && grep -q "^== attic2 on nodeb ==" "$1/out" && ! grep -q "^== attic1 on nodea ==" "$1/out" && [ "$(grep -c "guest/install.sh --from-node --run" "$1/calls")" = 1 ]' _ "$T/a" "$RC"
 

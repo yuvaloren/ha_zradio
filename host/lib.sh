@@ -185,7 +185,16 @@ run_guest_installer() { # run_guest_installer <node> <vmid> <name> <command>: th
 vm_kit() { # vm_kit <node> <vmid>: "VERSION=…", "CONTENT=…" of the kit installed in the VM (none: a kit from before
   # versions were kept), and SERVING=yes|no (it holds the floating address now)
   # shellcheck disable=SC2016  # the script runs in the VM
+  # and where Home Assistant connects: HA_VIP, HA_ZWAVE_PORT, HA_ZIGBEE_PORT (empty: the usual one), HA_ZWAVE, HA_ZIGBEE (none: no such stick)
   gx "$1" "$2" 20 'cat /usr/local/lib/zradio/kit-version 2>/dev/null; v=$(sed -n "s/^VIP=//p" /etc/zradio/zradio.conf 2>/dev/null | tail -1)
-    if [ -n "$v" ] && ip -o -4 addr show 2>/dev/null | grep -q " inet ${v%/*}/"; then echo SERVING=yes; else echo SERVING=no; fi'
+    if [ -n "$v" ] && ip -o -4 addr show 2>/dev/null | grep -q " inet ${v%/*}/"; then echo SERVING=yes; else echo SERVING=no; fi
+    echo "HA_VIP=${v%/*}"; for k in ZWAVE_PORT ZIGBEE_PORT; do echo "HA_$k=$(sed -n "s/^$k=//p" /etc/zradio/zradio.conf 2>/dev/null | tail -1)"; done
+    for k in ZWAVE ZIGBEE; do echo "HA_$k=$(sed -n "s/^$k=//p" /etc/zradio/radios.conf 2>/dev/null | tail -1)"; done'
+}
+ha_lines() { # ha_lines <floating address> <Z-Wave port> <Zigbee port> <Z-Wave stick: 1|0> <Zigbee stick: 1|0>: where Home
+  # Assistant connects, and the kit's line for Home Assistant's terminal (homeassistant/install.sh) with the address in it
+  echo "   In Home Assistant:$([ "$4" = 1 ] && echo "  Z-Wave JS → tcp://$1:$2")$([ "$5" = 1 ] && echo "  ZHA → socket://$1:$3")"
+  echo "   What to set where, for your Home Assistant: this line in Home Assistant's terminal (Settings > Apps > Terminal & SSH):"
+  echo "      bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/yuvaloren/ha_zradio/main/get.sh)\" _ --radios $1$([ "$2" = 6639 ] || echo " --zwave-port $2")$([ "$3" = 6638 ] || echo " --zigbee-port $3")$([ "$4" = 1 ] || echo " --no-zwave")$([ "$5" = 1 ] || echo " --no-zigbee")"
 }
 kv() { printf '%s\n' "$2" | sed -n "s/^$1=//p" | tail -1 | tr -dc 'A-Za-z0-9./@:_+-'; }     # kv <KEY> <text of KEY=value lines>

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # get.sh — ha_zradio onto this machine, then its installer. The one line to paste, as root, on each Proxmox node (a
-# radio VM there) and, for a cluster's third vote, on the third machine (install.sh sees which of the two it is on):
+# radio VM there), for a cluster's third vote on the third machine, and in Home Assistant's terminal (what to set
+# there, so that it uses the pair). install.sh sees which of the three it is on:
 #
 #     bash -c "$(curl -fsSL https://raw.githubusercontent.com/yuvaloren/ha_zradio/main/get.sh)"
 #
@@ -18,13 +19,13 @@ API=${ZRADIO_GITHUB_API:-https://api.github.com}
 DEST=${ZRADIO_DEST:-/opt/ha_zradio}
 die() { echo "get.sh: $*" >&2; exit 2; }
 [ "$(id -u)" = 0 ] || die "run this as root: the installer builds a VM on a Proxmox node, or sets up the cluster's third vote on another machine"
-command -v curl >/dev/null 2>&1 && command -v tar >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1 || die "needs curl, tar and python3 (a Proxmox node has all three; so has a Debian machine, and a NAS as a rule)"
+command -v curl >/dev/null 2>&1 && command -v tar >/dev/null 2>&1 || die "needs curl and tar"      # no python here: Home Assistant's terminal has none
 # the folder this script replaces things in: one of its own, never a system path
 [[ "$DEST" =~ ^/[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)+$ ]] || die "ZRADIO_DEST '$DEST': an absolute path at least two levels deep"
 
 REF=${ZRADIO_REF:-} RELEASE=""
 if [ -z "$REF" ]; then          # the latest release; a repository without one: main
-  RELEASE=$(curl -fsSL "$API/repos/$REPO/releases/latest" 2>/dev/null | python3 -c 'import json, sys; print(json.load(sys.stdin)["tag_name"])' 2>/dev/null) || RELEASE=""
+  RELEASE=$(curl -fsSL "$API/repos/$REPO/releases/latest" 2>/dev/null | tr -d '\n' | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p') || RELEASE=""
   REF=${RELEASE:-main}
 fi
 [[ "$REF" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$ ]] && [[ "$REF" != *..* ]] || die "ZRADIO_REF '$REF': a tag or a branch name"
@@ -40,7 +41,7 @@ curl -fsSL "$URL" -o "$TMP/kit.tgz" || die "the download failed: $URL"
 mkdir "$TMP/kit" && tar -xzf "$TMP/kit.tgz" -C "$TMP/kit" --strip-components=1 2>/dev/null || die "$URL is not a tar.gz archive"
 [ -f "$TMP/kit/install.sh" ] && [ -f "$TMP/kit/guest/install.sh" ] || die "$URL holds no install.sh and guest/: not the kit"
 # the commit the archive was made from (GitHub writes it into the archive's header)
-SHA=$(python3 -c 'import sys, tarfile; print(tarfile.open(sys.argv[1]).pax_headers.get("comment", "")[:12])' "$TMP/kit.tgz" 2>/dev/null)
+SHA=$(gzip -dc "$TMP/kit.tgz" 2>/dev/null | head -c 2048 | LC_ALL=C tr -d '\000' | LC_ALL=C sed -n 's/.*comment=\([0-9a-f]\{40\}\).*/\1/p' | head -n 1 | cut -c1-12)
 # the kit's version, for its installers (guest/lib/zradio-kit-stamp.sh): a release by its tag, anything else as
 # <tag or branch>@<commit>. Into the kit's gen/, the folder for what is generated and never kept in git.
 mkdir -p "$TMP/kit/gen" && printf '%s\n' "$([ "$REF" = "$RELEASE" ] && echo "$REF" || echo "$REF${SHA:+@${SHA:0:7}}")" > "$TMP/kit/gen/version" \

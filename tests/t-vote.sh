@@ -235,5 +235,5 @@ cluster "$T/r11"; rm "$T/r11/pve/corosync.conf"; tv "$T/r11" "${V[@]}"
 check "a node in no cluster: exit 2, said" bash -c '[ "$2" = 2 ] && grep -q "this node is in no cluster" "$1/out"' _ "$T/r11" "$RC"
 
 echo "-- the kit names no file that is not in it"
-check "every host/*.sh and vote/*.sh a script or a document names exists" bash -c 'cd "$1" && ! grep -rhoE "\b(host|vote)/[a-z0-9-]+\.sh\b" --include="*.sh" --include="*.md" --include="*.example" . | sort -u | while read -r f; do [ -f "$f" ] || echo "$f"; done | grep .' _ "$KIT"
+check "every host/*.sh, vote/*.sh and homeassistant/*.sh a script or a document names exists" bash -c 'cd "$1" && ! grep -rhoE "\b(host|vote|homeassistant)/[a-z0-9-]+\.sh\b" --include="*.sh" --include="*.md" --include="*.example" . | sort -u | while read -r f; do [ -f "$f" ] || echo "$f"; done | grep .' _ "$KIT"
 finish

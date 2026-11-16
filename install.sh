@@ -42,10 +42,18 @@ WAIT=${ZRADIO_VM_WAIT:-5}
 IMAGE_NAME=debian-13-generic-amd64.qcow2
 RUN=0
 NODE=$(hostname -s)
-# Not a Proxmox node: the one thing the kit installs on any other machine is a cluster's third vote (vote/install.sh).
-# So the same line, and the same command, serve on all three machines.
+# Not a Proxmox node. Home Assistant (its terminal app, or its settings are here, or --radios names a pair): what to
+# set there so that it uses the pair (homeassistant/install.sh). Any other machine: the one thing the kit installs
+# there is a cluster's third vote (vote/install.sh). So the same line, and the same command, serve on every machine.
 if ! { command -v qm >/dev/null 2>&1 && command -v pvesh >/dev/null 2>&1; }; then
   case " $* " in *" -h "*|*" --help "*) ;; *)
+    if [ -n "${SUPERVISOR_TOKEN:-}" ] || [ -f /config/.storage/core.config_entries ] || [ -f /homeassistant/.storage/core.config_entries ] \
+       || [[ " $* " == *" --radios "* ]] || [[ " $* " == *" --config "* ]]; then
+      echo "This is Home Assistant, not a Proxmox node. The kit installs nothing here: it looks at how Home Assistant's"
+      echo "Z-Wave and Zigbee are connected, and says what to set so that both use the radio pair (README, \"Connecting"
+      echo "Home Assistant\")."
+      exec bash "$HERE/homeassistant/install.sh" "$@"
+    fi
     echo "This machine is not a Proxmox node (no qm, no pvesh). What the kit installs on any other machine is a"
     echo "Proxmox cluster's third vote, and nothing else (README, \"Two nodes or three\")."
     exec bash "$HERE/vote/install.sh" "$@";; esac

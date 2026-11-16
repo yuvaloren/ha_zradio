@@ -159,6 +159,48 @@ To remove the vote: `pvecm qdevice remove` on a node; on the third machine `dock
 rm zradio-vote`, `docker rmi zradio-vote`, or `apt-get purge corosync-qnetd` and the key's line out of root's
 `authorized_keys`.
 
+## Home Assistant's side (`homeassistant/install.sh`)
+
+The kit's install line in Home Assistant's terminal (the Terminal & SSH app) with `--radios <floating address>`:
+`./install.sh` on a machine that is not a Proxmox node hands over to this script when it is in a Home Assistant app
+(`SUPERVISOR_TOKEN` is in its environment), when Home Assistant's settings are there (`/config` or `/homeassistant`),
+or when `--radios` or `--config` is given; any other machine gets the third vote. `get.sh` needs no python for this
+reason: that terminal has bash, curl, jq and busybox, and nothing else.
+
+The floating address, when `--radios` does not give it, is looked for in the same file: a `socket://` or `tcp://`
+path with a numeric address that ZHA or the Z-Wave JS app uses already. One such address is asked about on a
+terminal, and taken (and said to be taken) without one; two different ones are shown and none is picked. Where
+there is none, the script says where the address is: `./install.sh` on a node with a radio VM (`host/update.sh`)
+reads it from the VM and ends every run with the line for Home Assistant, and each radio VM's description in Proxmox
+names it. The network is not searched: nothing of the pair answers but its two ports.
+
+It reads and never writes. From Home Assistant's list of integrations (`<config>/.storage/core.config_entries`) it
+takes, for ZHA, the serial path and the adapter type, and for Z-Wave, whether the integration runs the Z-Wave JS app,
+the app's USB or socket path, and the server's address. Only those fields are read; the Z-Wave keys are in the same
+file and are never taken out of it. Then, for each kind of stick the pair has:
+
+| What Home Assistant has | It says |
+|---|---|
+| the pair's path already | `OK` |
+| another path (a stick in its own machine) | `TODO`, with the steps in Home Assistant's own dialogs |
+| no such integration | `TODO`, with how to add it on the pair |
+| Z-Wave through a server it cannot look into (Z-Wave JS UI, or a server elsewhere) | `CHECK`, with where that server's serial port is set |
+
+What it does not do, and why:
+
+- **It makes none of the changes.** ZHA and the Z-Wave integration change their path in a dialog that stops the
+  integration, tries the stick, and saves. From the terminal app, Home Assistant's own API is closed (it answers 401
+  to the app's token), Z-Wave JS UI's is not reachable, and the file read here is Home Assistant's own state, which
+  must not be edited under it.
+- **It does not connect to the pair's ports.** Each takes one client, and ser2net gives the port to the newest one:
+  a look from here would cut Home Assistant off. Whether the floating address is there is asked with a ping.
+- **It cannot tell that Home Assistant is connected**, only what it is set to. From the pair's side, in the VM that
+  serves: `ss -tn state established '( sport = :6639 or sport = :6638 )'` lists Home Assistant's connections.
+
+The steps name Home Assistant 2026.11's menus (`homeassistant/components/zha` and `zwave_js`, their `strings.json`).
+Two of them matter: for a stick that holds a network, ZHA's "Set up automatically" and "Migrate to a new adapter"
+both write to a stick, and the steps say which choice does not.
+
 ## Updating (`host/update.sh`)
 
 `./install.sh` (or the one line of `get.sh`) on a node whose radio VM exists updates that VM and the pair's other one.
@@ -239,7 +281,10 @@ VM. Serial settings of served-only sticks come from public documentation and are
 third vote's two ends the same way. `bash tests/vote-real.sh` is apart, because it needs docker and the network: it
 builds and starts the vote's container, then a Debian 13 container in the place of a node leaves its key there with
 the one-time password, runs the commands `pvecm qdevice setup` runs toward it, and a real corosync node with
-`corosync-qdevice` gets its second vote from it. `pvecm` itself has not been run against it. The tests are for
+`corosync-qdevice` gets its second vote from it. `pvecm` itself has not been run against it. `t-hass.sh` covers
+Home Assistant's side against stand-ins for its list of integrations, and `bash tests/hass-real.sh` (docker) runs the
+install line and that script on the kind of machine Home Assistant's terminal is: Alpine, busybox, no python. No
+Home Assistant runs in either. The tests are for
 development: a release's archive, which is what `get.sh` puts on a machine, carries no `tests/` (`.gitattributes`). `t-host.sh` covers
 `install.sh` on a fake Proxmox cluster; `t-e2e.sh` installs a whole pair, with the kit's real installer running in
 fake VMs and real keys exchanged. Where ser2net, keepalived and cloud-init are installed, the files the kit writes

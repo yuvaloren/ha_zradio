@@ -68,14 +68,17 @@ check "the kit is unpacked in the VM and its installer run there, through the gu
 check "…the kit really is in the VM: the files cloud-init put there unpack to guest/install.sh" bash -c 'cmp -s "$1/g/109/root/opt/zradio/kit/guest/install.sh" "$2/guest/install.sh" && grep -q "^NAME=zr2$" "$1/g/109/root/root/zradio.conf"' _ "$T/c" "$KIT"
 check "the installer's lines are shown as it runs, each once" bash -c 'grep -c "| DONE  the radios are detected and named" "$1/out" | grep -qx 1 && grep -q "| OK    keepalived 2.3.3 installed" "$1/out" && grep -q "the kit is installed in zr2, as the initial standby" "$1/out"' _ "$T/c"
 check "what the VM found is said, and where Home Assistant connects — one line per kind of stick" bash -c 'grep -q "zr2.s radios: Z-Wave yes, Zigbee yes" "$1/out" && grep -q "Z-Wave JS → tcp://10.20.30.50:6639  ZHA → socket://10.20.30.50:6638" "$1/out"' _ "$T/c"
+check "…and the kit's line for Home Assistant's terminal, with the floating address in it" bash -c 'grep -qxF "      bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/yuvaloren/ha_zradio/main/get.sh)\" _ --radios 10.20.30.50" "$1/out"' _ "$T/c"
 check "without --start it is NOT put into the pair, and the command that does it is said" bash -c 'grep -q "NOTE  zr2 is installed and not started. To start it: qm guest exec 109 -- systemctl start zradio.target" "$1/out" && ! grep -q "guest: systemctl start zradio.target" "$1/calls"' _ "$T/c"
 check "the first VM of a pair: no pairing step, and the next thing to do is said" bash -c '! grep -q "zradio-sync" "$1/calls" && grep -q "Next: ./install.sh on the other node" "$1/out"' _ "$T/c"
 
 echo "-- one kind of stick only"
 node "$T/k"; printf 'ZWAVE=synced\nZIGBEE=none\n' > "$T/k/radios.conf"; zvm "$T/k" "${BASE[@]}" --run
 check "a VM that found only a Z-Wave stick: installed, said, and only the Z-Wave line for Home Assistant" bash -c '[ "$2" = 0 ] && grep -q "radios: Z-Wave yes, Zigbee none" "$1/out" && grep -q "Z-Wave JS → tcp://10.20.30.50:6639$" "$1/out" && ! grep -q "ZHA" "$1/out"' _ "$T/k" "$RC"
+check "…and the line for Home Assistant says that the pair has no Zigbee stick" bash -c 'grep -q -- "get.sh)\" _ --radios 10.20.30.50 --no-zigbee$" "$1/out"' _ "$T/k"
 node "$T/k2" zwave; printf 'ZWAVE=none\nZIGBEE=served\n' > "$T/k2/radios.conf"; zvm "$T/k2" "${BASE[@]}" --conf ZIGBEE_PORT=7000 --run
 check "one stick on the node: one USB mapping, one usb line; only Zigbee found: only the ZHA line, on the port of --conf" bash -c '[ "$2" = 0 ] && grep "^qm create" "$1/calls" | grep -q -- "--usb0 mapping=zradio-10c4ea70 --tags" && grep -q "radios: Z-Wave none, Zigbee yes" "$1/out" && grep -q "ZHA → socket://10.20.30.50:7000" "$1/out" && ! grep -q "Z-Wave JS" "$1/out"' _ "$T/k2" "$RC"
+check "…and the line for Home Assistant carries the other port, and says that the pair has no Z-Wave stick" bash -c 'grep -q -- "get.sh)\" _ --radios 10.20.30.50 --zigbee-port 7000 --no-zwave$" "$1/out"' _ "$T/k2"
 
 echo "-- options"
 node "$T/o"; zvm "$T/o" "${BASE[@]/standby/primary}" --run --start --first --hookscript local:snippets/my-hook.sh --conf SYNC_TZ=Europe/Berlin --conf ELECTION=observe --vmid 150 --priority 110 --vrid 77 --pair-mac BC:24:11:0A:63:36 --memory 1024 --cores 1 --disk 12G

@@ -24,14 +24,21 @@ case "$(printf '%s\n' "$OTHER" | grep -c .)" in
   *) warn "more than one radio VM of the kit on other nodes ($(printf '%s\n' "$OTHER" | awk '{ printf "%s ", $2 }')): only $UNAME is updated here; run ./install.sh on each one's node";;
 esac
 
+# the pair's floating address is looked up here too: every end of this run names it, with the line for Home Assistant
+# shellcheck disable=SC2086  # HA is five words
+ha_say() { [ -z "$HA" ] || ha_lines $HA; }
 # what each one runs now
-TODO=() SERVES=""
+TODO=() SERVES="" HA=""      # HA: what ha_lines takes, from the first VM that answers
 for t in "${TARGETS[@]}"; do
   read -r tn ti tname <<< "$t"
   if ! agent_up "$tn" "$ti"; then bad "$tname on $tn does not answer (its guest agent): start it first (qm start $ti on $tn)"; continue; fi
   st=$(vm_kit "$tn" "$ti") || { bad "could not ask $tname which kit it runs (through its guest agent)"; continue; }
   tv=$(kv VERSION "$st"); tc=$(kv CONTENT "$st")
   [ "$(kv SERVING "$st")" = yes ] && SERVES=$tname
+  if [ -z "$HA" ] && hv=$(kv HA_VIP "$st") && ip4 "$hv"; then
+    zp=$(kv HA_ZWAVE_PORT "$st"); gp=$(kv HA_ZIGBEE_PORT "$st")
+    HA="$hv ${zp:-6639} ${gp:-6638} $([ "$(kv HA_ZWAVE "$st")" = none ] && echo 0 || echo 1) $([ "$(kv HA_ZIGBEE "$st")" = none ] && echo 0 || echo 1)"
+  fi
   if [ "$tc" = "$KIT_CONTENT" ]; then ok "$tname on $tn runs this kit already: $tv"
   else
     ok "$tname on $tn runs ${tv:+$tv, }$([ -n "$tc" ] && echo "not this kit" || echo "a kit from before versions were kept")$([ "$(kv SERVING "$st")" = yes ] && echo " — it serves the radios now")"
@@ -42,6 +49,7 @@ done
 
 if [ ${#TODO[@]} -eq 0 ]; then
   echo "== up to date: $(for t in "${TARGETS[@]}"; do read -r _ _ tname <<< "$t"; printf '%s ' "$tname"; done)run $KIT_VERSION =="
+  ha_say
   exit 0
 fi
 
@@ -52,6 +60,7 @@ if [ $RUN = 0 ]; then
     would "run the kit's installer in $tname (guest/install.sh --from-node --run): the files that differ are replaced, the radios keep running$([ "$tname" = "$SERVES" ] && echo " (it serves: it goes last)")"
   done
   ARGS=(--update "$UNAME" ${PASS[@]+"${PASS[@]}"})
+  ha_say
   go_ahead "${ARGS[@]}"
 fi
 
@@ -68,4 +77,5 @@ for t in "${TODO[@]}"; do
 done
 [ $FAILS -eq 0 ] || { echo "== $FAILS FAIL =="; exit 1; }
 echo "== done: $(for t in "${TARGETS[@]}"; do read -r _ _ tname <<< "$t"; printf '%s ' "$tname"; done)run $KIT_VERSION =="
+ha_say
 exit 0

@@ -11,13 +11,15 @@ jobs:
     steps:
       - uses: actions/checkout@v7      # v4 ran on Node.js 20, which GitHub has deprecated; v7 is the current one (Node.js 24)
       - name: tools
-        run: sudo apt-get update -q && sudo apt-get install -y -q shellcheck python3-yaml openssh-client ser2net socat keepalived
+        run: sudo apt-get update -q && sudo apt-get install -y -q shellcheck python3-yaml openssh-client ser2net socat keepalived jq
       - name: shellcheck
-        run: shellcheck -x -S warning get.sh install.sh host/*.sh vote/install.sh guest/install.sh guest/lib/zradio-kit-stamp.sh guest/lib/zradio-common.sh guest/sbin/zradio-{apply,gate,notify,render,serve,switch,sync} tests/*.sh
+        run: shellcheck -x -S warning get.sh install.sh host/*.sh vote/install.sh homeassistant/install.sh guest/install.sh guest/lib/zradio-kit-stamp.sh guest/lib/zradio-common.sh guest/sbin/zradio-{apply,gate,notify,render,serve,switch,sync} tests/*.sh
       - name: the tests (fakes only, no hardware)
         run: bash tests/run.sh
       - name: the third vote's container, with the real programs (docker)
         run: bash tests/vote-real.sh
+      - name: Home Assistant's side, on its terminal's kind of machine (docker; Alpine and busybox, no python)
+        run: bash tests/hass-real.sh
       - name: nothing generated outside gen/ (a test run leaves the tree as git has it)
         run: test -z "$(git status --porcelain)" || { git status --porcelain; exit 1; }
       - name: the tests' copies of Home Assistant's USB lists are the lists at the pinned commit
