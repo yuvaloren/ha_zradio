@@ -13,4 +13,4 @@ RUN apt-get update -q \
 USER dev
 WORKDIR /home/dev/ha_zradio
 # The repo is mounted read-only at /src and copied, so a run leaves nothing behind in the clone.
-ENTRYPOINT ["bash", "-c", "cp -R /src/. . && { [ $# -gt 0 ] || shellcheck -x -S warning get.sh install.sh host/*.sh guest/install.sh guest/lib/zradio-kit-stamp.sh guest/lib/zradio-common.sh guest/sbin/zradio-{apply,gate,notify,render,serve,switch,sync} tests/*.sh; } && exec bash tests/run.sh \"$@\"", "--"]
+ENTRYPOINT ["bash", "-c", "cp -R /src/. . && { [ $# -gt 0 ] || shellcheck -x -S warning get.sh install.sh host/*.sh vote/install.sh guest/install.sh guest/lib/zradio-kit-stamp.sh guest/lib/zradio-common.sh guest/sbin/zradio-{apply,gate,notify,render,serve,switch,sync} tests/*.sh; } && exec bash tests/run.sh \"$@\"", "--"]

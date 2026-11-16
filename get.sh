@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# get.sh — ha_zradio onto this Proxmox node, then its installer. The one line to paste, as root, on each node:
+# get.sh — ha_zradio onto this machine, then its installer. The one line to paste, as root, on each Proxmox node (a
+# radio VM there) and, for a cluster's third vote, on the third machine (install.sh sees which of the two it is on):
 #
 #     bash -c "$(curl -fsSL https://raw.githubusercontent.com/yuvaloren/ha_zradio/main/get.sh)"
 #
@@ -16,8 +17,8 @@ GH=${ZRADIO_GITHUB:-https://github.com}
 API=${ZRADIO_GITHUB_API:-https://api.github.com}
 DEST=${ZRADIO_DEST:-/opt/ha_zradio}
 die() { echo "get.sh: $*" >&2; exit 2; }
-[ "$(id -u)" = 0 ] || die "run this as root on a Proxmox node: the installer builds a VM"
-command -v curl >/dev/null 2>&1 && command -v tar >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1 || die "needs curl, tar and python3 (a Proxmox node has all three)"
+[ "$(id -u)" = 0 ] || die "run this as root: the installer builds a VM on a Proxmox node, or sets up the cluster's third vote on another machine"
+command -v curl >/dev/null 2>&1 && command -v tar >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1 || die "needs curl, tar and python3 (a Proxmox node has all three; so has a Debian machine, and a NAS as a rule)"
 # the folder this script replaces things in: one of its own, never a system path
 [[ "$DEST" =~ ^/[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)+$ ]] || die "ZRADIO_DEST '$DEST': an absolute path at least two levels deep"
 

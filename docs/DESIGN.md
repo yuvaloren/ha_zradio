@@ -99,9 +99,65 @@ What a third vote (three nodes, or two and a QDevice) still adds, and why the in
 require it): a node without quorum starts no VM. A start checks quorum first (`check_cfs_quorum` in qemu-server's
 `vm_start`), and at boot Proxmox waits for quorum with no time limit (`startall` in pve-manager). With two nodes and no
 third vote, while one node is down the other starts no radio VM, at boot or by hand, until someone runs `pvecm expected
-1` on it; VMs already running are not affected. The installer says so on such a cluster. A QDevice is Proxmox's own: `apt install corosync-qnetd` on a third machine,
-`apt install corosync-qdevice` on both nodes, then `pvecm qdevice setup <its address>` on one node (Proxmox's cluster
-manual, "Corosync External Vote Support").
+1` on it; VMs already running are not affected. The installer says so on such a cluster.
+
+### The third vote (`./install.sh --third-vote`, `vote/install.sh`)
+
+The vote is Proxmox's own QDevice (its cluster manual, "Corosync External Vote Support"): `corosync-qnetd` on a
+third machine, `corosync-qdevice` on the nodes, and `pvecm qdevice setup <address>` on one node, which makes the
+certificates and writes the cluster's configuration. The kit writes none of that itself. It does what that command
+needs done first, on both ends, and reads the votes back afterward.
+
+`pvecm qdevice setup` logs into the third machine as root over SSH (`ssh-copy-id`, then `ssh` and `scp`) and runs
+`corosync-qnetd-certutil` there. A NAS has no `apt-get` for that tool and no root login to give away. So
+`vote/install.sh`, on the third machine, works two ways:
+
+- **With docker** (a NAS, or `--docker`): a container, `zradio-vote`, built on the machine from Debian 13 with
+  `corosync-qnetd` and `openssh-server`. It runs on the machine's own network (`--network host`, no port mapping in
+  between, so qnetd sees the nodes' own addresses): the vote on TCP 5403, and an SSH server of its own on `--ssh-port`
+  (default 2222). The arbiter's certificates and the SSH host key are in the docker volume `zradio-vote`; running the
+  script again replaces the container and keeps them. Nothing of the machine itself is changed.
+- **With `apt-get`** and no docker asked for (Debian, Ubuntu, Raspberry Pi OS): Debian's `corosync-qnetd` package. It
+  changes no SSH setting.
+
+**How the node gets in.** The third machine goes first and needs nothing from a node. The container's root gets a
+one-time password that the script makes up and shows: twelve letters and digits. The node's first act is
+`ssh-copy-id` with it; from then on it uses its key, as `pvecm` does. The password is good from the container's
+start until a key has been left, 30 minutes at most. It is marked as used in the volume before the door opens, so a
+restart of the container (the machine rebooting) never opens it again; only running the script again does, with a
+new password. The password and the key open the container, not the machine. On the `apt-get` path there is no
+password to make up: the node asks for root's own password of that machine, as in Proxmox's manual, and the script
+refuses where the SSH server does not take one for root (Debian's default) and names the two ways out, `--docker`
+or `--key`. `--key '<a node's /root/.ssh/id_rsa.pub>'`, on either path, lets that key in and uses no password at all;
+it is the way for a run without a terminal.
+
+It is one file with the container's two scripts inside it (`--show image|entrypoint`): what makes the image, and
+what the container runs. The image is made with `docker run`, `docker cp` and `docker commit`, not `docker build`: a
+NAS's docker has no buildx, and `docker build` without it is the legacy builder that docker is retiring. The image
+carries a label of what it was made from, so a second run makes it again only after the kit changed. `./install.sh` on a
+machine that is not a Proxmox node (no `qm`, no `pvesh`) says so and hands over to it, so the one install line
+(`get.sh`) is the same on all three machines. It shows what it would do and asks before doing it.
+
+On the node, `./install.sh --third-vote <address>` (`host/qdevice.sh`) builds no VM. It ends early when the cluster
+has a third vote already or an odd number of nodes (`pvecm` sets one up for an even number only). While the third
+machine does not answer on TCP 5403 or on its SSH port, it prints the line to run there. Once it answers:
+
+1. `corosync-qdevice` is installed on every node that lacks it; on the other node over the SSH the cluster's nodes
+   have between them, with the options Proxmox itself uses to go there.
+2. For an SSH port other than 22 (`--third-vote-port`), root's `~/.ssh/config` gets an entry for the address.
+   `pvecm` has no option for a port; that file is the one place its `ssh`, `scp` and `ssh-copy-id` all read one from.
+3. Unless this node's key is there already: `ssh-copy-id`, which asks for the password. The machine's SSH host key
+   is recorded then, trusted on this first use. A login by key must then find `corosync-qnetd` there.
+4. `pvecm qdevice setup <address>`, its lines shown. Its own `ssh-copy-id` finds the key in place and asks nothing.
+5. The votes are read back until the cluster keeps its quorum without one node, or it says that it does not.
+
+Refused before step 4, because `pvecm` would stop halfway and leave certificates behind: a node offline, no SSH to
+the other node, certificates of an earlier vote still on the node, an entry for the address in the SSH config with
+another port, a wrong password.
+
+To remove the vote: `pvecm qdevice remove` on a node; on the third machine `docker rm -f zradio-vote`, `docker volume
+rm zradio-vote`, `docker rmi zradio-vote`, or `apt-get purge corosync-qnetd` and the key's line out of root's
+`authorized_keys`.
 
 ## Updating (`host/update.sh`)
 
@@ -179,7 +235,12 @@ VM. Serial settings of served-only sticks come from public documentation and are
 
 ## Tests
 
-`bash tests/run.sh` runs everything against fakes: bash, python3 with PyYAML, openssh-client. `t-host.sh` covers
+`bash tests/run.sh` runs everything against fakes: bash, python3 with PyYAML, openssh-client. `t-vote.sh` covers the
+third vote's two ends the same way. `bash tests/vote-real.sh` is apart, because it needs docker and the network: it
+builds and starts the vote's container, then a Debian 13 container in the place of a node leaves its key there with
+the one-time password, runs the commands `pvecm qdevice setup` runs toward it, and a real corosync node with
+`corosync-qdevice` gets its second vote from it. `pvecm` itself has not been run against it. The tests are for
+development: a release's archive, which is what `get.sh` puts on a machine, carries no `tests/` (`.gitattributes`). `t-host.sh` covers
 `install.sh` on a fake Proxmox cluster; `t-e2e.sh` installs a whole pair, with the kit's real installer running in
 fake VMs and real keys exchanged. Where ser2net, keepalived and cloud-init are installed, the files the kit writes
 are also given to the real programs.

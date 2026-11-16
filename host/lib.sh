@@ -96,6 +96,7 @@ show_sticks() { # the sticks of this node that the kit's table names, one per li
 }
 
 # ------------------------------------------------------------------------------------------------- the votes
+# (A third vote is set up by host/qdevice.sh: ./install.sh --third-vote.)
 # The kit does not use Proxmox HA: the pair decides itself which VM serves, and HA's one use here (restarting a VM on
 # its own node) would cost a node that loses the cluster's quorum a reboot by its watchdog — in a cluster of two nodes,
 # the survivor of the other's death. A radio VM gets a virtual watchdog instead (qm create --watchdog), which resets a
@@ -112,7 +113,7 @@ quorum_alone() { # 0 when the cluster keeps its quorum without one of its nodes 
 quorum_check() { # an OK line, or the NOTE on what two votes cost
   local v; v=$(votes)
   if quorum_alone; then ok "the cluster keeps its quorum without one node (${v% *} votes, ${v#* } needed): a node that boots while the other is down starts its radio VM"
-  else warn "$([ -n "$v" ] && echo "this cluster has ${v% *} vote(s) and needs ${v#* }" || echo "no answer from pvecm status"): while one node is down, Proxmox starts no VM on the other, $NAME among them, at boot or by hand, until you run 'pvecm expected 1' there. VMs already running keep running, and the pair fails over without it. Recommended: a third vote (README, \"Two nodes or three\")"; fi
+  else warn "$([ -n "$v" ] && echo "this cluster has ${v% *} vote(s) and needs ${v#* }" || echo "no answer from pvecm status"): while one node is down, Proxmox starts no VM on the other, $NAME among them, at boot or by hand, until you run 'pvecm expected 1' there. VMs already running keep running, and the pair fails over without it. Recommended: a third vote (./install.sh --third-vote ADDRESS; README, \"Two nodes or three\")"; fi
 }
 
 # --------------------------------------------------------------------------------- a command in a VM, on any node

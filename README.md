@@ -55,11 +55,19 @@ starts no VM on the other node, at boot or by hand, until you run `pvecm expecte
 running, so a failover works without it; a power cut that only one node comes back from does not. The installer says
 which case your cluster is in.
 
-The third vote is a QDevice: a small daemon on any always-on machine outside the cluster (not a VM on either node),
-reached over TCP port 5403. On a Debian-based machine: `apt install corosync-qnetd` there, `apt install
-corosync-qdevice` on both nodes, then `pvecm qdevice setup <its address>` on one node, which logs into the machine as
-root over SSH. A NAS can run the daemon in a container; with no root SSH into it, the certificates are made by hand
-(the `corosync-qdevice-net-certutil` and `corosync-qnetd-certutil` man pages).
+The third vote is Proxmox's QDevice: a small daemon on any always-on machine outside the cluster. A NAS, a Pi or a
+small Linux box will do; a VM on either node will not. Two steps, each of which shows what it would do and does it
+after a `y`:
+
+1. **On that machine, as root:** the same install line as on the nodes. It sees that the machine is not a Proxmox
+   node and says that it sets up the third vote there, not a radio VM. With docker (a NAS) it builds and starts a
+   container; on Debian, Ubuntu or Raspberry Pi OS without docker it installs Debian's `corosync-qnetd` package. It
+   ends with the line for a node, and a one-time password.
+2. **On one node:** that line. It asks for the password once, installs `corosync-qdevice` on both nodes, runs
+   Proxmox's own `pvecm qdevice setup`, and checks that the cluster now keeps its quorum without one node.
+
+Both nodes must reach that machine on TCP port 5403. The node of step 2 also needs its SSH port: the container's
+(2222 unless you choose another), or 22.
 
 ## Connecting Home Assistant
 
@@ -113,7 +121,8 @@ Measured on the pair this kit was extracted from (about 50 Z-Wave nodes):
 - [docs/DESIGN.md](docs/DESIGN.md): how it works, every option, what is not built.
 - Versions: a release is a git tag; the installers stamp each VM with the kit it runs (docs/DESIGN.md, "Updating").
 - Tests: `bash tests/run.sh` on Linux, `bash tests/docker.sh` anywhere else (macOS lacks the GNU tools they need).
-  No hardware needed; they also run on every push (`.github/workflows/tests.yml`).
+  No hardware needed; they also run on every push (`.github/workflows/tests.yml`). `bash tests/vote-real.sh` (needs
+  docker) tests the third vote's container with the real programs.
 - To see the install without a Proxmox node: `tests/try.sh` (needs docker) is a shell on a pretend two-node cluster
   where `./install.sh` asks and prints what it would on a real one. Proxmox, the VMs and the sticks are fakes.
 - MIT. The list of known sticks is built at install time from Home Assistant core's USB lists (Apache-2.0); the

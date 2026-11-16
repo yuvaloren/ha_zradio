@@ -48,7 +48,7 @@ check "the download fails: exit 2, said, the earlier download is left as it was,
 site "$T/n"; rm -rf "$T/n/src/ha_zradio-x/guest"; tar -C "$T/n/src" -czf "$T/n/kit.tgz" ha_zradio-x; get "$T/n"
 check "an archive that is not the kit: refused, nothing put in place" bash -c '[ "$2" = 2 ] && grep -q "holds no install.sh and guest/: not the kit" "$1/out" && [ ! -e "$1/opt/ha_zradio/main" ]' _ "$T/n" "$RC"
 site "$T/u"; FAKE_UID=1000 get "$T/u"
-check "not root: refused, nothing downloaded" bash -c '[ "$2" = 2 ] && grep -q "run this as root on a Proxmox node" "$1/out" && [ ! -s "$1/calls" ]' _ "$T/u" "$RC"
+check "not root: refused, nothing downloaded" bash -c '[ "$2" = 2 ] && grep -q "run this as root: the installer builds a VM on a Proxmox node" "$1/out" && [ ! -s "$1/calls" ]' _ "$T/u" "$RC"
 site "$T/p"; PATH="$T/p/bin:$PATH" ZRADIO_DEST=/opt bash "$TOOL" > "$T/p/out" 2>&1 < /dev/null; RC=$?
 check "a folder of its own only: ZRADIO_DEST=/opt is refused" bash -c '[ "$2" = 2 ] && grep -q "ZRADIO_DEST ./opt.: an absolute path at least two levels deep" "$1/out"' _ "$T/p" "$RC"
 
