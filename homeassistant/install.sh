@@ -4,7 +4,7 @@
 # Home Assistant's terminal (the Terminal & SSH app), with the kit's install line (get.sh: ./install.sh sees Home
 # Assistant and hands over to this script), or on any machine with --config.
 #
-# It CHANGES NOTHING in Home Assistant, and installs nothing. It reads which serial path the Zigbee integration
+# It CHANGES NOTHING in Home Assistant. It reads which serial path the Zigbee integration
 # (ZHA) and the Z-Wave integration use, from Home Assistant's own list of integrations
 # (<config>/.storage/core.config_entries: those fields only, never a key), and says OK, or the steps for this Home
 # Assistant. Why it does not do the steps itself: Home Assistant changes these paths only through its own setup
@@ -22,8 +22,9 @@
 # For the same reason it does not search the network for the pair: those two ports are all that would answer.
 # The menu names are Home Assistant 2026.11's. Needs bash and jq (the terminal app has both); no python.
 # Tests: tests/t-hass.sh (fakes) and tests/hass-real.sh (the terminal app's kind of machine: Alpine, busybox).
+# Env for the tests: ZRADIO_HA_CONFIG (the config folder, as --config), ZRADIO_HA_ASK=1 (ask as on a terminal).
 set -uo pipefail
-ADDR="" ZP=6639 GP=6638 ZW=1 ZB=1 CONF=${ZRADIO_HA_CONFIG:-} TODO=0 UNSEEN=0
+ADDR="" ZP=6639 GP=6638 ZW=1 ZB=1 CONF=${ZRADIO_HA_CONFIG:-} CONF_OPT="" TODO=0 UNSEEN=0
 GET_LINE='bash -c "$(curl -fsSL https://raw.githubusercontent.com/yuvaloren/ha_zradio/main/get.sh)" _'      # the kit's one install line
 ok() { printf '   OK    %s\n' "$*"; }
 note() { printf '   NOTE  %s\n' "$*"; }
@@ -34,10 +35,12 @@ die() { echo "die: $*" >&2; exit 2; }
 ip4() { [[ "$1" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] && [ "${BASH_REMATCH[1]}" -le 255 ] && [ "${BASH_REMATCH[2]}" -le 255 ] && [ "${BASH_REMATCH[3]}" -le 255 ] && [ "${BASH_REMATCH[4]}" -le 255 ]; }
 port() { [[ "$1" =~ ^[0-9]{1,5}$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
 
-while [ $# -gt 0 ]; do case "$1" in
+while [ $# -gt 0 ]; do
+  case "$1" in --radios|--zwave-port|--zigbee-port|--config) [ $# -ge 2 ] || die "$1 needs a value (--help). Without --radios the address is looked for";; esac
+  case "$1" in
   -h|--help) sed -n '2,/^set -uo pipefail$/p' "$0" 2>/dev/null | sed '$d'; exit 0;;
-  --radios) ADDR=${2:-}; shift 2;; --zwave-port) ZP=${2:-}; shift 2;; --zigbee-port) GP=${2:-}; shift 2;;
-  --no-zwave) ZW=0; shift;; --no-zigbee) ZB=0; shift;; --config) CONF=${2:-}; shift 2;;
+  --radios) ADDR=$2; shift 2;; --zwave-port) ZP=$2; shift 2;; --zigbee-port) GP=$2; shift 2;;
+  --no-zwave) ZW=0; shift;; --no-zigbee) ZB=0; shift;; --config) CONF=$2; CONF_OPT=$2; shift 2;;
   *) echo "unknown option: $1" >&2; exit 2;; esac; done
 port "$ZP" || die "--zwave-port '$ZP': a TCP port"
 port "$GP" || die "--zigbee-port '$GP': a TCP port"
@@ -63,7 +66,7 @@ if [ -z "$ADDR" ]; then
     h=${BASH_REMATCH[2]}; ip4 "$h" || continue
     case " ${HOSTS[*]-} " in *" $h "*) ;; *) HOSTS+=("$h");; esac
     SAID+=("$what is set to $path")
-  done < <(jq -r '.data.entries[] | select(.disabled_by == null) | if .domain == "zha" then "Zigbee (ZHA)\u001f" + (.data.device.path // "") elif .domain == "zwave_js" and .data.use_addon == true then "Z-Wave (the Z-Wave JS app)\u001f" + (.data.socket_path // "") else empty end' "$F")
+  done < <(jq -r '.data.entries[] | select(.disabled_by == null and .source != "ignore") | if .domain == "zha" then "Zigbee (ZHA)\u001f" + (.data.device.path // "") elif .domain == "zwave_js" and .data.use_addon == true then "Z-Wave (the Z-Wave JS app)\u001f" + (.data.socket_path // "") else empty end' "$F")
   if [ ${#HOSTS[@]} -gt 0 ]; then echo "   No --radios. In Home Assistant's own settings:"; printf '     - %s\n' "${SAID[@]}"; else echo "   No --radios, and Home Assistant's settings name no network path for Z-Wave or Zigbee yet."; fi
   if [ ${#HOSTS[@]} = 1 ]; then
     if [ $ASK = 1 ]; then
@@ -80,13 +83,14 @@ fi
 ip4 "$ADDR" || die "--radios '$ADDR': the pair's floating address, A.B.C.D"
 WANT_ZB="socket://$ADDR:$GP" WANT_ZW="tcp://$ADDR:$ZP"
 
-# one integration's entries, the named fields only; an entry the user disabled is not in use
-entries() { local d=$1; shift; jq -r --arg d "$d" ".data.entries[] | select(.domain == \$d and .disabled_by == null) | [$*] | map(. // \"\" | tostring) | join(\"\\u001f\")" "$F"; }
+# one integration's entries, the named fields only. Not in use, and left out: an entry the user disabled, and the
+# entry Home Assistant keeps for a discovered stick the user chose to ignore
+entries() { local d=$1; shift; jq -r --arg d "$d" ".data.entries[] | select(.domain == \$d and .disabled_by == null and .source != \"ignore\") | [$*] | map(. // \"\" | tostring) | join(\"\\u001f\")" "$F"; }
 
 echo "== Home Assistant and the radio pair at $ADDR (a look only: nothing is changed) =="
 [ -z "$FOUND" ] || note "$ADDR is taken as the pair's floating address from Home Assistant's own settings ($FOUND). Another pair: --radios A.B.C.D"
 if command -v ping >/dev/null 2>&1; then
-  if ping -c 1 -W 2 "$ADDR" >/dev/null 2>&1; then ok "$ADDR answers a ping from here: a radio VM holds the floating address"
+  if ping -c 1 -W 2 "$ADDR" >/dev/null 2>&1; then ok "$ADDR answers a ping from here"
   else note "$ADDR does not answer a ping from here. Is a radio VM serving (zradio-serve status in it)? Does this machine reach that network? (Some firewalls drop pings.)"; fi
 fi
 
@@ -99,11 +103,11 @@ if [ $ZB = 1 ]; then
           "The pair's sticks hold your network: \"Set up manually\", then \"Keep adapter network settings\". NOT \"Set up automatically\": that one erases the stick and creates a new network. (A new house, no devices yet: \"Set up automatically\".)"
   else
     while IFS=$SEP read -r path radio; do
-      if [ "$path" = "$WANT_ZB" ]; then ok "Zigbee (ZHA) uses the pair: $path"
+      if [ "$path" = "$WANT_ZB" ] || [ "$path" = "tcp://$ADDR:$GP" ]; then ok "Zigbee (ZHA) uses the pair: $path"      # (ZHA reads tcp:// as socket://)
       else
         todo "Zigbee (ZHA) uses ${path:-no path} now${radio:+ ($radio)}, not the pair. With the stick that holds your network in the pair:"
-        steps "Settings > Devices & services > Zigbee Home Automation > Configure (the gear)." \
-              "\"Change ZHA adapter settings\": Submit. ZHA makes a backup and stops." \
+        steps "Settings > Devices & services > Zigbee Home Automation > the gear: ZHA's own page." \
+              "There, \"Migrate adapter\": Migrate. Then \"Change ZHA adapter settings\": Submit. ZHA makes a backup and stops." \
               "\"Change the current adapter's settings\". NOT \"Migrate to a new adapter\": that one resets the old stick first." \
               "\"Serial device path\": type  $WANT_ZB" \
               "If it asks how to migrate: \"Migrate manually\", then \"Keep adapter network settings\". The stick already holds the network; nothing is written to it. ZHA starts again."
@@ -148,6 +152,6 @@ fi
 if [ $TODO = 0 ] && [ $UNSEEN = 0 ]; then echo "== Home Assistant uses the pair at $ADDR. Nothing to do. =="
 else
   echo "== $([ $TODO = 0 ] || echo "$TODO to do (TODO). ")$([ $UNSEEN = 0 ] || echo "$UNSEEN that cannot be seen from here (CHECK). ")Nothing was changed. =="
-  [ $TODO = 0 ] || echo "   Afterward, this again checks it:    $GET_LINE --radios $ADDR$([ "$ZP" = 6639 ] || echo " --zwave-port $ZP")$([ "$GP" = 6638 ] || echo " --zigbee-port $GP")$([ $ZW = 1 ] || echo " --no-zwave")$([ $ZB = 1 ] || echo " --no-zigbee")"
+  [ $TODO = 0 ] || echo "   Afterward, this again checks it:    $GET_LINE --radios $ADDR$([ "$ZP" = 6639 ] || echo " --zwave-port $ZP")$([ "$GP" = 6638 ] || echo " --zigbee-port $GP")$([ $ZW = 1 ] || echo " --no-zwave")$([ $ZB = 1 ] || echo " --no-zigbee")$([ -z "$CONF_OPT" ] || printf ' --config %q' "$CONF_OPT")"
 fi
 exit 0

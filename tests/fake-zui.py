@@ -3,7 +3,8 @@
 engine.io v4 open packet, socket.io CONNECT, ZWAVE_API calls with acks (driverFunction, restoreNVM with one binary
 attachment). Usage: fake-zui.py PORTFILE STATEDIR [knob…]. It writes its port to PORTFILE, the image it received to
 STATEDIR/received.bin and every call to STATEDIR/calls. Knobs: refuse (restoreNVM answers success=false), notready
-(driver.ready false), ping (an engine.io ping before every answer), binary-event (a binary frame before the answer)."""
+(driver.ready false), ping (an engine.io ping before every answer), binary-event (a binary frame before the answer),
+second-503 (every connection after the first is answered HTTP 503: a Z-Wave JS UI that went away after the read)."""
 import base64, hashlib, json, os, socket, struct, sys
 
 portfile, state, knobs = sys.argv[1], sys.argv[2], set(sys.argv[3:])
@@ -35,11 +36,13 @@ def recv_frame(c, buf):
 
 s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("127.0.0.1", 0)); s.listen(4)
 open(portfile + ".tmp", "w").write(str(s.getsockname()[1])); os.replace(portfile + ".tmp", portfile)
+conns = 0
 while True:
-    c, _ = s.accept(); buf = bytearray()
+    c, _ = s.accept(); buf = bytearray(); conns += 1
     try:
         req = b""
         while b"\r\n\r\n" not in req: req += c.recv(4096)
+        if "second-503" in knobs and conns > 1: c.sendall(b"HTTP/1.1 503 Service Unavailable\r\n\r\n"); continue
         key = [l.split(b":", 1)[1].strip() for l in req.split(b"\r\n") if l.lower().startswith(b"sec-websocket-key")][0]
         acc = base64.b64encode(hashlib.sha1(key + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest())
         c.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + acc + b"\r\n\r\n")

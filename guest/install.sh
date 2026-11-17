@@ -36,7 +36,9 @@
 #      /dev/zradio-zwave and /dev/zradio-zigbee). Skipped when radios.conf exists (--detect looks again).
 #   4. what the detected radios need: podman and the pinned Z-Wave JS UI image (a Z-Wave stick that is synced: the
 #      image writes a copied network onto it, and a sync must never wait for a download); zigpy in its own venv
-#      /opt/zradio/zigpy (a Zigbee stick that is synced).
+#      /opt/zradio/zigpy (a Zigbee stick that is synced): zigpy-cli at the release zradio.conf pins (ZIGPY_VERSION),
+#      and under it the libraries of lib/zigpy-constraints.txt. The venv is stamped with its release (zradio-pin);
+#      when the conf pins another one, the venv is built again — and put back as it was if that fails.
 #   5. the rendered files: /etc/keepalived/keepalived.conf (checked with keepalived -t), /etc/ser2net.yaml (the
 #      package's file is kept once as /etc/ser2net.yaml.dist), the nightly timer.
 #   6. the units, and a drop-in for keepalived.service: the sticks are silenced first; a keepalived that dies comes
@@ -45,29 +47,61 @@
 #      keepalived runs none. Enabled: zradio-quiet (silent sticks at every boot), keepalived, the nightly sync, the
 #      15-minute tick, the state line, the device-change watcher, the election's gate (zradio-gate: observe mode
 #      unless zradio.conf says ELECTION=act) — and zradio.target, which names them all.
-#      NOTHING IS STARTED: `systemctl start zradio.target`, or the next boot, puts this VM into the pair.
+#      NOTHING IS STARTED on a VM that is not in the pair: `systemctl start zradio.target`, or the next boot, puts it
+#      there. On a VM that is (zradio.target is active), what runs all the time is put onto the new files: the gate
+#      and the watcher are restarted when a file they read changed — while no sync runs here, because a restart ends
+#      what they started; a timer whose file changed is restarted; a unit of the target that is not running (new in
+#      this kit) is started. keepalived and a serving ser2net are never restarted here: the notes say what to do.
 #   7. this VM's sync key (made if missing) and its two PUBLIC keys, with the line to run on the other VM.
-# Refused before anything is changed: not root; a missing sibling file; a conf that does not check.
+# Refused before anything is changed: not root; a missing sibling file; a conf that does not check (a key that is not
+# one of its own; a time systemd does not take: systemd-analyze calendar).
 # Tests: tests/t-install.sh. Env for the tests: ZRADIO_INSTALL_ROOT (a prefix for every path written),
-# ZRADIO_INSTALL_DETECT, ZRADIO_INSTALL_ZIGPY_SETUP, ZRADIO_INSTALL_WATCHDOG (the device), ZRADIO_INSTALL_SYSCTL, and
-# systemctl / apt-get / dpkg-query / keepalived / podman on PATH.
+# ZRADIO_INSTALL_DETECT, ZRADIO_INSTALL_ZIGPY_SETUP (called with the venv's folder and the release),
+# ZRADIO_INSTALL_WATCHDOG (the device), ZRADIO_INSTALL_SYSCTL, ZRADIO_INSTALL_HOSTKEY (this VM's public host key),
+# ZRADIO_INSTALL_RESTART_WAIT (s to wait for a running sync before a restart), ZRADIO_IP (the `ip` command), and
+# systemctl / apt-get / dpkg-query / keepalived / podman / systemd-analyze on PATH.
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 R=${ZRADIO_INSTALL_ROOT:-}
 RUN=0 CONF_SRC="" FIRST=0 DETECT=0 USE=() ROLE="" BYNODE=0 SETPEER="" PEER_SAID=0
-while [ $# -gt 0 ]; do case "$1" in
-  --run) RUN=1; shift;; --conf) CONF_SRC=$2; shift 2;; --first) FIRST=1; shift;; --detect) DETECT=1; shift;; --from-node) BYNODE=1; shift;; --initial-role) ROLE=${2:-}; shift 2;; --peer) SETPEER=${2:-}; PEER_SAID=1; shift 2;;
+while [ $# -gt 0 ]; do
+  case "$1" in --conf|--initial-role|--peer|--use) [ $# -ge 2 ] || { echo "$1 needs a value (--help)" >&2; exit 2; };; esac
+  case "$1" in
+  --run) RUN=1; shift;; --conf) CONF_SRC=$2; shift 2;; --first) FIRST=1; shift;; --detect) DETECT=1; shift;; --from-node) BYNODE=1; shift;; --initial-role) ROLE=$2; shift 2;; --peer) SETPEER=$2; PEER_SAID=1; shift 2;;
   --use) USE+=(--use "$2"); shift 2;;
   -h|--help) sed -n '2,/^set -uo pipefail$/{/^set -uo pipefail$/!p}' "$0"; exit 0;; *) echo "unknown arg: $1" >&2; exit 2;; esac; done
 case "$ROLE" in ""|primary|standby) ;; *) echo "--initial-role '$ROLE': primary (its sticks hold the networks today) or standby (its sticks will be overwritten)" >&2; exit 2;; esac
 [ "$ROLE" != standby ] || [ $FIRST = 0 ] || { echo "--first is for the initial primary of a new house: a standby's sticks are filled by the primary's sync" >&2; exit 2; }
+# the library first: the report lines (ok, warn, bad, done_, would) and the conf's checks are its own
+[ -r "$HERE/lib/zradio-common.sh" ] || { echo "FAIL  $HERE/lib/zradio-common.sh is missing: this is not a whole kit. Nothing was changed" >&2; exit 2; }
+# shellcheck source=lib/zradio-common.sh
+. "$HERE/lib/zradio-common.sh" || exit 2
 FAILS=0
-ok()   { printf 'OK    %s\n' "$*"; }
-warn() { printf 'WARN  %s\n' "$*"; }
-bad()  { printf 'FAIL  %s\n' "$*"; FAILS=$((FAILS + 1)); }
-done_(){ printf 'DONE  %s\n' "$*"; }
-would(){ printf 'WOULD %s\n' "$*"; }
 active() { systemctl is-active --quiet "$1" 2>/dev/null; }
+RESTART_WAIT=${ZRADIO_INSTALL_RESTART_WAIT:-300}      # s a restart waits for a sync that runs here
+sync_idle() { # 0 when no sync runs on this VM (zradio-sync's two locks are free), and they stay taken by the shell
+  # that asked: ALWAYS called in a subshell, which gives them back when it ends; 3 when one runs
+  local d="$R/run/zradio"
+  [ -d "$d" ] || return 0
+  exec 8>"$d/sync-out.lock" 9>"$d/sync-in.lock" || return 3
+  flock -n 8 && flock -n 9 || return 3
+}
+idle_restart() { # idle_restart <unit> <note>: restart a unit that runs all the time, while no sync runs here. A restart
+  # ends everything the unit started (systemd stops its whole control group): the watcher's device-change sync in the
+  # middle of its read, the gate's raise of the Zigbee counter in the middle of its write.
+  local left=$RESTART_WAIT rc
+  while :; do
+    ( sync_idle || exit 3; systemctl restart "$1" >/dev/null 2>&1 ) 2>/dev/null; rc=$?
+    case $rc in
+      0) ok "$1 restarted on the new files ($2)"; return 0;;
+      3) ;;
+      *) warn "systemctl restart $1 failed: it runs on the old files until it is restarted"; return 0;;
+    esac
+    [ "$left" -gt 0 ] || break
+    sleep $(( left < 5 ? left : 5 )); left=$(( left < 5 ? 0 : left - 5 ))
+  done
+  warn "a sync is running here, for more than $RESTART_WAIT s now: $1 was not restarted and runs on the old files. When the sync has ended (zradio-sync status): systemctl restart $1"
+}
 installed() { dpkg-query -W -f '${Status}' "$1" 2>/dev/null | grep -q "install ok installed"; }
 CHANGED=""          # the files this run changed, for the notes at the end
 put() { # put <source> <dest under $R> <mode>: installed only when it differs
@@ -90,11 +124,9 @@ echo "== 0. checks ($([ $RUN = 1 ] && echo RUN || echo REPORT) mode) =="
 [ "$(id -u)" = 0 ] && ok "root" || bad "not root"
 miss=""
 for f in $SBIN; do [ -f "$HERE/sbin/$f" ] || miss="$miss sbin/$f"; done
-for f in $LIBF zradio-usb-ids.py usb-annotations.json zradio-kit-stamp.sh; do [ -f "$HERE/lib/$f" ] || miss="$miss lib/$f"; done
+for f in $LIBF zradio-usb-ids.py usb-annotations.json zradio-kit-stamp.sh zigpy-constraints.txt; do [ -f "$HERE/lib/$f" ] || miss="$miss lib/$f"; done
 for f in $UNITS; do [ -f "$HERE/units/$f" ] || miss="$miss units/$f"; done
 [ -z "$miss" ] && ok "the kit's files are all here ($HERE)" || bad "missing in $HERE:$miss"
-# shellcheck source=lib/zradio-common.sh
-. "$HERE/lib/zradio-common.sh" || exit 2
 TMP=$(mktemp -d) || exit 1; trap 'rm -rf "$TMP"' EXIT
 if [ -n "$CONF_SRC" ]; then
   [ -r "$CONF_SRC" ] || { bad "--conf $CONF_SRC: no such file"; CONF_SRC=""; }
@@ -142,6 +174,12 @@ elif [ $PEER_SAID = 1 ]; then bad "--peer: there is no conf to write it into ($Z
 if zr_load_conf; then ok "$CONF_NAME checks: $NAME, $SELF ↔ ${PEER:-no peer yet}, the floating address $VIP (VRID $VRID, priority $PRIORITY), ports $ZWAVE_PORT (Z-Wave) / $ZIGBEE_PORT (Zigbee)"
   [ -z "${SELF_TAKEN:-}" ] || warn "SELF: $CONF_NAME names no address for this VM, so the one it has is written into its conf: ${SELF_TAKEN%% *} on ${SELF_TAKEN#* }$(m=$(cat "/sys/class/net/${SELF_TAKEN#* }/address" 2>/dev/null); [ -z "$m" ] || echo " (MAC $m)"). The pair knows this VM by that address from now on: RESERVE it for this VM in your DHCP server. A VM whose address changes does not serve (zradio-serve status says so)"
   [ -n "$PEER" ] || warn "no PEER: this VM has no peer yet. It holds the floating address alone (keepalived sends VRRP's ordinary multicast adverts) until the pair's other VM is installed and this one is told its address (the node's install.sh does that; by hand: install.sh --peer A.B.C.D --run)"
+  # the nightly timer's time, as it will be rendered: systemd says whether it is one. (The conf's own check knows a
+  # time zone by its shape only; a mistyped one gives a timer that systemd does not load — and no sync at night.)
+  cal="*-*-* $SYNC_AT:00${SYNC_TZ:+ $SYNC_TZ}"
+  if ! command -v systemd-analyze >/dev/null 2>&1; then warn "systemd-analyze is not here: the nightly sync's time ($cal) was not checked"
+  elif systemd-analyze calendar "$cal" >/dev/null 2>&1; then ok "the nightly sync's time is one systemd takes: $cal"
+  else bad "SYNC_AT / SYNC_TZ: systemd does not take '$cal' as a time (systemd-analyze calendar). A time zone is a name such as Europe/Berlin (timedatectl list-timezones), or empty for the VM's own. With this one the nightly sync would never run"; fi
 else bad "$ZR_ERR"; fi
 # the table of the sticks the kit knows, in the kit's gen/ folder (never kept in git): run by the node, the one the
 # node built and put into the kit; otherwise built here, now
@@ -160,8 +198,10 @@ ZR_RADIOS=$ZRADIO_RADIOS
 export ZRADIO_DETECT_ETC="$R/etc/zradio" ZRADIO_DETECT_UDEV_RULES="$R/etc/udev/rules.d/99-zradio.rules"
 
 echo "== 1. the kit's files =="
-for f in $SBIN; do put "$HERE/sbin/$f" "/usr/local/sbin/$f" 755; done
+# the library before the tools that source it: a new tool beside the old library, for the moment in between, would
+# call a function the old library does not have (a new library beside an old tool lacks nothing the old tool calls)
 for f in $LIBF; do put "$HERE/lib/$f" "/usr/local/lib/zradio/$f" 644; done
+for f in $SBIN; do put "$HERE/sbin/$f" "/usr/local/sbin/$f" 755; done
 put "$IDS" /usr/local/lib/zradio/usb-ids.json 644
 [ -z "$CONF_SRC" ] || put "$CONF_SRC" /etc/zradio/zradio.conf 644
 if [ -f "$R/etc/zradio/zui/settings.json" ]; then ok "/etc/zradio/zui/settings.json exists (Z-Wave JS UI's own store: left as it is)"
@@ -189,13 +229,19 @@ print(" ".join(k for k in sorted(r) if r[k].get("level") == "synced" and r[k].ge
 try: r = json.load(open(sys.argv[1]))["radios"]
 except Exception: r = {}
 print(" ".join(k for k in sorted(r) if r[k].get("level") == "synced" and r[k].get("holds_network") is True))' "$R/etc/zradio/radios.json" 2>/dev/null)
+  unk=$(python3 -c 'import json, sys
+try: r = json.load(open(sys.argv[1]))["radios"]
+except Exception: r = {}
+print(" ".join(k for k in sorted(r) if r[k].get("level") == "synced" and r[k].get("holds_network") is None))' "$R/etc/zradio/radios.json" 2>/dev/null)
+  [ -z "$unk" ] || warn "it could not be told whether the $unk stick(s) hold a network (zradio-detect's lines above say why). Nothing is marked for them: they count as holding one. If they are empty, this VM must not serve first — install it as the standby (--initial-role standby), and the other VM's sync fills them"
   # The INITIAL role: who holds the house's networks on the day of the install. Afterward the two VMs swap freely
   # (a failover, a switch), so it is applied ONCE — the answer is kept in initial-role, and a later run that says the
   # same again changes nothing: it would otherwise mark a VM that has long since become the one that serves, or
   # unmark one that a sync is in the middle of filling. The mark itself says who set it: the installer writes a
-  # line into it, zradio-sync's own (a set being written) is empty — the installer never lifts that one.
+  # line into it that begins "install.sh:"; zradio-sync's own (a set being written) is empty or names the networks in
+  # doubt — the installer never lifts that one.
   MARK="$R/var/lib/zradio/standby-dirty"; WAS=$(cat "$R/var/lib/zradio/initial-role" 2>/dev/null | tr -dc a-z)
-  sync_mark=0; if [ -e "$MARK" ] && [ ! -s "$MARK" ]; then sync_mark=1; fi
+  sync_mark=0; if [ -e "$MARK" ] && ! grep -q '^install\.sh:' "$MARK" 2>/dev/null; then sync_mark=1; fi      # (zradio-sync's: empty, or the networks in doubt)
   if [ -n "$ROLE" ] && [ "$WAS" = "$ROLE" ]; then
     ok "this VM was installed as the initial $ROLE before: that is asked once, and nothing about it was changed (the two swap since then — who serves today: zradio-serve status)"
   elif [ "$ROLE" = standby ]; then
@@ -239,15 +285,63 @@ else
     if podman image exists "$ZUI_IMAGE" 2>/dev/null; then ok "image $ZUI_IMAGE is present"
     elif [ $RUN = 1 ]; then podman pull -q "$ZUI_IMAGE" >/dev/null 2>&1 && done_ "image $ZUI_IMAGE pulled" || bad "podman pull $ZUI_IMAGE failed (the standby could not write a copied Z-Wave network)"
     else would "podman pull $ZUI_IMAGE"; fi
+    # Started once the way a write starts it (ZR_ZUI_RUN_OPTS), with no stick and no port: its own Node.js says its
+    # version. Where this machine's podman does not start it so, that is known now — on an update, at the standby,
+    # before the VM that serves is touched — and not at the first sync that has to write.
+    if [ $RUN = 1 ] && podman image exists "$ZUI_IMAGE" 2>/dev/null; then
+      # shellcheck disable=SC2086  # the options, as words
+      if nv=$(podman run --rm $ZR_ZUI_RUN_OPTS --entrypoint node "$ZUI_IMAGE" --version 2>&1); then ok "the image starts with the rights a write gives it (Node.js $(printf '%s' "$nv" | tail -n 1 | tr -dc 'v0-9.'))"
+      else bad "the image $ZUI_IMAGE does not start with the rights a write gives it (podman run --rm $ZR_ZUI_RUN_OPTS --entrypoint node … --version): $(printf '%s' "$nv" | tail -n 1 | cut -c1-200). This VM could not write a copied Z-Wave network"; fi
+    fi
+    # an image of the same name from an earlier pin: 400 MB of a small disk that nothing uses any more. Only once the
+    # pinned one is here; one that a running container still uses stays (podman refuses to remove it).
+    # (By image id: an image pulled by its digest has no tag in podman's list. [V podman 5.4.2, Debian 13])
+    if [ $RUN = 1 ] && podman image exists "$ZUI_IMAGE" 2>/dev/null; then
+      keep=$(podman image inspect --format '{{.Id}}' "$ZUI_IMAGE" 2>/dev/null); repo=${ZUI_IMAGE%%@*}; repo=${repo%:*}
+      while read -r id old; do
+        [ -n "$id" ] && [ -n "$keep" ] && [ "${keep#"$id"}" = "$keep" ] || continue      # (the list has an id's first characters)
+        podman rmi "$id" >/dev/null 2>&1 && done_ "image $old removed (an earlier pin; ${ZUI_IMAGE%%@*} is the one in use)" || warn "image $old (an earlier pin) could not be removed: podman rmi $id"
+      done < <(podman images --noheading --format '{{.ID}} {{.Repository}}:{{.Tag}}' --filter "reference=$repo" 2>/dev/null)
+    fi
   else ok "no synced Z-Wave stick: podman and the Z-Wave JS UI image are not needed"; fi
   if zr_has zigbee synced; then
-    if [ -x "$R/opt/zradio/zigpy/bin/zigpy" ]; then ok "zigpy is at /opt/zradio/zigpy"
+    # zigpy-cli at the pinned release, and under it the libraries the kit names (lib/zigpy-constraints.txt: pip alone
+    # would take whatever is newest on the day, and two VMs made months apart would write with different code). The
+    # venv says which release it holds (zradio-pin); one of a kit that did not stamp it is asked through its pip.
+    VENV="$R/opt/zradio/zigpy"; PIN="zigpy-cli==$ZIGPY_VERSION"; CONS="$HERE/lib/zigpy-constraints.txt"
+    cons=(); grep -qx "$PIN" "$CONS" 2>/dev/null && cons=(-c "$CONS")
+    has=$(head -n 1 "$VENV/zradio-pin" 2>/dev/null)
+    if [ -x "$VENV/bin/zigpy" ] && [ -z "$has" ]; then
+      v=$("$VENV/bin/pip" show zigpy-cli 2>/dev/null | sed -n 's/^Version: //p' | head -n 1)
+      if [ "$v" = "$ZIGPY_VERSION" ]; then has=$PIN; [ $RUN = 0 ] || echo "$PIN" > "$VENV/zradio-pin"; else has="zigpy-cli==${v:-?}"; fi
+    fi
+    if [ -x "$VENV/bin/zigpy" ] && [ "$has" = "$PIN" ]; then
+      ok "zigpy-cli $ZIGPY_VERSION is at /opt/zradio/zigpy"
+      # the libraries under it, against the kit's set: said where they differ (a venv made on another day)
+      if [ ${#cons[@]} -gt 0 ]; then
+        fr=$("$VENV/bin/pip" freeze 2>/dev/null) || fr=""; odd=""
+        for lib in zigpy zigpy-znp; do
+          h=$(printf '%s\n' "$fr" | sed -n "s/^$lib==//p" | head -n 1); k=$(sed -n "s/^$lib==//p" "$CONS" | head -n 1)
+          [ -z "$h" ] || [ -z "$k" ] || [ "$h" = "$k" ] || odd="$odd${odd:+, }$lib $h here, $k in the kit's set"
+        done
+        [ -z "$odd" ] || warn "the libraries under zigpy-cli are those of the day this venv was made: $odd. The two VMs of a pair should hold the same (this line on the other VM says what it holds). To take the kit's set here: rm -rf /opt/zradio/zigpy and this installer again — on the standby, and let a sync show that it still writes"
+      fi
     elif [ $RUN = 1 ]; then
       pkg python3-venv || exit 1
-      if [ -n "${ZRADIO_INSTALL_ZIGPY_SETUP:-}" ]; then "$ZRADIO_INSTALL_ZIGPY_SETUP" "$R/opt/zradio/zigpy"
-      else python3 -m venv "$R/opt/zradio/zigpy" && "$R/opt/zradio/zigpy/bin/pip" install -q "zigpy-cli==$ZIGPY_VERSION"; fi
-      [ -x "$R/opt/zradio/zigpy/bin/zigpy" ] && done_ "zigpy-cli $ZIGPY_VERSION installed in its own venv /opt/zradio/zigpy" || bad "zigpy did not install into /opt/zradio/zigpy (python3 -m venv + pip install zigpy-cli==$ZIGPY_VERSION)"
-    else would "python3 -m venv /opt/zradio/zigpy; pip install zigpy-cli==$ZIGPY_VERSION"; fi
+      if ! ( sync_idle ); then bad "zigpy-cli is to be installed again ($has here, $PIN in the conf) and a sync is running on this VM, which uses it: run this installer again when the sync has ended"
+      else
+        [ ${#cons[@]} -gt 0 ] || warn "the kit names no set of libraries for $PIN (lib/zigpy-constraints.txt is for $(grep -m1 '^zigpy-cli==' "$CONS" 2>/dev/null)): pip takes the newest that fit"
+        rm -rf "$VENV.old"; [ ! -e "$VENV" ] || mv "$VENV" "$VENV.old"      # (a venv cannot be made elsewhere and moved: its scripts name its path)
+        if [ -n "${ZRADIO_INSTALL_ZIGPY_SETUP:-}" ]; then "$ZRADIO_INSTALL_ZIGPY_SETUP" "$VENV" "$ZIGPY_VERSION"
+        else python3 -m venv "$VENV" && "$VENV/bin/pip" install -q "${cons[@]}" "$PIN"; fi
+        if [ -x "$VENV/bin/zigpy" ] && echo "$PIN" > "$VENV/zradio-pin"; then
+          done_ "zigpy-cli $ZIGPY_VERSION installed in its own venv /opt/zradio/zigpy$([ ! -e "$VENV.old" ] || echo " (in place of $has)")"; rm -rf "$VENV.old"
+        else
+          rm -rf "$VENV"; put_back=""; if [ -e "$VENV.old" ]; then mv "$VENV.old" "$VENV" && put_back=" The venv that was there ($has) is put back"; fi
+          bad "zigpy-cli $ZIGPY_VERSION did not install into /opt/zradio/zigpy (python3 -m venv + pip install $PIN; this machine has to reach pypi.org).$put_back"
+        fi
+      fi
+    else would "python3 -m venv /opt/zradio/zigpy; pip install $PIN$([ -z "$has" ] || echo " (in place of $has)")"; fi
   else ok "no synced Zigbee stick: zigpy is not needed"; fi
 fi
 [ $FAILS -eq 0 ] || { echo "== FAILED before any service file was touched: $FAILS FAIL =="; exit 1; }
@@ -255,8 +349,12 @@ fi
 echo "== 5. the rendered files =="
 RENDER="$R/usr/local/sbin/zradio-render"; [ $RUN = 1 ] || RENDER="$HERE/sbin/zradio-render"
 if bash "$RENDER" --keepalived > "$TMP/keepalived.conf" 2> "$TMP/err"; then
-  put "$TMP/keepalived.conf" /etc/keepalived/keepalived.conf 644
-  if [ $RUN = 1 ]; then keepalived -t -f "$R/etc/keepalived/keepalived.conf" > "$TMP/kt" 2>&1 && ok "keepalived -t accepts the config" || bad "keepalived -t: $(tail -2 "$TMP/kt" | tr '\n' ' ')"; fi
+  # tried BEFORE it is put in place: a file keepalived rejects must never replace the one a VM runs with (keepalived
+  # would go on until its next start, and then not start)
+  if [ $RUN = 0 ]; then put "$TMP/keepalived.conf" /etc/keepalived/keepalived.conf 644
+  # (its words count as well as its exit code: an unknown keyword is said and skipped, with exit 0 [V keepalived 2.3.3])
+  elif keepalived -t -f "$TMP/keepalived.conf" > "$TMP/kt" 2>&1 && ! grep -qi 'unknown keyword' "$TMP/kt"; then put "$TMP/keepalived.conf" /etc/keepalived/keepalived.conf 644; ok "keepalived -t accepts the config"
+  else bad "keepalived -t refuses the new config: $(grep -i -m2 'unknown keyword' "$TMP/kt" | tr '\n' ' ')$(tail -2 "$TMP/kt" | tr '\n' ' ') — /etc/keepalived/keepalived.conf is left as it was"; fi
 else bad "keepalived.conf does not render: $(cat "$TMP/err")"; fi
 if bash "$RENDER" --timer > "$TMP/zradio-sync.timer" 2> "$TMP/err"; then put "$TMP/zradio-sync.timer" /etc/systemd/system/zradio-sync.timer 644
 else bad "the nightly timer does not render: $(cat "$TMP/err")"; fi
@@ -289,7 +387,7 @@ if [ $RUN = 1 ]; then
     && done_ "enabled: zradio-quiet (silent sticks at boot), keepalived, the nightly sync ($SYNC_AT${SYNC_TZ:+ $SYNC_TZ}), the 15-min tick, the state line, the device-change watcher, the election's gate (ELECTION=$ELECTION) — nothing started" \
     || bad "systemctl enable failed"
   systemctl disable ser2net >/dev/null 2>&1 || true
-else would "systemctl daemon-reload; enable zradio.target, zradio-quiet, keepalived, zradio-sync.timer, zradio-sync-tick.timer, zradio-state.timer, zradio-change-watch (nothing is started)"; fi
+else would "systemctl daemon-reload; enable zradio.target, zradio-quiet, keepalived, zradio-sync.timer, zradio-sync-tick.timer, zradio-state.timer, zradio-change-watch, zradio-gate (nothing is started on a VM that is not in the pair)"; fi
 # a re-run on a VM that is in the pair: say what still runs on the old files
 if [ $RUN = 1 ]; then
   case " $CHANGED " in *" /etc/ser2net.yaml "*) active ser2net && warn "/etc/ser2net.yaml changed and ser2net is active (this VM serves): the new file is used from the next switch on (zradio-switch --run), or after 'systemctl restart ser2net' — a few seconds without radios for Home Assistant";; esac
@@ -300,8 +398,20 @@ if [ $RUN = 1 ]; then
     elif active keepalived; then warn "/etc/keepalived/keepalived.conf changed and keepalived is active: 'systemctl restart keepalived' puts it in place (on the active VM that hands the radios to the other one)"; fi;; esac
   case " $CHANGED " in *" /etc/sysctl.d/90-zradio.conf "*) "${ZRADIO_INSTALL_SYSCTL:-sysctl}" -q -p "$R/etc/sysctl.d/90-zradio.conf" >/dev/null 2>&1 && ok "kernel.panic = $PANIC_REBOOT_S is in effect" || warn "sysctl did not take /etc/sysctl.d/90-zradio.conf now: it does at the next boot";; esac
   case " $CHANGED " in *" /etc/systemd/system.conf.d/90-zradio-watchdog.conf "*) systemctl daemon-reexec >/dev/null 2>&1 && ok "systemd feeds the watchdog now (RuntimeWatchdogSec=${WATCHDOG_S}s)" || warn "systemctl daemon-reexec failed: systemd feeds the watchdog from the next boot";; esac
-  case " $CHANGED " in *zradio-change-watch*) active zradio-change-watch && { systemctl restart zradio-change-watch >/dev/null 2>&1; ok "zradio-change-watch restarted on the new file (it only watches)"; };; esac
-  case " $CHANGED " in *zradio-gate*|*zradio.conf*) active zradio-gate && { systemctl restart zradio-gate >/dev/null 2>&1; ok "zradio-gate restarted on the new files (ELECTION=$ELECTION)"; };; esac
+  # What runs all the time reads its files once: the watcher its own file and the two confs, the gate its own, the
+  # conf and the library every tool sources.
+  case " $CHANGED " in *zradio-change-watch*|*" /etc/zradio/zradio.conf "*) ! active zradio-change-watch.service || idle_restart zradio-change-watch.service "it only watches";; esac
+  case " $CHANGED " in *zradio-gate*|*zradio-common.sh*|*" /etc/zradio/zradio.conf "*) ! active zradio-gate.service || idle_restart zradio-gate.service "ELECTION=$ELECTION";; esac
+  for t in zradio-sync.timer zradio-sync-tick.timer zradio-state.timer; do
+    case " $CHANGED " in *" /etc/systemd/system/$t "*) ! active "$t" || { systemctl restart "$t" >/dev/null 2>&1 && ok "$t restarted: its new times are in force" || warn "systemctl restart $t failed: it keeps its old times until then"; };; esac
+  done
+  # a VM that is in the pair, and a unit of the target that is not running: new in this kit (enabled above, which
+  # starts nothing), or stopped by hand. Not keepalived: whoever stopped that took this VM out of the pair on purpose.
+  if active zradio.target; then
+    for u in zradio-gate.service zradio-change-watch.service zradio-sync.timer zradio-sync-tick.timer zradio-state.timer; do
+      active "$u" || { systemctl start "$u" >/dev/null 2>&1 && done_ "$u started (this VM is in the pair and it was not running: new in this kit, or stopped)" || bad "systemctl start $u failed"; }
+    done
+  fi
 fi
 
 echo "== 7. this VM's sync key =="

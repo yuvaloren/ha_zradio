@@ -37,7 +37,7 @@ check "the calls, in order: mappings, VM, disk, then the start; nothing of Proxm
   a=$(n "^pvesh create /cluster/mapping/usb --id zradio-10c4ea70" "$1"); b=$(n "^qm create 109 " "$1"); c=$(n "^qm set 109 --scsi0 local-zfs:0,import-from=.*debian-13-generic-amd64.qcow2,discard=on" "$1"); d=$(n "^qm disk resize 109 scsi0 8G" "$1")
   g=$(n "^qm start 109" "$1")
   [ -n "$a" ] && [ "$a" -lt "$b" ] && [ "$b" -lt "$c" ] && [ "$c" -lt "$d" ] && [ "$d" -lt "$g" ] && ! grep -q "^ha-manager" "$1/calls"' _ "$T/c"
-check "the image in the cache is used: nothing downloaded" bash -c '! grep -q "^wget" "$1/calls"' _ "$T/c"
+check "the image in the cache is used: no image downloaded" bash -c '! grep -q "^wget .*qcow2" "$1/calls"' _ "$T/c"
 Y="$T/c/store/snippets/zr2-zradio.yaml"
 check "the cloud-init file parses; root over keys only; the agent package; the hostname" python3 -c '
 import sys, yaml
@@ -59,7 +59,8 @@ assert yaml.safe_load(open(sys.argv[1]))["runcmd"] == [["systemctl", "enable", "
 if command -v cloud-init >/dev/null 2>&1; then
   check "…and the real cloud-init accepts the file (cloud-init schema)" bash -c 'cloud-init schema --config-file "$1" 2>&1 | grep -q "^Valid schema"' _ "$Y"
 else echo "  (cloud-init is not installed here: its schema check of the file is skipped)"; fi
-check "the VM carries that file, the tag and a description that says what it is" bash -c 'grep "^qm create" "$1/calls" | grep -q -- "--cicustom user=local:snippets/zr2-zradio.yaml .*--tags zradio --description zr2: one radio VM of a zradio pair"' _ "$T/c"
+check "the VM carries that file, the tag and a description that says what it is" bash -c 'grep "^qm create" "$1/calls" | grep -q -- "--cicustom user=local:snippets/zr2-zradio.yaml .*--tags zradio-building --description zr2: one radio VM of a zradio pair"' _ "$T/c"
+check "…tagged as not finished at its creation, and as a radio VM of the kit only once the kit is installed in it" bash -c 'c=$(grep -n "^qm create" "$1/calls" | cut -d: -f1) && s=$(grep -n "^qm set 109 --tags zradio$" "$1/calls" | cut -d: -f1) && [ "$c" -lt "$s" ] && grep -q "DONE  zr2 is a radio VM of the kit from here on" "$1/out"' _ "$T/c"
 check "the kit is unpacked in the VM and its installer run there, through the guest agent — as the initial standby, with its log and exit code kept" bash -c '
   n() { grep -n -m1 -F -- "$1" "$2/calls" | cut -d: -f1; }
   a=$(n "guest: cloud-init status" "$1"); b=$(n "guest: mkdir -p /opt/zradio/kit && tar -xzf /root/zradio-kit.tgz -C /opt/zradio/kit" "$1")
@@ -70,7 +71,7 @@ check "the installer's lines are shown as it runs, each once" bash -c 'grep -c "
 check "what the VM found is said, and where Home Assistant connects — one line per kind of stick" bash -c 'grep -q "zr2.s radios: Z-Wave yes, Zigbee yes" "$1/out" && grep -q "Z-Wave JS → tcp://10.20.30.50:6639  ZHA → socket://10.20.30.50:6638" "$1/out"' _ "$T/c"
 check "…and the kit's line for Home Assistant's terminal, with the floating address in it" bash -c 'grep -qxF "      bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/yuvaloren/ha_zradio/main/get.sh)\" _ --radios 10.20.30.50" "$1/out"' _ "$T/c"
 check "without --start it is NOT put into the pair, and the command that does it is said" bash -c 'grep -q "NOTE  zr2 is installed and not started. To start it: qm guest exec 109 -- systemctl start zradio.target" "$1/out" && ! grep -q "guest: systemctl start zradio.target" "$1/calls"' _ "$T/c"
-check "the first VM of a pair: no pairing step, and the next thing to do is said" bash -c '! grep -q "zradio-sync" "$1/calls" && grep -q "Next: ./install.sh on the other node" "$1/out"' _ "$T/c"
+check "the first VM of a pair: no pairing step, and the next thing to do is said, with what the second VM takes from this one" bash -c '! grep -q "zradio-sync" "$1/calls" && grep -q "Next: ./install.sh on the other node. It finds zr2, takes the pair.s addresses and settings from it, and introduces the two to each other.$" "$1/out"' _ "$T/c"
 
 echo "-- one kind of stick only"
 node "$T/k"; printf 'ZWAVE=synced\nZIGBEE=none\n' > "$T/k/radios.conf"; zvm "$T/k" "${BASE[@]}" --run
@@ -254,7 +255,7 @@ check "the installer's \"no stick\" end is the drill's expected end: said so, ex
 check "the drill is built like the real thing: onboot and the watchdog (what it is for)" bash -c 'grep "^qm create 109 " "$1/calls" | grep -q -- "--onboot 1 --watchdog model=i6300esb,action=reset"' _ "$T/d"
 echo 1 > "$T/d/install.rc"; printf 'FAIL  apt-get install keepalived failed\n' > "$T/d/install.log"; echo '[{"vmid":101,"name":"live1","node":"nodea","status":"running"}]' > "$T/d/vms.json"
 zvm "$T/d" --name zr-drill2 --self 10.20.30.77/24 --peer 10.20.30.78 --vip 10.20.30.79/24 --pair-bridge vmbrpair --no-usb --run
-check "the line the drill is recognized by is the one the kit's installer really prints when the detection fails" bash -c 'grep -q "bad \"zradio-detect did not end clean" "$1/guest/install.sh" && grep -q "printf .FAIL  %s" "$1/guest/install.sh"' _ "$KIT"
+check "the line the drill is recognized by is the one the kit's installer really prints when the detection fails" bash -c 'grep -q "bad \"zradio-detect did not end clean" "$1/guest/install.sh" && grep -q "printf .FAIL  %s" "$1/guest/lib/zradio-common.sh" && grep -q "^\. \"\$HERE/lib/zradio-common.sh\"" "$1/guest/install.sh"' _ "$KIT"
 check "a drill whose installer failed for ANOTHER reason is a failure" bash -c '[ "$2" = 1 ] && grep -q "the installer ended 1 in zr-drill2" "$1/out"' _ "$T/d" "$RC"
 zvm "$T/d" --name zr-drill3 --self 10.20.30.77/24 --peer 10.20.30.78 --vip 10.20.30.79/24 --pair-bridge vmbrpair --no-usb --start
 check "--no-usb with --start, or with --usb-mapping: refused" bash -c '[ "$2" = 2 ] && grep -q "is a drill" "$1/out"' _ "$T/d" "$RC"
@@ -292,16 +293,52 @@ echo '[{"storage":"local","type":"dir","content":"images,iso"},{"storage":"local
 check "a snippets storage without a folder: refused, nothing changed" bash -c '[ "$2" = 1 ] && grep -q "has no folder for the cloud-init file (snippets): name one that has, with --snippets" "$1/out" && [ ! -s "$1/calls" ]' _ "$T/x6" "$RC"
 node "$T/x7"; : > "$T/x7/keys"; zvm "$T/x7" "${BASE[@]}" --run
 check "no public key for root: refused (the VM would have no way in)" bash -c '[ "$2" = 1 ] && grep -q "no public key in" "$1/out" && [ ! -s "$1/calls" ]' _ "$T/x7" "$RC"
-for bad in "--name Zr2" "--self 10.20.30.6" "--peer 10.20.30.6" "--vip 10.20.30.5/24" "--vrid 0" "--priority 255" "--conf NAME=x" "--conf lower=1" "--hookscript /root/hook.sh" "--disk 8"; do
+for bad in "--name Zr2" "--self 10.20.30.6" "--peer 10.20.30.6" "--vip 10.20.30.5/24" "--vrid 0" "--priority 255" "--conf NAME=x" "--conf lower=1" "--conf ELECTON=act" "--hookscript /root/hook.sh" "--disk 8"; do
   node "$T/a"; zvm "$T/a" "${BASE[@]}" $bad --run
   check "refused before anything: $bad" bash -c '[ "$2" = 2 ] && grep -q "^die: " "$1/out" && [ ! -s "$1/calls" ]' _ "$T/a" "$RC"
 done
 
-echo "-- the image: downloaded once, and only when its checksum is the published one"
+echo "-- the image: Debian's current one, and whole in the cache before it is used"
+IMG=debian-13-generic-amd64.qcow2
 node "$T/i"; find "$T/i/cache" -type f -delete; zvm "$T/i" "${BASE[@]}" --run
-check "no image in the cache: downloaded, checked against SHA512SUMS, kept" bash -c '[ "$2" = 0 ] && [ "$(cat "$1/cache/debian-13-generic-amd64.qcow2")" = image-from-the-web ] && [ -s "$1/cache/debian-13-generic-amd64.qcow2.sha512" ] && grep -q "^wget -q https://cloud.debian.org/images/cloud/trixie/latest/SHA512SUMS" "$1/calls"' _ "$T/i" "$RC"
+check "no image in the cache: downloaded, checked against SHA512SUMS, kept — the image and its checksum, nothing else" bash -c '[ "$2" = 0 ] && [ "$(cat "$1/cache/$3")" = image-from-the-web ] && [ "$(cat "$1/cache/$3.sha512")" = "$(sha512sum < "$1/cache/$3" | cut -d" " -f1)" ] && [ "$(ls "$1/cache" | tr "\n" " ")" = "$3 $3.sha512 " ] && grep -q "^wget -q -T 20 -t 2 https://cloud.debian.org/images/cloud/trixie/latest/SHA512SUMS" "$1/calls"' _ "$T/i" "$RC" "$IMG"
 node "$T/i2"; find "$T/i2/cache" -type f -delete; echo 0000 > "$T/i2/sum"; zvm "$T/i2" "${BASE[@]}" --run
 check "the checksum does not match: no image kept, no VM made" bash -c '[ "$2" = 1 ] && grep -q "sha512 mismatch" "$1/out" && [ -z "$(ls "$1/cache")" ] && ! grep -q "^qm create" "$1/calls"' _ "$T/i2" "$RC"
+node "$T/i3"; echo "bit rot" >> "$T/i3/cache/$IMG"; zvm "$T/i3" "${BASE[@]}"
+check "a cached image that is not the file its checksum was stored for (damaged): said in the report, with the download it would take; nothing downloaded yet" bash -c '[ "$2" = 0 ] && grep -q "NOTE  the cached image .*/cache/$3 is not the file its checksum was stored for" "$1/out" && grep -q "WOULD download https://cloud.debian.org/images/cloud/trixie/latest/$3" "$1/out" && ! grep -q "OK    image cached" "$1/out" && [ ! -s "$1/calls" ]' _ "$T/i3" "$RC" "$IMG"
+zvm "$T/i3" "${BASE[@]}" --run
+check "…--run: it is not used: downloaded again, and the VM is built" bash -c '[ "$2" = 0 ] && [ "$(cat "$1/cache/$3")" = image-from-the-web ] && grep -q "^wget -q .*/$3 " "$1/calls" && grep -q "^qm set 109 --scsi0 .*import-from=.*/cache/$3," "$1/calls"' _ "$T/i3" "$RC" "$IMG"
+node "$T/i4"; zvm "$T/i4" "${BASE[@]}"
+check "a cached image that is whole: said in the report, and that Debian's list would be asked whether it is still the current one" bash -c '[ "$2" = 0 ] && grep -q "OK    image cached, and whole by its stored checksum: .*/cache/$3 (3ca88d8294d42633…)" "$1/out" && grep -q "WOULD ask https://cloud.debian.org/images/cloud/trixie/latest/SHA512SUMS whether that is still Debian.s image" "$1/out" && [ ! -s "$1/calls" ]' _ "$T/i4" "$RC" "$IMG"
+zvm "$T/i4" "${BASE[@]}" --run
+check "…--run, and it is the one in Debian's list: the list is all that is fetched, and nothing is left beside the image" bash -c '[ "$2" = 0 ] && [ "$(grep -c "^wget" "$1/calls")" = 1 ] && grep -q "^wget -q .*/SHA512SUMS " "$1/calls" && grep -q "OK    image cached, whole, and still the one at https://cloud.debian.org" "$1/out" && [ "$(ls "$1/cache" | tr "\n" " ")" = "$3 $3.sha512 " ]' _ "$T/i4" "$RC" "$IMG"
+node "$T/i5"; echo "debian's next image" > "$T/i5/web"; zvm "$T/i5" "${BASE[@]}" --run
+check "Debian has another image by now (it replaces the one under latest): downloaded, checked, and the cache holds that one and its checksum" bash -c '[ "$2" = 0 ] && [ "$(cat "$1/cache/$3")" = "debian'"'"'s next image" ] && [ "$(cat "$1/cache/$3.sha512")" = "$(sha512sum < "$1/web" | cut -d" " -f1)" ] && grep -q "DONE  image $3, sha512 " "$1/out" && [ "$(ls "$1/cache" | tr "\n" " ")" = "$3 $3.sha512 " ]' _ "$T/i5" "$RC" "$IMG"
+node "$T/i6"; : > "$T/i6/list-fail"; zvm "$T/i6" "${BASE[@]}" --run
+check "Debian's list cannot be read and the cached image is whole: said, the cached one is used, the VM built; nothing left beside it" bash -c '[ "$2" = 0 ] && grep -q "NOTE  https://cloud.debian.org/images/cloud/trixie/latest/SHA512SUMS could not be read.*The cached one is used" "$1/out" && grep -q "^qm create" "$1/calls" && [ "$(ls "$1/cache" | tr "\n" " ")" = "$3 $3.sha512 " ]' _ "$T/i6" "$RC" "$IMG"
+node "$T/i7"; find "$T/i7/cache" -type f -delete; : > "$T/i7/image-fail"; zvm "$T/i7" "${BASE[@]}" --run
+check "the download breaks off halfway and nothing is cached: FAIL, exit 1, neither the partial image nor the list is left in the cache, no VM" bash -c '[ "$2" = 1 ] && grep -q "FAIL  the download of https://cloud.debian.org/images/cloud/trixie/latest/$3 failed" "$1/out" && [ -z "$(ls "$1/cache")" ] && ! grep -q "^qm create" "$1/calls"' _ "$T/i7" "$RC" "$IMG"
+node "$T/i8"; echo "debian's next image" > "$T/i8/web"; : > "$T/i8/image-fail"; zvm "$T/i8" "${BASE[@]}" --run
+check "…a newer image that breaks off, with a whole one cached: said, the cached one is used and is still there, no partial file" bash -c '[ "$2" = 0 ] && grep -q "NOTE  the newer image at https://cloud.debian.org/images/cloud/trixie/latest did not arrive whole.*The cached one is used" "$1/out" && [ "$(cat "$1/cache/$3")" = image-from-the-web ] && [ "$(ls "$1/cache" | tr "\n" " ")" = "$3 $3.sha512 " ] && grep -q "^qm create" "$1/calls"' _ "$T/i8" "$RC" "$IMG"
+node "$T/i9"; zvm "$T/i9" "${BASE[@]}" --image-dir http://mirror.example/debian/
+check "--image-dir with plain http: taken, and said what is not protected then" bash -c '[ "$2" = 0 ] && grep -q "NOTE  --image-dir http://mirror.example/debian is plain http: nothing protects the image or its checksum list on the way" "$1/out"' _ "$T/i9" "$RC"
+zvm "$T/i9" "${BASE[@]}" --image-dir 'http://[fd00::1]/debian'
+check "…a mirror by its IPv6 address: taken" bash -c '[ "$2" = 0 ] && ! grep -q "^die: --image-dir" "$1/out"' _ "$T/i9" "$RC"
+check "the downloads give up after two tries of 20 s each (Debian's server not reached must not hold a run with a good cached image for the better part of an hour)" bash -c 'grep -q "wget -q -T 20 -t 2 " "$1/host/new-vm.sh"' _ "$KIT"
+zvm "$T/i9" "${BASE[@]}" --image-dir ftp://mirror.example/debian --run
+check "…neither https, http nor a folder of this node (file:///…): refused before anything" bash -c '[ "$2" = 2 ] && grep -q "^die: --image-dir .ftp://mirror.example/debian." "$1/out" && [ ! -s "$1/calls" ]' _ "$T/i9" "$RC"
+mkdir "$T/i9/own"; echo "an image of my own" > "$T/i9/own/$IMG"; ( cd "$T/i9/own" && sha512sum "$IMG" > SHA512SUMS ); zvm "$T/i9" "${BASE[@]}" --image-dir "file://$T/i9/own" --run
+check "--image-dir file:///folder: the image and its list are copied from that folder of the node and checked the same; nothing is downloaded" bash -c '[ "$2" = 0 ] && [ "$(cat "$1/cache/$3")" = "an image of my own" ] && ! grep -q "^wget" "$1/calls" && grep -q "DONE  image $3, sha512 .* (from file://$1/own: the image there now, in place of the cached one)" "$1/out"' _ "$T/i9" "$RC" "$IMG"
+zvm "$T/i9" "${BASE[@]}" --name zr3 --self 10.20.30.7/24 --image-dir "file://$T/i9/nowhere"
+check "…a folder that is not there: FAIL in the checks" bash -c '[ "$2" = 1 ] && grep -q "FAIL  --image-dir file://$1/nowhere: no such folder on this node" "$1/out"' _ "$T/i9" "$RC"
+# a node without wget: every command of this machine but that one (GitHub's runner has a real wget; the tests' container has none)
+node "$T/i10"; rm "$T/i10/bin/wget"; python3 -c 'import os, sys
+os.mkdir(sys.argv[1])
+for d in os.environ["PATH"].split(":"):
+    for f in (os.listdir(d) if os.path.isdir(d) else []):
+        if f != "wget" and not os.path.lexists(sys.argv[1] + "/" + f): os.symlink(d + "/" + f, sys.argv[1] + "/" + f)' "$T/i10/rest"
+PATH="$T/i10/bin:$T/i10/rest" ZRADIO_VM_SYS="$T/i10/sys" ZRADIO_VM_NET="$T/i10/net" ZRADIO_VM_PVE="$T/i10/pve" ZRADIO_VM_CACHE="$T/i10/cache" ZRADIO_VM_WAIT=0 ZRADIO_VM_POLL=0 ZRADIO_VM_KEYS="$T/i10/keys" bash "$TOOL" "${BASE[@]}" --run > "$T/i10/out" 2>&1 < /dev/null; RC=$?
+check "no wget on the node: FAIL in the checks, before anything is changed (no USB mapping made for a VM that cannot be built)" bash -c '[ "$2" = 1 ] && grep -q "FAIL  no wget on this node: the Debian image and its checksum list are fetched with it" "$1/out" && grep -q "nothing was changed" "$1/out" && [ ! -s "$1/calls" ]' _ "$T/i10" "$RC"; [ "$FAIL" = 0 ] || tail -5 "$T/i10/out"
 
 echo "-- when a step fails"
 node "$T/f"; : > "$T/f/qm-fail"; zvm "$T/f" "${BASE[@]}" --run
@@ -318,9 +355,52 @@ check "the kit's installer failed in the VM: its FAIL line is shown, exit 1, the
 echo "-- help"
 check "--help: one command, what it asks, that nothing is changed without --run; short" bash -c 'h=$(bash "$1" --help); printf "%s\n" "$h" | grep -q "^#     ./install.sh$" && printf "%s\n" "$h" | grep -q "standby: this node.s sticks WILL BE WIPED" && printf "%s\n" "$h" | grep -q "Only for the start" && printf "%s\n" "$h" | grep -q "nothing is changed without --run" && [ "$(printf "%s\n" "$h" | wc -l)" -le 32 ] && ! printf "%s\n" "$h" | grep -q "^set -uo"' _ "$TOOL"
 
+check "every ZRADIO_VM_* knob the node's scripts read (the tests' fakes hang on them) is named in install.sh's own comments, below the help" bash -c 'cd "$1" && k=$(grep -ohE "ZRADIO_VM_[A-Z_]+" install.sh host/*.sh | sort -u) && [ -n "$k" ] && c=$(sed "1,/^set -uo pipefail\$/d" install.sh | grep "^#") && for n in $k; do printf "%s\n" "$c" | grep -qw "$n" || { echo "        not named: $n"; exit 1; }; done' _ "$KIT"
+
 echo "-- the table of known sticks: built at every run into the kit's gen/, never kept in git"
 node "$T/g1"; zvm "$T/g1" "${BASE[@]}"
 check "built from Home Assistant's lists at the pinned commit, into gen/, and said" bash -c '[ "$2" = 0 ] && [ -s "$3/gen/usb-ids.json" ] && grep -q "OK    the sticks the kit knows: 25 sticks (23 from Home Assistant.s lists at fd864375b04b, 2 added by the kit)" "$1/out"' _ "$T/g1" "$RC" "$KIT"
 mkdir -p "$T/g2"; node "$T/g2"; ZRADIO_USB_IDS_SOURCE="$T/g2/nowhere" zvm "$T/g2" "${BASE[@]}" --run
 check "Home Assistant's lists cannot be read: refused before anything, saying it needs GitHub" bash -c '[ "$2" = 2 ] && grep -q "die: the table of the sticks the kit knows could not be built: Home Assistant.s USB list for zha" "$1/out" && grep -q "has to reach raw.githubusercontent.com" "$1/out" && [ ! -s "$1/calls" ]' _ "$T/g2" "$RC"
+
+echo "-- an option without its value; a VM an earlier run did not finish"
+node "$T/v1"; zvm "$T/v1" --name
+check "an option that takes a value, given last without one: exit 2, said (it used to loop or end in bash's own error)" bash -c '[ "$2" = 2 ] && grep -q "die: --name needs a value" "$1/out"' _ "$T/v1" "$RC"
+zvm "$T/v1" --initial-role primary --third-vote
+check "…--third-vote the same" bash -c '[ "$2" = 2 ] && grep -q "die: --third-vote needs a value" "$1/out"' _ "$T/v1" "$RC"
+node "$T/v2"; echo '[{"vmid":109,"name":"zr2","node":"nodea","status":"stopped","tags":"zradio-building","type":"qemu"}]' > "$T/v2/vms.json"; zvm "$T/v2" "${BASE[@]}" --run
+check "a VM tagged as not finished on this node: refused with how to remove it; nothing built beside it" bash -c '[ "$2" = 2 ] && grep -q "die: zr2 (109) on nodea: a radio VM that an earlier run did not finish, or a drill" "$1/out" && grep -q "qm destroy <id> --purge" "$1/out" && ! grep -q "^qm" "$1/calls"' _ "$T/v2" "$RC"
+zvm "$T/v2" --run
+check "…and the bare command does not take it for a radio VM to update" bash -c '[ "$2" = 2 ] && ! grep -q "an update to" "$1/out" && grep -q "an earlier run did not finish" "$1/out"' _ "$T/v2" "$RC"
+node "$T/v3"; echo 1 > "$T/v3/install.rc"; zvm "$T/v3" "${BASE[@]}" --run
+check "the kit's installer fails in the new VM: exit 1, the VM keeps the not-finished tag, and the run ends with how to start over" bash -c '[ "$2" = 1 ] && ! grep -q "^qm set 109 --tags zradio$" "$1/calls" && [ "$(tail -1 "$1/out")" = "== zr2 (109) was not finished: nothing updates it or pairs with it as it is. To start over: qm stop 109; qm destroy 109 --purge; rm $1/store/snippets/zr2-zradio.yaml; then this again ==" ]' _ "$T/v3" "$RC"
+node "$T/v4"; zvm "$T/v4" "${BASE[@]}"
+check "a report-only run ends without that line: nothing was made" bash -c '[ "$2" = 0 ] && ! grep -q "was not finished" "$1/out"' _ "$T/v4" "$RC"
+
+echo "-- the second VM takes what a pair shares from the first; an option that says otherwise is refused"
+PAIR2=(--name zr2 --initial-role standby --self 10.20.30.6/24 --pair-bridge vmbrpair)
+node "$T/h1"; peer_vm "$T/h1" 120 radio1 primary; printf '%s\n' ZWAVE_PORT=7000 ELECTION=act SYNC_TZ=Etc/GMT+8 >> "$T/h1/g/120/root/etc/zradio/zradio.conf"; zvm "$T/h1" "${PAIR2[@]}" --run
+check "the first VM's ports, election mode and sync time zone are in the second VM's conf, with no option naming them" bash -c '[ "$2" = 0 ] && f="$1/store/snippets/zr2-zradio.yaml" && grep -qx "      ZWAVE_PORT=7000" "$f" && grep -qx "      ELECTION=act" "$f" && grep -qx "      SYNC_TZ=Etc/GMT+8" "$f" && grep -qx "      VRID=61" "$f"' _ "$T/h1" "$RC"; [ "$FAIL" = 0 ] || tail -5 "$T/h1/out"
+check "…and the line for Home Assistant carries that port" bash -c 'grep -q -- "_ --radios 10.20.30.50 --zwave-port 7000$" "$1/out"' _ "$T/h1"
+node "$T/h2"; peer_vm "$T/h2" 120 radio1 primary; echo ZWAVE_PORT=7000 >> "$T/h2/g/120/root/etc/zradio/zradio.conf"
+zvm "$T/h2" "${PAIR2[@]}" --conf ZWAVE_PORT=7001 --run
+check "--conf with another value than the first VM's: refused before anything, naming both" bash -c '[ "$2" = 2 ] && grep -q "die: --conf ZWAVE_PORT=7001: radio1 has ZWAVE_PORT=7000. Both VMs of a pair have the same one" "$1/out" && ! grep -q "^qm" "$1/calls"' _ "$T/h2" "$RC"
+zvm "$T/h2" "${PAIR2[@]}" --conf ZWAVE_PORT=7000 --run
+check "…the same value: taken" eq "$RC" 0
+node "$T/h3"; peer_vm "$T/h3" 120 radio1 primary; zvm "$T/h3" "${PAIR2[@]}" --vrid 62
+check "--vrid other than the first VM's: refused (the two would not hear each other)" bash -c '[ "$2" = 2 ] && grep -q "die: --vrid 62: radio1 has 61" "$1/out"' _ "$T/h3" "$RC"
+zvm "$T/h3" "${PAIR2[@]}" --vip 10.20.30.51/24
+check "--vip other than the first VM's: refused" bash -c '[ "$2" = 2 ] && grep -q "die: --vip 10.20.30.51: radio1 holds the pair.s floating address as 10.20.30.50" "$1/out"' _ "$T/h3" "$RC"
+zvm "$T/h3" "${PAIR2[@]}" --conf ELECTION=act
+check "a setting the first VM's conf does not name: a warning that the two must agree, and it goes on" bash -c '[ "$2" = 0 ] && grep -q "ELECTION=act: radio1.s zradio.conf does not set ELECTION" "$1/out"' _ "$T/h3" "$RC"
+
+echo "-- what counts as a stick; a stick another VM holds by its USB port"
+node "$T/u1"; mkdir -p "$T/u1/sys/1-5"; echo 10c4 > "$T/u1/sys/1-5/idVendor"; echo ea60 > "$T/u1/sys/1-5/idProduct"; echo "CP2102 USB to UART Bridge Controller" > "$T/u1/sys/1-5/product"; zvm "$T/u1" --sticks
+check "a plain serial adapter with a stick's USB id and another product name is not listed (the VM would not take it for one either); the sticks are" bash -c '[ "$2" = 0 ] && ! grep -q "^ *1-5 " "$1/out" && ! grep -q "CP2102 USB to UART" "$1/out" && grep -q "1-3.2.4 *10c4:ea60 .*Sonoff" "$1/out" && grep -q "1-3.2.1 *10c4:ea70" "$1/out"' _ "$T/u1" "$RC"; [ "$FAIL" = 0 ] || cat "$T/u1/out"
+node "$T/u2"; echo '[{"vmid":108,"name":"old2","node":"nodea","status":"running"}]' > "$T/u2/vms.json"; vmconf "$T/u2" nodea/108 "usb0: host=1-3.2.4"; zvm "$T/u2" "${BASE[@]}" --run
+check "a running VM holds the one stick of its model by its USB port (host=<port>): refused, nothing built" bash -c '[ "$2" = 1 ] && grep -q "the running VM old2 on nodea has the USB device 10c4:ea60 .* passed through already" "$1/out" && ! grep -q "^qm create" "$1/calls"' _ "$T/u2" "$RC"
+
+echo "-- root's keys in the cloud-init file"
+node "$T/k9"; echo 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeKeyFakeKeyFakeKeyFakeKeyFakeKeyFakeKey1234 me: the laptop #2' > "$T/k9/keys"; zvm "$T/k9" "${BASE[@]}" --run
+check "a key whose comment has a colon and a hash in it reaches cloud-init as that one string" bash -c '[ "$2" = 0 ] && python3 -c "import sys, yaml; k = yaml.safe_load(open(sys.argv[1]))[\"users\"][0][\"ssh_authorized_keys\"]; assert k == [\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeKeyFakeKeyFakeKeyFakeKeyFakeKeyFakeKey1234 me: the laptop #2\"], k" "$1/store/snippets/zr2-zradio.yaml"' _ "$T/k9" "$RC"
 finish

@@ -299,9 +299,9 @@ check "status shows the version and the hold" bash -c 'grep -q "version: term 7,
 echo "-- a VM without a peer yet, and a VM whose own address changed (DHCP)"
 conf "$T/wp" NAME=radio1 SELF=10.20.30.6 PEER=10.20.30.5 VIP=10.20.30.50/24 VRID=50 PRIORITY=110; render "$T/wp"
 conf "$T/np" NAME=radio1 SELF=10.20.30.6 VIP=10.20.30.50/24 VRID=50 PRIORITY=110; render "$T/np"
-check "no PEER: keepalived.conf is rendered without the unicast lines — those four are all that is missing, nothing is added" bash -c '[ "$3" = 0 ] && ! grep -q "unicast_" "$1/out" && grep -q "interface eth1" "$1/out" && grep -q "10.20.30.50/24 dev eth1" "$1/out" && [ "$(diff "$2/out" "$1/out" | grep -c "^<")" = 4 ] && [ "$(diff "$2/out" "$1/out" | grep -c "^>")" = 0 ] && diff "$2/out" "$1/out" | grep -q "^<  *10.20.30.5$"' _ "$T/np" "$T/wp" "$RC"
+check "no PEER: keepalived.conf is rendered without the unicast lines — those five are all that is missing, nothing is added" bash -c '[ "$3" = 0 ] && ! grep -q "unicast_" "$1/out" && grep -q "interface eth1" "$1/out" && grep -q "10.20.30.50/24 dev eth1" "$1/out" && [ "$(diff "$2/out" "$1/out" | grep -c "^<")" = 5 ] && [ "$(diff "$2/out" "$1/out" | grep -c "^>")" = 0 ] && diff "$2/out" "$1/out" | grep -q "^<  *10.20.30.5$"' _ "$T/np" "$T/wp" "$RC"
 adconf() { printf '%s\n' NAME=radio1 SELF=10.20.30.5 PEER=10.20.30.6 VIP=10.20.30.50/24 VRID=50 PRIORITY=110 > "$1/zradio.conf"; }
-host "$T/ad"; adconf "$T/ad"; fake "$T/ad/bin" ip 'printf "2: eth0    inet 10.20.30.5/24 scope global eth0\n2: eth0    inet 10.20.30.50/24 scope global secondary eth0\n"'
+host "$T/ad" 1; adconf "$T/ad"; fake "$T/ad/bin" ip 'printf "2: eth0    inet 10.20.30.5/24 scope global eth0\n2: eth0    inet 10.20.30.50/24 scope global secondary eth0\n"'
 ZRADIO_CONF="$T/ad/zradio.conf" serve "$T/ad" check
 check "check: 0 while an interface holds SELF" eq "$RC" 0
 fake "$T/ad/bin" ip 'printf "2: eth0    inet 10.20.30.99/24 scope global dynamic eth0\n"'
@@ -315,4 +315,92 @@ check "check: 0 when the addresses cannot be read at all (not a reason to hold a
 grep -v '^PEER=' "$T/ad/zradio.conf" > "$T/ad/np.conf"; ZRADIO_CONF="$T/ad/np.conf" serve "$T/ad" status
 check "status of a VM without a peer says so" bash -c 'grep -q "peer: none yet" "$1/out"' _ "$T/ad"
 
+echo "-- the role and the serving must agree: a VM that holds the address and does not serve; one that serves without the role"
+role() { echo "$2 2026-11-12T00:00:00Z priority=100" > "$1/run/role"; [ -z "${3:-}" ] || touch -d "$3" "$1/run/role"; }
+unserved() { echo $(( $(date +%s) - ${2:-120} )) > "$1/run/unserved-since"; }      # the check has seen this VM hold the address without serving for that many seconds, up to now
+host "$T/rs0"; role "$T/rs0" MASTER '2 minutes ago'; serve "$T/rs0" check
+check "the FIRST check that sees the address without the serving passes, whatever the role file's age (keepalived sets the address before its notify writes that file): it only notes the moment" bash -c '[ "$2" = 0 ] && [ ! -e "$1/run/serve-failed" ] && [ -e "$1/run/unserved-since" ]' _ "$T/rs0" "$RC"
+unserved "$T/rs0" 600; touch -d '1 hour ago' "$T/rs0/run/unserved-since"; serve "$T/rs0" check
+check "a count left over from an earlier time (no check has seen it since): it starts again, the check passes" bash -c '[ "$2" = 0 ] && [ ! -e "$1/run/serve-failed" ]' _ "$T/rs0" "$RC"
+host "$T/rs"; role "$T/rs" MASTER '2 minutes ago'; unserved "$T/rs"; serve "$T/rs" check
+check "MASTER for a while, ser2net not active, nobody at the sticks: the check fails and the VM takes itself out (serve-failed), with one loud line" bash -c '[ "$2" = 1 ] && [ -e "$1/run/serve-failed" ] && [ "$(grep -c "event=serve result=loud step=not-serving" "$1/journal")" = 1 ]' _ "$T/rs" "$RC"
+serve "$T/rs" check
+check "…the next checks fail on the mark, and say nothing more" bash -c '[ "$2" = 1 ] && [ "$(grep -c "step=not-serving" "$1/journal")" = 1 ]' _ "$T/rs" "$RC"
+host "$T/rs2"; role "$T/rs2" MASTER; serve "$T/rs2" check
+check "MASTER since a moment ago (zradio-serve up is on its way): the check passes" bash -c '[ "$2" = 0 ] && [ ! -e "$1/run/serve-failed" ]' _ "$T/rs2" "$RC"
+host "$T/rs3"; role "$T/rs3" MASTER '2 minutes ago'; unserved "$T/rs3"; flock "$T/rs3/run/sticks.lock" sleep 3 & LP=$!; sleep 0.5; serve "$T/rs3" check; wait $LP 2>/dev/null
+check "MASTER, not serving, but someone is at the sticks (an up waiting, a sync's read): the check passes" bash -c '[ "$2" = 0 ] && [ ! -e "$1/run/serve-failed" ]' _ "$T/rs3" "$RC"
+host "$T/rs4" 1; role "$T/rs4" MASTER '2 minutes ago'; unserved "$T/rs4"; serve "$T/rs4" check
+check "MASTER and serving: passes, and the noted moment is dropped (the next time counts from its own start)" bash -c '[ "$2" = 0 ] && [ ! -e "$1/run/unserved-since" ]' _ "$T/rs4" "$RC"
+host "$T/rs5"; role "$T/rs5" BACKUP '2 minutes ago'; serve "$T/rs5" check
+check "BACKUP and not serving: passes (the check is the same for a standby)" bash -c '[ "$2" = 0 ] && [ ! -e "$1/run/serve-failed" ]' _ "$T/rs5" "$RC"
+check "the check writes no file but that mark and the noted moment, and touches no stick" bash -c '[ ! -s "$1/calls" ] && [ ! -s "$2/calls" ] && [ -z "$(ls "$2/run" | grep -v "^role$")" ]' _ "$T/rs" "$T/rs5"
+
+host "$T/rh" 1; role "$T/rh" BACKUP '2 minutes ago'; serve "$T/rh" hush
+check "ser2net active and keepalived's last word BACKUP for a while: hush says so loudly and stops the serving through its unit" bash -c '[ "$2" = 0 ] && grep -q "event=serve result=loud step=role" "$1/journal" && grep -q "^systemctl stop zradio-serve.service" "$1/calls"' _ "$T/rh" "$RC"
+check "…and where the unit's stop did not do it, by itself: ser2net stopped, the receiver off, the coordinator reset" bash -c '[ "$(cat "$1/ser2net")" = 0 ] && grep -q -- "--rf-receive off" "$1/calls" && grep -q -- "--zigbee-reset" "$1/calls"' _ "$T/rh"
+host "$T/rh2" 1; role "$T/rh2" BACKUP; serve "$T/rh2" hush
+check "…the role changed a moment ago (the unit's own stop is on its way): hush stands back" bash -c '[ "$2" = 0 ] && [ ! -s "$1/calls" ] && [ "$(cat "$1/ser2net")" = 1 ]' _ "$T/rh2" "$RC"
+host "$T/rh3" 1; role "$T/rh3" MASTER '2 minutes ago'; serve "$T/rh3" hush
+check "…MASTER and serving: nothing to hush, as before" bash -c '[ "$2" = 0 ] && [ ! -s "$1/calls" ]' _ "$T/rh3" "$RC"
+
+host "$T/ru"; touch "$T/ru/nostart"; serve "$T/ru" up
+check "up: the receiver came on and ser2net then did not start: the receiver is turned off again (the stick must not listen beside the VM that serves), and the VM is out" bash -c '[ "$2" = 1 ] && [ -e "$1/run/serve-failed" ] && [ "$(grep -- "--rf-receive" "$1/calls" | tail -1 | grep -c -- "--rf-receive off")" = 1 ]' _ "$T/ru" "$RC"
+
+echo "-- …and the truth about the role is the floating address itself, where it can be seen (keepalived's notifies can arrive in either order)"
+addr() { # addr <dir> [vip]: a conf, and an `ip` on which this VM holds its own address — and the floating one, with "vip"
+  actconf "$1" observe
+  fake "$1/bin" ip "echo '2: eth0    inet 10.20.30.5/24 brd 10.20.30.255 scope global eth0'; [ '${2:-}' != vip ] || echo '2: eth0    inet 10.20.30.50/24 scope global secondary eth0'"
+}
+host "$T/ra0"; addr "$T/ra0" vip; role "$T/ra0" BACKUP '5 hours ago'; ZRADIO_CONF="$T/ra0/zradio.conf" serve "$T/ra0" check
+check "a takeover's first milliseconds: the address is here, the role file still says BACKUP from hours ago, ser2net is not up yet — the check passes (it failed a VM that had just taken over)" bash -c '[ "$2" = 0 ] && [ ! -e "$1/run/serve-failed" ]' _ "$T/ra0" "$RC"
+host "$T/ra"; addr "$T/ra" vip; role "$T/ra" BACKUP '2 minutes ago'; unserved "$T/ra"; ZRADIO_CONF="$T/ra/zradio.conf" serve "$T/ra" check
+check "the role file says BACKUP (a notify that was written last though it came first), but this VM HOLDS the floating address and does not serve: the check fails and takes it out" bash -c '[ "$2" = 1 ] && [ -e "$1/run/serve-failed" ] && grep -q "step=not-serving" "$1/journal"' _ "$T/ra" "$RC"
+host "$T/rb"; addr "$T/rb"; role "$T/rb" MASTER '2 minutes ago'; ZRADIO_CONF="$T/rb/zradio.conf" serve "$T/rb" check
+check "the role file says MASTER, but the address is not here: there is nothing to serve, and the check passes" bash -c '[ "$2" = 0 ] && [ ! -e "$1/run/serve-failed" ]' _ "$T/rb" "$RC"
+host "$T/rc" 1; addr "$T/rc"; role "$T/rc" MASTER '2 minutes ago'; ZRADIO_CONF="$T/rc/zradio.conf" serve "$T/rc" hush
+check "hush: ser2net is active, the role file says MASTER, but the address is not here: this VM serves without the role — stopped" bash -c '[ "$2" = 0 ] && grep -q "event=serve result=loud step=role" "$1/journal" && [ "$(cat "$1/ser2net")" = 0 ]' _ "$T/rc" "$RC"
+host "$T/rd" 1; addr "$T/rd" vip; role "$T/rd" BACKUP '2 minutes ago'; ZRADIO_CONF="$T/rd/zradio.conf" serve "$T/rd" hush
+check "hush: ser2net is active and the address IS here, whatever the role file says: not stopped" bash -c '[ "$2" = 0 ] && [ "$(cat "$1/ser2net")" = 1 ] && ! grep -q "step=role" "$1/journal"' _ "$T/rd" "$RC"
+
+echo "-- stick-wedged names a stick: only that stick's answer clears it"
+host "$T/wk"; mkdir -p "$T/wk/state"; printf 'ZWAVE=synced\nZWAVE_FAMILY=zwave-800\nZIGBEE=served\nZIGBEE_FAMILY=ezsp\n' > "$T/wk/radios.conf"; echo "zigbee 2026-11-12T02:40:00Z" > "$T/wk/state/stick-wedged"; serve "$T/wk" hush
+check "the mark names the Zigbee stick, which is served only (never asked): the Z-Wave stick's answer does not clear it, and it says how it is cleared" bash -c '[ -e "$1/state/stick-wedged" ] && grep -q "stick-wedged stays: it names the zigbee stick, which is served only" "$1/out" && grep -q "rm $1/state/stick-wedged" "$1/out"' _ "$T/wk"
+host "$T/wl"; mkdir -p "$T/wl/state"; printf 'ZWAVE=synced\nZWAVE_FAMILY=zwave-800\nZIGBEE=served\nZIGBEE_FAMILY=ezsp\n' > "$T/wl/radios.conf"; echo "zwave 2026-11-12T02:40:00Z" > "$T/wl/state/stick-wedged"; serve "$T/wl" hush
+check "…the mark names the Z-Wave stick, which was asked and answered: cleared" bash -c '[ ! -e "$1/state/stick-wedged" ]' _ "$T/wl"
+
+echo "-- a new turn drops what an earlier turn left pending"
+host "$T/np"; mkdir -p "$T/np/state"; echo '{"attempts": 4}' > "$T/np/state/sync-pending.json"; serve "$T/np" up
+check "up: the pending mark of an earlier turn is gone (its count of failed tries would hold this turn's first sync back for hours)" bash -c '[ "$2" = 0 ] && [ ! -e "$1/state/sync-pending.json" ]' _ "$T/np" "$RC"
+echo "-- the conf files hold the kit's own keys and no others"
+refused "a key the kit does not know (ELECTION mistyped: the default would have stayed, without a word)" "ELECTON: not a key of this file" NAME=radio2 SELF=10.20.30.6 PEER=10.20.30.5 VIP=10.20.30.50/24 VRID=50 PRIORITY=100 ELECTON=act
+refused "a key that is a variable of the tools themselves (the file is sourced)" "STATE: not a key of this file" NAME=radio2 SELF=10.20.30.6 PEER=10.20.30.5 VIP=10.20.30.50/24 VRID=50 PRIORITY=100 STATE=/tmp/x
+mkdir -p "$T/rk"; printf 'ZWAVE=synced\nZWAVE_FAMILY=zwave-800\nZIGBEE=none\nPATH=/tmp\n' > "$T/rk/radios.conf"
+check "radios.conf too: a key that is not one of its own refuses the file" bash -c 'export ZRADIO_RADIOS="$1/radios.conf"; . "$2/guest/lib/zradio-common.sh"; ! zr_load_radios && [[ "$ZR_ERR" == *"PATH: not a key of this file"* ]]' _ "$T/rk" "$KIT"
+printf '%s\n' ZWAVE=synced ZWAVE_FAMILY=zwave-800 ZWAVE_TTY=/dev/zradio-zwave ZWAVE_BAUD=115200 ZWAVE_FLOW=none ZIGBEE=served ZIGBEE_FAMILY=ezsp ZIGBEE_TTY=/dev/zradio-zigbee ZIGBEE_BAUD=115200 ZIGBEE_FLOW=hardware > "$T/rk/radios.conf"
+check "…and every key zradio-detect writes is one of them" bash -c 'export ZRADIO_RADIOS="$1/radios.conf"; . "$2/guest/lib/zradio-common.sh"; zr_load_radios && [ "$ZIGBEE_FLOW" = hardware ]' _ "$T/rk" "$KIT"
+
+echo "-- zradio-notify: the release of the version waits for the version lock"
+host "$T/nl"; mkdir -p "$T/nl/state"; echo "term=4 used=yes" > "$T/nl/state/version"; notify "$T/nl" INSTANCE RADIO MASTER 100
+( exec 6>"$T/nl/run/version.lock"; flock 6; command -p sleep 1; echo "term=9 used=yes" > "$T/nl/state/version" ) & LP=$!
+command -p sleep 0.3; notify "$T/nl" INSTANCE RADIO STOP 100; wait "$LP"
+check "a sync's landing holds the lock and writes the version: the release comes after it, and the version that landed is the one released (not written over, not lost)" eq "$(cat "$T/nl/state/version")" "term=9 used=no"
+check "no role file of a fixed temporary name is left behind" bash -c '[ -z "$(ls "$1/run" | grep "^role\.")" ] && grep -q "^STOP " "$1/run/role"' _ "$T/nl"
+
+echo "-- zradio-render: with a peer, adverts are taken from the peer's address only"
+conf "$T/cu" NAME=radio2 SELF=10.20.30.6 PEER=10.20.30.5 VIP=10.20.30.50/24 VRID=50 PRIORITY=100; render "$T/cu"
+check "check_unicast_src is in the instance (another host of that network cannot claim the floating address with an advert of its own)" bash -c '[ "$2" = 0 ] && grep -qx "    check_unicast_src" "$1/out"' _ "$T/cu" "$RC"
+conf "$T/cn" NAME=radio2 SELF=10.20.30.6 VIP=10.20.30.50/24 VRID=50 PRIORITY=100; render "$T/cn"
+check "no peer yet (multicast adverts): the line is not there" bash -c '[ "$2" = 0 ] && ! grep -q "unicast_" "$1/out"' _ "$T/cn" "$RC"
+
+echo "-- up: only on a VM that holds the floating address"
+host "$T/ug"; addr "$T/ug"; role "$T/ug" MASTER; ZRADIO_SERVE_ADDR_WAIT=2 ZRADIO_CONF="$T/ug/zradio.conf" serve "$T/ug" up
+check "the unit was started (keepalived's notifies came in the wrong order, or by hand) and the address is not here: nothing started, no stick touched, and not taken out of the election" bash -c '[ "$2" = 1 ] && [ "$(cat "$1/ser2net")" = 0 ] && grep -q "step=no-address" "$1/journal" && [ ! -e "$1/run/serve-failed" ] && ! grep -q "rf-receive" "$1/calls"' _ "$T/ug" "$RC"
+host "$T/uh"; addr "$T/uh" vip; role "$T/uh" MASTER; ZRADIO_CONF="$T/uh/zradio.conf" serve "$T/uh" up
+check "the address is here: served" bash -c '[ "$2" = 0 ] && [ "$(cat "$1/ser2net")" = 1 ]' _ "$T/uh" "$RC"
+host "$T/ui"; addr "$T/ui"; role "$T/ui" MASTER; ZRADIO_CONF="$T/ui/zradio.conf" serve "$T/ui" up --force
+check "up --force (a person who knows why): served without the address" bash -c '[ "$2" = 0 ] && [ "$(cat "$1/ser2net")" = 1 ]' _ "$T/ui" "$RC"
+echo "-- zradio-notify: a change of state starts the health check's count again"
+host "$T/nu"; : > "$T/nu/run/unserved-since"; notify "$T/nu" INSTANCE RADIO MASTER 100
+check "the noted moment of an earlier time without serving is gone with the new state" bash -c '[ ! -e "$1/run/unserved-since" ]' _ "$T/nu"
 finish

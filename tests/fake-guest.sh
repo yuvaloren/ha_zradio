@@ -15,8 +15,8 @@ vm() { # vm <dir> [radios: both|zwave-only|served|blank] [ser2net active: 0|1]
   fake "$d/bin" systemctl "$rec; case \"\$1\" in is-active) u=\${*: -1}; [ \"\$(cat '$d/'\$u 2>/dev/null)\" = 1 ];; disable) case \" \$* \" in *' --now '*) echo 0 > '$d/'\${*: -1};; esac;; *) exit 0;; esac"
   fake "$d/bin" dpkg-query "grep -qx \"\${*: -1}\" '$d/pkgs' && { case \"\$*\" in *Status*) printf 'install ok installed';; *) printf '1.2.3-1';; esac; exit 0; }; exit 1"
   fake "$d/bin" apt-get "$rec; [ -f '$d/apt-fail' ] && exit 100; echo \"\${*: -1}\" >> '$d/pkgs'; case \"\${*: -1}\" in keepalived|ser2net) echo 1 > '$d/'\${*: -1};; esac; exit 0"
-  fake "$d/bin" keepalived "$rec; [ -f '$d/kt-fail' ] && { echo 'Unknown keyword'; exit 1; }; exit 0"
-  fake "$d/bin" podman "$rec; case \"\$1 \$2\" in 'image exists') [ -f '$d/have-image' ];; 'pull -q') : > '$d/have-image';; esac"
+  fake "$d/bin" keepalived "$rec; [ -f '$d/kt-fail' ] && { echo 'Unknown keyword'; exit 1; }; [ -f '$d/kt-warn' ] && echo \"(x: Line 31) Unknown keyword 'check_unicast_srcx'\"; exit 0"
+  fake "$d/bin" podman "$rec; case \"\$1 \$2\" in 'image exists') [ -f '$d/have-image' ];; 'pull -q') : > '$d/have-image';; 'images --noheading') cat '$d/images' 2>/dev/null;; 'image inspect') echo 714decaa608057df637641ce2da9e6325654639ae67ca606fc35113c45957a66;; 'run --rm') [ ! -f '$d/start-fail' ] || { echo 'Error: crun: exec container process: Operation not permitted' >&2; exit 126; }; echo v24.22.1;; rmi\ *) [ ! -f '$d/rmi-fail' ];; esac"
   cat > "$d/detect" <<SH
 #!/usr/bin/env bash
 echo "zradio-detect \$*" >> "$d/calls"
@@ -27,10 +27,18 @@ case "$radios" in
   zwave-only) printf 'ZWAVE=synced\nZWAVE_FAMILY=zwave-800\nZIGBEE=none\n' > "\$ZRADIO_DETECT_ETC/radios.conf";;
   served) printf 'ZWAVE=served\nZWAVE_FAMILY=zwave-500\nZIGBEE=served\nZIGBEE_FAMILY=ezsp\nZIGBEE_BAUD=115200\n' > "\$ZRADIO_DETECT_ETC/radios.conf";;
 esac
-net=true; [ "$radios" = blank ] && net=false
+net=true; [ "$radios" = blank ] && net=false; [ -f "$d/detect-unknown" ] && net=null
 printf '{"radios": {"zwave": {"level": "%s", "holds_network": %s}, "zigbee": {"level": "%s", "holds_network": %s}}}\n' "\$(sed -n 's/^ZWAVE=//p' "\$ZRADIO_DETECT_ETC/radios.conf")" \$net "\$(sed -n 's/^ZIGBEE=//p' "\$ZRADIO_DETECT_ETC/radios.conf")" \$net > "\$ZRADIO_DETECT_ETC/radios.json"
 echo "Z-Wave: found"; exit 0
 SH
   chmod +x "$d/detect"
-  printf '#!/usr/bin/env bash\necho "zigpy-setup $*" >> %q\nmkdir -p "$1/bin" && printf "#!/bin/sh\\n" > "$1/bin/zigpy" && chmod +x "$1/bin/zigpy"\n' "$d/calls" > "$d/zigpy-setup"; chmod +x "$d/zigpy-setup"
+  # the venv's maker: zigpy, and a pip that answers `show` (the release: <dir>/zigpy-has, else 2.0.0) and `freeze` (<dir>/zigpy-freeze)
+  cat > "$d/zigpy-setup" <<SH
+#!/usr/bin/env bash
+echo "zigpy-setup \$*" >> "$d/calls"
+[ ! -f "$d/zigpy-fail" ] || exit 1
+mkdir -p "\$1/bin" && printf '#!/bin/sh\n' > "\$1/bin/zigpy" && chmod +x "\$1/bin/zigpy"
+printf '#!/bin/sh\ncase "\$1" in show) echo "Version: \$(cat %s/zigpy-has 2>/dev/null || echo 2.0.0)";; freeze) cat %s/zigpy-freeze 2>/dev/null;; esac\n' "$d" "$d" > "\$1/bin/pip" && chmod +x "\$1/bin/pip"
+SH
+  chmod +x "$d/zigpy-setup"
 }

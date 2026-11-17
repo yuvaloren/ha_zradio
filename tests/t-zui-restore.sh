@@ -53,4 +53,11 @@ OUT=$(python3 "$TOOL" read --url "http://127.0.0.1:1" --wait 1 2>&1); RC=$?
 check "nothing listens: exit 1, no traceback" bash -c '[ "$1" = 1 ] && ! printf "%s" "$2" | grep -q Traceback' _ "$RC" "$OUT"
 OUT=$(python3 "$TOOL" restore --url "$URL" --wait 1 2>&1); RC=$?
 check "restore without --nvm: usage, exit 2" eq "$RC" 2
+srv "$T/f" second-503
+OUT=$(python3 "$TOOL" restore --url "$URL" --nvm "$T/nvm.bin" --wait 5 2>&1); RC=$?
+check "Z-Wave JS UI is gone between the read and the write: a FAIL line that names the answer, exit 1, no traceback" bash -c '[ "$1" = 1 ] &&
+  printf "%s" "$2" | grep -q "^FAIL  restoreNVM did not answer: NotAnswering: .*503" && ! printf "%s" "$2" | grep -q Traceback' _ "$RC" "$OUT"
+check "…and nothing was written" bash -c '! grep -q restoreNVM "$1"' _ "$T/f/calls"
+OUT=$(python3 "$TOOL" read --url "http://127.0.0.1:port" --wait 1 2>&1); RC=$?
+check "a --url whose port is not a number: usage, exit 2, no traceback" bash -c '[ "$1" = 2 ] && ! printf "%s" "$2" | grep -q Traceback' _ "$RC" "$OUT"
 finish

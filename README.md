@@ -4,9 +4,6 @@ Z-Wave and Zigbee for Home Assistant that survive a dead server. Two small VMs, 
 own sticks. One serves the sticks to Home Assistant over the network; the other keeps a copy of both networks on its
 sticks and takes over within seconds. Home Assistant talks to one floating address.
 
-**Status: under construction, and not yet run on real hardware.** The code is tested against a fake Proxmox cluster
-and fake sticks only. The scripts it grew out of have run one real pair since 2026-11-11.
-
 ## Install
 
 You need two Proxmox nodes in one cluster, a Z-Wave and/or Zigbee stick on each, and a network with DHCP that Home
@@ -22,14 +19,14 @@ It downloads the kit into `/opt/ha_zradio/<version>` and runs its installer (`./
 clone the repository and run `./install.sh` yourself.
 
 It asks a few questions, shows what it will do, and does it after a `y`. Then run the same on the other node: there
-it finds the first VM, takes the network from it, and sets up the keys between the two. At the end it prints the
+it finds the first VM, takes the pair's addresses and settings from it, and sets up the keys between the two. At the end it prints the
 addresses to enter in Home Assistant.
 
 **To update**, run the same line again on either node. It finds the pair, says which kit each VM runs, and updates
 the ones that need it (or says they are up to date) after a `y`. The radios keep running.
 
 Each VM gets its own address from DHCP, and the pair knows it by that address from then on. **Reserve it in your
-DHCP server** (each run ends with the address and the MAC). A VM whose address changes stops serving until it has
+DHCP server** (the VM's install ends with the address and the MAC). A VM whose address changes stops serving until it has
 the old one back. Fixed addresses instead: `--self`, `--peer`, `--gateway`. With a link of its own between the
 nodes (`--pair-bridge`), the floating address is on that link, and Home Assistant has to reach it there.
 
@@ -60,9 +57,11 @@ small Linux box will do; a VM on either node will not. Two steps, each of which 
 after a `y`:
 
 1. **On that machine, as root:** the same install line as on the nodes. It sees that the machine is not a Proxmox
-   node and says that it sets up the third vote there, not a radio VM. With docker (a NAS) it builds and starts a
-   container; on Debian, Ubuntu or Raspberry Pi OS without docker it installs Debian's `corosync-qnetd` package. It
-   ends with the line for a node, and a one-time password.
+   node and says that it sets up the third vote there, not a radio VM. On Debian, Ubuntu or Raspberry Pi OS it
+   installs Debian's `corosync-qnetd` package; anywhere else with docker (a NAS), or with `--docker`, it makes and
+   starts a container. It ends with the line for a node, and with the container a one-time password. The line
+   carries that machine's SSH host key, so the node talks to it and to nobody else. The container's SSH server is
+   for this setup: it closes by itself afterward.
 2. **On one node:** that line. It asks for the password once, installs `corosync-qdevice` on both nodes, runs
    Proxmox's own `pvecm qdevice setup`, and checks that the cluster now keeps its quorum without one node.
 
@@ -87,7 +86,7 @@ already) and asks. If you do not know the address: the install line on either Pr
 ends with this line, the address filled in; and each radio VM's Notes in Proxmox name it. It does not search the
 network for the pair: the pair's two ports are all that would answer, and touching them cuts Home Assistant off.
 
-It installs nothing and changes nothing. It reads how Home Assistant's Z-Wave and Zigbee are connected now, and says
+It changes nothing in Home Assistant. It reads how Home Assistant's Z-Wave and Zigbee are connected now, and says
 `OK`, or the steps for your setup, with the names of the menus (Home Assistant 2026.11's). Run it again afterward
 and it checks them. It does not do the steps for you: Home Assistant changes these paths only in its own dialogs,
 which stop the integration and try the stick before they save.
@@ -97,9 +96,9 @@ The same steps by hand:
 **Zigbee (ZHA).** The path is `socket://<floating address>:6638`.
 
 - ZHA that used a stick on its own machine, with that stick now in the pair: Settings > Devices & services > Zigbee
-  Home Automation > Configure > "Change the current adapter's settings" (not "Migrate to a new adapter"), and type
-  the path as the serial device path. If it asks how to migrate: "Migrate manually", then "Keep adapter network
-  settings". The stick already holds the network.
+  Home Automation > the gear. On ZHA's page, "Migrate adapter": Migrate. Confirm the backup, then choose "Change the
+  current adapter's settings" (not "Migrate to a new adapter"), and type the path as the serial device path. If it
+  asks how to migrate: "Migrate manually", then "Keep adapter network settings". The stick already holds the network.
 - A new ZHA: Add integration > Zigbee Home Automation, and the same path. With sticks that hold your network, choose
   "Set up manually", then "Keep adapter network settings". "Set up automatically" erases the stick and creates a new
   network: that one is for a new house.
@@ -134,8 +133,12 @@ In a radio VM (`qm guest exec <id> -- <command>` on its node, or ssh):
 | Command | |
 |---|---|
 | `zradio-serve status` | who serves, and anything holding this VM back |
-| `zradio-sync run --reason manual` | sync now (pauses the radios about 12 s) |
+| `zradio-sync run --reason manual` | sync now (Home Assistant is without the radios for 15 to 30 s) |
+| `zradio-sync status` | the last sync, and what the standby holds |
+| `zradio-sync reapply` | on the standby: write the last received copy onto its sticks again (after a write that failed) |
 | `zradio-switch --run` | hand the radios to the other VM |
+| `zradio-gate status` | the election on this VM: its version of the networks, its marks, and what they mean |
+| `systemctl start zradio.target` | put this VM into the pair (a reboot does too); `systemctl stop keepalived` takes it out |
 | `journalctl -t zradio` | every decision, one line each |
 
 ## What to expect
@@ -146,16 +149,18 @@ Measured on the pair this kit was extracted from (about 50 Z-Wave nodes):
 |---|---|---|
 | Planned switch | 1.3 s | 7 s |
 | The serving VM dies | about 5 s | about 14 s |
-| A sync (nightly, and after a device is added or removed) | paused 14 s | paused 26–28 s |
+| A sync (nightly, and after a device is added or removed) | after 14 s | after 26–28 s |
 
 ## More
 
-- [docs/DESIGN.md](docs/DESIGN.md): how it works, every option, what is not built.
-- Versions: a release is a git tag; the installers stamp each VM with the kit it runs (docs/DESIGN.md, "Updating").
+- [docs/DESIGN.md](docs/DESIGN.md): how it works and why, every option, what is not built, what has run where.
+- Versions: a release is a GitHub release of a git tag; the installers stamp each VM with the kit it runs
+  (docs/DESIGN.md, "Updating"). Another version than the latest: `ZRADIO_REF=<tag or branch>` before the install line.
 - Tests: `bash tests/run.sh` on Linux, `bash tests/docker.sh` anywhere else (macOS lacks the GNU tools they need).
   No hardware needed; they also run on every push (`.github/workflows/tests.yml`). `bash tests/vote-real.sh` (needs
-  docker) tests the third vote's container with the real programs, and `bash tests/hass-real.sh` Home Assistant's
-  side on the kind of machine its terminal is.
+  docker) tests the third vote's container with the real programs, `bash tests/vote-bash.sh` its script under the
+  old bash a NAS may have, and `bash tests/hass-real.sh` Home Assistant's side on the kind of machine its terminal
+  is.
 - To see the install without a Proxmox node: `tests/try.sh` (needs docker) is a shell on a pretend two-node cluster
   where `./install.sh` asks and prints what it would on a real one. Proxmox, the VMs and the sticks are fakes.
 - MIT. The list of known sticks is built at install time from Home Assistant core's USB lists (Apache-2.0); the

@@ -4,32 +4,45 @@ TI Z-Stack coordinator (ZNP, the Monitor and Test API). A few single-purpose wri
 --wipe (only), a stick that holds a named network is blanked. Stdlib only (Python >= 3.9).
 
     zradio-probe.py --zwave /dev/zradio-zwave --zigbee /dev/zradio-zigbee     # the ttys (nothing else may hold them)
-    zradio-probe.py --zwave tcp://127.0.0.1:16639                             # through a ser2net port (reads only)
     ... --json                                                                # JSON on stdout, the human lines on stderr
-  local tty only, one write each, then the same reads:
+  one write each, then the same reads:
     --soft-reset          Z-Wave SoftReset: the controller restarts and reloads its NVM (zradio-apply, after a restore)
-    --rf-receive off|on   Z-Wave SetRFReceiveMode: the receiver off silences a standby's stick (zradio-serve)
+    --rf-receive off|on   Z-Wave SetRFReceiveMode: the receiver off silences a standby's stick (zradio-serve, -sync, -apply)
     --zigbee-reset        ZNP SYS_RESET_REQ: the coordinator leaves the air until a host starts it (zradio-serve)
     --nvm-dump FILE       Z-Wave NVM read (Open/Read/Close), 0600 (zradio-sync's read; no write)
+  for a person, run by no tool of the kit:
     --wipe --zwave TTY --zigbee TTY --expect-zwave-home-id N --expect-zigbee-ieee EUI64 --expect-zigbee-extpan EUI64
 
-Who runs it: zradio-detect (which stick is what), zradio-serve, zradio-sync and zradio-apply (the flags above).
+Who runs it: zradio-detect (the plain reads: which stick is what), zradio-serve (--rf-receive, --zigbee-reset, the plain
+Zigbee read), zradio-sync (--rf-receive, --nvm-dump) and zradio-apply (--rf-receive, --soft-reset, the plain Z-Wave
+read). --wipe and its --expect-* flags are for a person: the hand tool that blanks a retired stick, or the standby's
+stick of a "served only" family (docs/DESIGN.md).
+
+Local ttys only. A network port (ser2net's) leads to the stick of the VM that serves: once a network is copied, the
+live stick and its copy answer the same identities, and only the host tells them apart; and ser2net hands its port to
+the newest client, so even a read there would take the stick from Home Assistant. A port spec with "://" is a usage error.
 
 Exit: 0 every radio asked for answered its mandatory reads; 1 one did not (or its tty is locked by another process);
 2 usage. --wipe: 0 every stick wiped (and re-probed blank) or blank already; 1 a wipe failed (the other stick untouched);
-3 refused — nothing was written to any stick. Times: --timeout per command (5 s), --budget per radio and phase (45 s),
---connect-timeout (5 s); --reset-timeout overrides the HardReset callback / SYS_RESET_IND bound (the drivers' 30 s).
+3 refused — nothing was written to any stick. Times: --timeout per command (5 s), --budget per radio and phase (45 s);
+--reset-timeout overrides the HardReset callback / SYS_RESET_IND bound (the drivers' 30 s).
 
-What it may send, enforced at the lowest send path:
-  - reads: the functions in ZW_READ_ONLY / ZNP_READ_ONLY; anything else is refused before a byte is sent.
-  - each single-purpose write only in a session its flag allowed (ZWave.allow_*, ZNP.allow_reset).
-  - the wipe's writes (ZW_WIPE; ZNP_WIPE with exactly zigpy-znp's NV items and value) only with --wipe, and only on
-    local ttys: once a network is copied, the live stick and its copy answer the same identities, and through a
-    network port only the host would tell them apart — so a tcp:// port with --wipe is a usage error.
+What it may send:
+  - reads: the functions in ZW_READ_ONLY / ZNP_READ_ONLY, and of SerialAPISetup and the NVM functions only the
+    sub-commands in ZW_SETUP_GETS / ZW_NVM_READS. ZWave.request() and ZNP._exchange() — the one path every read takes
+    to the wire — refuse anything else before a byte is sent.
+  - each single-purpose write (SoftReset, SetRFReceiveMode, SYS_RESET_REQ) is sent by its own function, which writes
+    its one frame itself and first checks that this session's flag allowed it (ZWave.allow_*, ZNP.allow_reset).
+  - the wipe's writes (HardReset by ZWave.hard_reset; ZNP_WIPE through _exchange, with exactly zigpy-znp's NV items and
+    value) only in a session made with --wipe.
+  - the modem lines: the probe sets none, and clears HUPCL on the port so that closing it does not drop DTR and RTS
+    (boards that wire them to the radio's reset or bootloader pins take a change for a command). Not avoided: Linux
+    raises both lines when a port is opened — a change where they were down (a port not opened since it was plugged
+    in, or one whose last user closed it with HUPCL set).
 
 The wipe (a retired stick, or the standby stick of a "served only" family). Every stick is first probed read-only:
   Z-Wave  home ID = --expect-zwave-home-id -> the stale copy: wipe; only its own node (another home ID) -> blank: skip;
-          anything else (another network, no answer) -> refuse
+          anything else (another network, a node list that could not be read, no answer) -> refuse
   Zigbee  on a network as --expect-zigbee-ieee -> wipe; not on a network, not running, NV EXTENDED_PAN_ID not the
           network's -> blank: skip; not on a network but still running as that IEEE, or NV still holding the
           network's extended PAN (a wipe that stopped between the deletes and the reset) -> wipe again;
@@ -51,13 +64,21 @@ Why it reads the way it does:
   - Z-Wave: one NAK first, as zwave-js resets the link at startup; every frame received is ACKed; a request not ACKed
     within 1.6 s, or answered NAK/CAN, is sent again (3 attempts). A stick just powered on answers CAN and repeats
     SerialAPIStarted until ACKed: settle() answers that first.
-  - Z-Wave verdict: blank = the classic node list holds only the controller's own node (a blank stick has no Long
-    Range nodes either; they are not read).
-  - ZNP: the bootloader-skip byte 0xEF first (no RTS/DTR toggling: through ser2net there are no modem lines).
-  - ZNP verdict, zigpy-znp's own rule: BDBNODEISONANETWORK absent or not 0x01 = blank; 0x01 = live; a read that
-    answers another status = unknown, never blank.
-References read: zwave-js 15.29.0 (packages/serial, packages/zwave-js Driver.ts) and zigpy-znp 1.1.0 (frames.py,
-commands/, types/nvids.py, api.py, nvram.py). [V] = verified on the reference sticks; [H] = not verified.
+  - Z-Wave verdict: live = a node other than the controller's own in either list — the classic one (ids 1-232,
+    GetSerialApiInitData) or the Long Range one (ids 256+, GetLongRangeNodes, asked where the controller's function
+    list has it: a network of Long Range devices only has nothing in the classic list). blank = neither has one.
+    unknown, never blank = the classic list is empty of others and the Long Range list could not be read.
+  - ZNP: the bootloader-skip byte 0xEF first (zigpy-znp toggles RTS/DTR as well; this does not).
+  - ZNP verdict. Z-Stack 3 (SYS_PING's capabilities have APP_CNF: zigpy-znp's detect_zstack_version):
+    BDBNODEISONANETWORK absent or not 0x01 = blank; 0x01 = live; a read that answers another status = unknown, never
+    blank. That is the second half of zigpy-znp's rule (_load_network_info): it reads the NIB first, and calls a
+    network not formed when the NIB has no channel or no key — so every stick blank here is not formed there, and
+    one live here may still be not formed there. Z-Stack Home 1.2 (no APP_CNF; CC2531/CC2530) has no such item, and
+    zigpy-znp judges it by the NIB alone, which this probe does not read: unknown, never blank.
+References read: zwave-js 15.29.0 (packages/serial, packages/zwave-js Driver.ts) and 15.32.3 (Controller.ts
+backupNVMRaw700 and getLongRangeNodes, GetLongRangeNodesMessages.ts), Silicon Labs' Serial API firmware
+(simplicity_sdk zwave_ncp_serial_api/cmds_management.c: the GetLongRangeNodes answer) and zigpy-znp 1.1.0 (frames.py,
+commands/, types/, api.py, nvram.py). [V] = verified on the reference sticks; [H] = not verified.
 """
 from __future__ import annotations
 
@@ -68,7 +89,7 @@ import fcntl
 import json
 import os
 import select
-import socket
+import signal
 import sys
 import termios
 import time
@@ -88,16 +109,28 @@ ZW_SETUP_GET_POWERLEVEL16 = 0x13   # SerialAPISetupCommand.GetPowerlevel16Bit �
 ZW_SETUP_GET_RF_REGION = 0x20      # SerialAPISetupCommand.GetRFRegion  → [sub, region]  (9 = USA Long Range)
 # the GETs only: SetRFRegion 0x40 / SetPowerlevel 0x04 are never sent
 ZW_SETUP_GETS = {ZW_SETUP_GET_SUPPORTED, ZW_SETUP_GET_POWERLEVEL, ZW_SETUP_GET_POWERLEVEL16, ZW_SETUP_GET_RF_REGION}
+ZW_GET_LR_NODES = 0xDA             # FunctionType.GetLongRangeNodes: REQUEST [segment] → RESPONSE [more nodes 0|1, segment, mask
+                                   # length, mask…]; bit 0 of segment n = node 256 + 128 n (GetLongRangeNodesMessages.ts). The
+                                   # firmware answers one mask of all its nodes in segment 0 and "no more" (cmds_management.c)
+                                   # [H: read in the two sources, not yet asked of a stick]
+ZW_LR_FIRST_NODE, ZW_LR_NODES_PER_SEGMENT, ZW_LR_MAX_NODE = 256, 128, 4000   # getFirstNodeId; consts.ts NUM_LR_NODES_PER_SEGMENT, MAX_NODES_LR
+ZW_LR_SEGMENTS = (ZW_LR_MAX_NODE - ZW_LR_FIRST_NODE) // ZW_LR_NODES_PER_SEGMENT + 1   # as far as a stick that always says "more" is followed
 ZW_RF_REGIONS = {0: "Europe", 1: "USA", 2: "Australia/New Zealand", 3: "Hong Kong", 5: "India", 6: "Israel", 7: "Russia",
                  8: "China", 9: "USA (Long Range)", 11: "Europe (Long Range)", 32: "Japan", 33: "Korea", 254: "Unknown",
                  255: "Default (EU)"}   # zwave-js RFRegion enum, the driver's names
 ZW_NVM_OPS = 0x2E                  # FunctionType.NVMOperations (700+): [cmd, length, offset u16, data…]
 ZW_NVM_OPS_EXT = 0x3D              # FunctionType.ExtendedNVMOperations: the same with a u32 offset
-ZW_NVM_OPEN, ZW_NVM_READ, ZW_NVM_WRITE, ZW_NVM_CLOSE = 0x00, 0x01, 0x02, 0x03
+ZW_NVM_OPEN, ZW_NVM_READ, ZW_NVM_CLOSE = 0x00, 0x01, 0x03          # NVMOperationsCommand; Write (0x02) is never sent
+ZW_NVM_READS = {ZW_NVM_OPEN, ZW_NVM_READ, ZW_NVM_CLOSE}
 ZW_NVM_STATUS = {0x00: "OK", 0x01: "Error", 0x02: "OperationMismatch", 0x03: "OperationInterference",
                  0x04: "SubCommandNotSupported", 0xFF: "EndOfFile"}
+ZW_NVM_CHUNK, ZW_NVM_FALLBACK_CHUNK = 0xFF, 48   # backupNVMRaw700: the first read's length; FALLBACK_NVM_CHUNK_SIZE
+ZW_NVM_CLOSE_S = 3.0               # the Close's own time, whatever is left of the budget (under the 5 s zradio-sync's
+                                   # `timeout -k 5` gives between its SIGTERM and its SIGKILL)
 ZW_READ_ONLY = {ZW_GET_INIT_DATA, ZW_GET_CAPABILITIES, ZW_GET_PROTOCOL_VERSION, ZW_GET_CONTROLLER_VERSION, ZW_GET_CONTROLLER_ID,
-                ZW_SERIAL_API_SETUP, ZW_NVM_OPS, ZW_NVM_OPS_EXT}   # the NVM functions: Open/Read/Close only (nvm_dump guards the sub-command)
+                ZW_GET_LR_NODES, ZW_SERIAL_API_SETUP, ZW_NVM_OPS, ZW_NVM_OPS_EXT}
+# of these, the functions that carry a sub-command, and the sub-commands that are reads (request() refuses the others)
+ZW_READ_SUBS = {ZW_SERIAL_API_SETUP: ZW_SETUP_GETS, ZW_NVM_OPS: ZW_NVM_READS, ZW_NVM_OPS_EXT: ZW_NVM_READS}
 ZW_SOFT_RESET = 0x08               # FunctionType.SoftReset: the controller restarts and reloads its NVM (what activates a
                                    # restored NVM image). A WRITE of its own kind (a restart, no data): --soft-reset only
 ZW_HARD_RESET = 0x42               # FunctionType.HardReset — a WRITE: --wipe only
@@ -109,6 +142,7 @@ ZW_WIPE = {ZW_HARD_RESET}          # the only Z-Wave write this tool can send (w
 ZW_CALLBACK_TIMEOUT = 30.0         # zwave-js timeouts.sendDataCallback: the callback wait
 ZW_NODEMASK_BYTES = 29             # NUM_NODEMASK_BYTES: "Controller Nodes MUST set this field to 29"
 ZW_ACK_TIMEOUT = 1.6               # zwave-js timeouts.ack (1600 ms)
+ZW_ACK_CAP = 8.0             # s: the longest one wait for an ACK lasts, however many other frames the stick sends meanwhile
 ZW_ATTEMPTS = 3                    # zwave-js attempts.controller
 ZW_BUSY_ATTEMPTS = 6               # this tool's own sends (SoftReset, SetRFReceiveMode) on a stick busy with the mesh's frames
 
@@ -120,7 +154,11 @@ ZNP_SYS_PING, ZNP_SYS_VERSION, ZNP_SYS_OSAL_NV_READ, ZNP_SYS_OSAL_NV_LENGTH = 0x
 ZNP_UTIL_GET_DEVICE_INFO = 0x00                                       # commands/util.py
 ZNP_READ_ONLY = {(MT_SYS, ZNP_SYS_PING), (MT_SYS, ZNP_SYS_VERSION), (MT_SYS, ZNP_SYS_OSAL_NV_READ), (MT_SYS, ZNP_SYS_OSAL_NV_LENGTH),
                  (MT_UTIL, ZNP_UTIL_GET_DEVICE_INFO)}
-NV_BDBNODEISONANETWORK = 0x0055    # types/nvids.py OsalNvIds.BDBNODEISONANETWORK ("bdbNodeIsOnANetwork attribute")
+MT_CAP_APP_CNF = 1 << 10           # types/commands.py MTCapabilities.APP_CNF: "Z-Stack 1.2 does not have the AppConfig
+                                   # subsystem" (api.py detect_zstack_version: the bit absent = 1.2, present = 3.0 or 3.30+)
+                                   # [H: zigpy-znp's own fixtures answer 0x0659 for Z-Stack 3 and 0x0179 for a CC2531 on
+                                   # 1.2 (tests/conftest.py); no 1.2 stick was asked by this probe]
+NV_BDBNODEISONANETWORK = 0x0055    # types/nvids.py OsalNvIds.BDBNODEISONANETWORK ("bdbNodeIsOnANetwork attribute"): Z-Stack 3 only
 NV_EXT_PAN_ID = 0x002D             # types/nvids.py OsalNvIds.EXTENDED_PAN_ID — read-only on the wipe path: an interrupted
                                    # wipe (deletes done, no STARTUP_OPTION write, no reset) leaves the network's value here
 # the wipe (zigpy-znp's reset_network_info; the WRITE commands — --wipe only, these items only)
@@ -162,48 +200,38 @@ class Budget:
 
 
 class Link:
-    """A byte stream to a stick: a tty path (raw 115200 8N1, flock'd) or tcp://host:port (ser2net's raw accepter)."""
+    """A byte stream to a stick: a tty path (raw 115200 8N1, flock'd)."""
 
-    def __init__(self, spec: str, connect_timeout: float):
+    def __init__(self, spec: str):
         self.spec = spec
-        self.sock = None
-        if spec.startswith("tcp://"):
-            host, _, port = spec[len("tcp://"):].rpartition(":")
-            if not host or not port.isdigit():
-                raise ProbeError(f"cannot read {spec!r} (want tcp://host:port)")
-            try:
-                self.sock = socket.create_connection((host.strip("[]"), int(port)), timeout=connect_timeout)
-            except OSError as e:
-                raise ProbeError(f"connect {spec}: {e}") from None
-            self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            self.sock.setblocking(False)
-            self.fd = self.sock.fileno()
-        else:
-            try:
-                self.fd = os.open(spec, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
-            except OSError as e:
-                raise ProbeError(f"open {spec}: {e.strerror}") from None
-            try:   # never share a stick with a running ser2net/ZHA/zwave-js (ser2net's serialdev flocks it too: gensio flock=true)
-                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError:
-                os.close(self.fd)
-                raise ProbeError(f"{spec} is locked by another process — not touching it") from None
-            try:
-                a = termios.tcgetattr(self.fd)
-                a[0] &= ~(termios.IGNBRK | termios.BRKINT | termios.PARMRK | termios.ISTRIP | termios.INLCR
-                          | termios.IGNCR | termios.ICRNL | termios.IXON | termios.IXOFF | termios.IXANY)
-                a[1] &= ~termios.OPOST
-                a[2] &= ~(termios.CSIZE | termios.PARENB | termios.CSTOPB | getattr(termios, "CRTSCTS", 0))
-                a[2] |= termios.CS8 | termios.CREAD | termios.CLOCAL
-                a[3] &= ~(termios.ECHO | termios.ECHONL | termios.ICANON | termios.ISIG | termios.IEXTEN)
-                a[4] = a[5] = termios.B115200
-                a[6][termios.VMIN] = 0
-                a[6][termios.VTIME] = 0
-                termios.tcsetattr(self.fd, termios.TCSANOW, a)
-                termios.tcflush(self.fd, termios.TCIOFLUSH)
-            except termios.error as e:
-                os.close(self.fd)
-                raise ProbeError(f"{spec}: not a serial port ({e})") from None
+        try:
+            self.fd = os.open(spec, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        except OSError as e:
+            raise ProbeError(f"open {spec}: {e.strerror}") from None
+        try:   # never share a stick with a running ser2net/ZHA/zwave-js (ser2net's serialdev flocks it too: gensio flock=true)
+            fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(self.fd)
+            raise ProbeError(f"{spec} is locked by another process — not touching it") from None
+        try:
+            a = termios.tcgetattr(self.fd)
+            a[0] &= ~(termios.IGNBRK | termios.BRKINT | termios.PARMRK | termios.ISTRIP | termios.INLCR
+                      | termios.IGNCR | termios.ICRNL | termios.IXON | termios.IXOFF | termios.IXANY)
+            a[1] &= ~termios.OPOST
+            # HUPCL off: with it (a port's default) the kernel drops DTR and RTS at the last close, and each probe would
+            # end with a pulse on lines some boards wire to the radio's reset or bootloader pins. The setting stays
+            # with the port until a program sets its own.
+            a[2] &= ~(termios.CSIZE | termios.PARENB | termios.CSTOPB | termios.HUPCL | getattr(termios, "CRTSCTS", 0))
+            a[2] |= termios.CS8 | termios.CREAD | termios.CLOCAL
+            a[3] &= ~(termios.ECHO | termios.ECHONL | termios.ICANON | termios.ISIG | termios.IEXTEN)
+            a[4] = a[5] = termios.B115200
+            a[6][termios.VMIN] = 0
+            a[6][termios.VTIME] = 0
+            termios.tcsetattr(self.fd, termios.TCSANOW, a)
+            termios.tcflush(self.fd, termios.TCIOFLUSH)
+        except termios.error as e:
+            os.close(self.fd)
+            raise ProbeError(f"{spec}: not a serial port ({e})") from None
 
     def write(self, data: bytes, deadline: float) -> None:
         view = memoryview(data)
@@ -215,7 +243,7 @@ class Link:
             if not w:
                 continue
             try:
-                n = self.sock.send(view) if self.sock else os.write(self.fd, view)
+                n = os.write(self.fd, view)
             except BlockingIOError:
                 continue
             except OSError as e:
@@ -223,7 +251,7 @@ class Link:
             view = view[n:]
 
     def read_some(self, deadline: float) -> bytes:
-        """Bytes that arrive before the deadline (b'' on timeout); the far end closing is an error."""
+        """Bytes that arrive before the deadline (b'' on timeout); the device going away is an error."""
         while True:
             left = deadline - time.monotonic()
             if left <= 0:
@@ -232,7 +260,7 @@ class Link:
             if not r:
                 return b""
             try:
-                chunk = self.sock.recv(4096) if self.sock else os.read(self.fd, 4096)
+                chunk = os.read(self.fd, 4096)
             except BlockingIOError:
                 continue
             except OSError as e:
@@ -240,8 +268,7 @@ class Link:
                     raise ProbeError(f"{self.spec}: I/O error (the device went away?)") from None
                 raise ProbeError(f"{self.spec}: read failed: {e}") from None
             if not chunk:
-                raise ProbeError(f"{self.spec}: the far end closed the connection"
-                                 + (" (ser2net could not open the device?)" if self.sock else ""))
+                raise ProbeError(f"{self.spec}: end of file (the device went away?)")
             return chunk
 
     def drain(self, quiet: float, limit: float) -> int:
@@ -256,10 +283,7 @@ class Link:
 
     def close(self) -> None:
         try:
-            if self.sock:
-                self.sock.close()
-            else:
-                os.close(self.fd)
+            os.close(self.fd)
         except OSError:
             pass
 
@@ -286,6 +310,7 @@ class ZWave:
         self.allow_soft_reset = False         # True only with --soft-reset (read_only sets it): SoftReset (0x08) before the reads
         self.allow_rf_mode = False            # True only with --rf-receive: SetRFReceiveMode (0x10) before the reads
         self.settled = False                  # settle() done once per session (the stick's own start-up frames answered)
+        self.funcs = None                     # the functions the stick lists (GetSerialApiCapabilities), once probe() read them
         self.buf = bytearray()
         self.notes: list[str] = []
         self.sent: list[str] = []
@@ -350,8 +375,11 @@ class ZWave:
         return n
 
     def request(self, func: int, name: str, payload: bytes = b"") -> bytes:
-        if func not in ZW_READ_ONLY:   # the read-only promise, enforced
+        # the read-only promise, enforced here: every read goes to the wire through this function and no other
+        if func not in ZW_READ_ONLY:
             raise ProbeError(f"refusing to send Z-Wave function 0x{func:02x}: not a read-only query")
+        if func in ZW_READ_SUBS and (not payload or payload[0] not in ZW_READ_SUBS[func]):
+            raise ProbeError(f"refusing to send Z-Wave function 0x{func:02x} with sub-command {payload[:1].hex() or '(none)'}: not a read")
         raw = self.frame(func, payload)
         why = []
         for attempt in range(1, ZW_ATTEMPTS + 1):
@@ -408,8 +436,9 @@ class ZWave:
             self.link.write(self.frame(ZW_SOFT_RESET), time.monotonic() + 2)
             self.sent.append("0x08 SoftReset")
             ack = "no ACK in 1.6 s"
+            cap = time.monotonic() + ZW_ACK_CAP        # frames that keep coming must not keep this waiting for ever
             while True:
-                u = self._next(time.monotonic() + ZW_ACK_TIMEOUT)
+                u = self._next(min(time.monotonic() + ZW_ACK_TIMEOUT, cap))
                 if u is None:
                     break
                 if u[0] == "hdr":
@@ -453,8 +482,9 @@ class ZWave:
             self.link.write(raw, time.monotonic() + 2)
             self.sent.append("0x10 SetRFReceiveMode(%d)" % (1 if enabled else 0))
             got = "no ACK in 1.6 s"
+            cap = time.monotonic() + ZW_ACK_CAP        # frames that keep coming must not keep this waiting for ever
             while True:
-                u = self._next(time.monotonic() + ZW_ACK_TIMEOUT)
+                u = self._next(min(time.monotonic() + ZW_ACK_TIMEOUT, cap))
                 if u is None:
                     break
                 if u[0] == "hdr":
@@ -536,14 +566,12 @@ class ZWave:
         return res
 
     def nvm_op(self, ext: bool, cmd: int, length: int = 0, offset: int = 0) -> tuple:
-        """One NVM operation (Open/Read/Close — Write is refused here, whatever the caller): (status, offset_or_size, data)."""
-        if cmd not in (ZW_NVM_OPEN, ZW_NVM_READ, ZW_NVM_CLOSE):
-            raise ProbeError(f"refusing NVM operation 0x{cmd:02x}: only Open/Read/Close are reads")
+        """One NVM operation, Open/Read/Close (request() refuses any other): (status, offset_or_size, data)."""
         if cmd == ZW_NVM_READ:
             payload = bytes([cmd, length]) + (offset.to_bytes(4, "big") if ext else offset.to_bytes(2, "big"))
         else:
             payload = bytes([cmd])
-        pl = self.request(ZW_NVM_OPS_EXT if ext else ZW_NVM_OPS, f"NVM{'Ext' if ext else ''}Operations/{ {0: 'Open', 1: 'Read', 3: 'Close'}[cmd] }", payload)
+        pl = self.request(ZW_NVM_OPS_EXT if ext else ZW_NVM_OPS, f"NVM{'Ext' if ext else ''}Operations/{ {0: 'Open', 1: 'Read', 3: 'Close'}.get(cmd, cmd) }", payload)
         if len(pl) < 2:
             raise ProbeError(f"NVM operation 0x{cmd:02x}: a {len(pl)}-byte answer")
         status, n = pl[0], pl[1]
@@ -553,39 +581,52 @@ class ZWave:
         return status, off, data
 
     def nvm_dump(self, funcs) -> dict:
-        """The controller's NVM as zwave-js's backupNVMRaw reads it (Open → Read in the chunk size the stick answers →
-        Close), without the RF toggle it does first (this is for an IDLE stick: nothing writes its NVM meanwhile) — a
-        read, no RF: {"size", "data", "ext"} — the bytes are returned to the caller, never printed."""
+        """The controller's NVM as zwave-js's backupNVMRaw700 reads it — Open; Read 0xff bytes, then in the size the stick
+        answers in, never more than is left; a read answered with no data ("some SDK versions return an empty buffer
+        when trying to read a buffer that is too long") once more 48 bytes at a time; Close, whatever happened — without
+        the RF toggle it does first (this is for an IDLE stick: nothing writes its NVM meanwhile). A read, no RF:
+        {"size", "data", "ext"} — the bytes are returned to the caller, never printed."""
         ext = funcs is not None and ZW_NVM_OPS_EXT in funcs
         if funcs is not None and not ext and ZW_NVM_OPS not in funcs:
             raise ProbeError("the stick lists neither NVMOperations (0x2e) nor ExtendedNVMOperations (0x3d)")
-        st, size, _ = self.nvm_op(ext, ZW_NVM_OPEN)
-        if st != 0:
-            raise ProbeError(f"NVM open: status {ZW_NVM_STATUS.get(st, st)}")
         out = bytearray()
+        size, chunk, refused = 0, ZW_NVM_CHUNK, False
         try:
-            offset = 0
-            while offset < size:
-                st, off, data = self.nvm_op(ext, ZW_NVM_READ, 0xFF, offset)
+            st, size, _ = self.nvm_op(ext, ZW_NVM_OPEN)
+            if st != 0:
+                refused = True      # the stick said it did not open its NVM: nothing to close
+                raise ProbeError(f"NVM open: status {ZW_NVM_STATUS.get(st, st)}")
+            while len(out) < size:
+                at = len(out)
+                st, _, data = self.nvm_op(ext, ZW_NVM_READ, min(chunk, size - at), at)
                 if st not in (0x00, 0xFF):
-                    raise ProbeError(f"NVM read at {offset}: status {ZW_NVM_STATUS.get(st, st)}")
+                    raise ProbeError(f"NVM read at {at}: status {ZW_NVM_STATUS.get(st, st)}")
                 if not data:
-                    raise ProbeError(f"NVM read at {offset}: no data (status {ZW_NVM_STATUS.get(st, st)})")
+                    if chunk > ZW_NVM_FALLBACK_CHUNK:
+                        chunk = ZW_NVM_FALLBACK_CHUNK
+                        self.notes.append(f"NVM read at {at}: no data — reading {chunk} bytes at a time")
+                        continue
+                    if st == 0xFF:      # "a read may legitimately end exactly at the end of the NVM"
+                        break
+                    raise ProbeError(f"NVM read at {at}: no data (status {ZW_NVM_STATUS.get(st, st)})")
+                data = data[:size - at]          # "avoid overflowing the result buffer if the controller returns too much data"
                 out += data
-                offset += len(data)
+                chunk = min(chunk, len(data))
                 if st == 0xFF:
                     break
         finally:
-            try:
-                self.nvm_op(ext, ZW_NVM_CLOSE)
-            except ProbeError as e:
-                self.notes.append(f"NVM close: {e}")
+            if not refused:
+                # zwave-js: "Whatever happens, close the NVM" — also when the budget is spent or SIGTERM stopped the
+                # read (run()), so the Close has its own time
+                self.budget.end = max(self.budget.end, time.monotonic() + ZW_NVM_CLOSE_S)
+                try:
+                    self.nvm_op(ext, ZW_NVM_CLOSE)
+                except ProbeError as e:
+                    self.notes.append(f"NVM close: {e}")
         return {"size": size, "ext": ext, "data": bytes(out)}
 
     def setup_get(self, sub: int, name: str) -> bytes:
-        """SerialAPISetup with one GET sub-command (the allow-list above); the answer minus its echoed sub-command byte."""
-        if sub not in ZW_SETUP_GETS:
-            raise ProbeError(f"refusing SerialAPISetup sub-command 0x{sub:02x}: not a GET")
+        """SerialAPISetup with one GET sub-command (request() refuses any other); the answer minus its echoed sub-command byte."""
         pl = self.request(ZW_SERIAL_API_SETUP, f"SerialAPISetup/{name}", bytes([sub]))
         if not pl or pl[0] != sub:
             raise ProbeError(f"{name}: the stick answered sub-command 0x{pl[0]:02x} instead of 0x{sub:02x}" if pl else f"{name}: empty answer")
@@ -627,6 +668,21 @@ class ZWave:
             self.notes.append(f"GetPowerlevel: {e} — tx power unknown, not fatal")
         return rf
 
+    def lr_nodes(self) -> list:
+        """The Long Range nodes (ids 256+), as zwave-js's getLongRangeNodes reads them: GetLongRangeNodes segment by
+        segment while the stick says there are more. zwave-js asks where SerialAPIStarted said the controller does
+        Long Range — seen only after a restart, which a read may not cause; this asks where the function is listed."""
+        nodes: list = []
+        for segment in range(ZW_LR_SEGMENTS):
+            pl = self.request(ZW_GET_LR_NODES, "GetLongRangeNodes", bytes([segment]))
+            if len(pl) < 3 or len(pl) < 3 + pl[2]:
+                raise ProbeError(f"GetLongRangeNodes: no node list in the answer ({pl.hex()})")
+            first = ZW_LR_FIRST_NODE + ZW_LR_NODES_PER_SEGMENT * pl[1]      # by the segment the stick says it answers
+            nodes += [first + 8 * j + i for j, byte in enumerate(pl[3:3 + pl[2]]) for i in range(8) if byte & (1 << i)]
+            if not pl[0]:
+                break
+        return sorted({n for n in nodes if n <= ZW_LR_MAX_NODE})   # "the controller may report bits outside the valid range"
+
     def probe(self) -> dict:
         out: dict = {"protocol": "Z-Wave Serial API"}
         if not self.settled:
@@ -656,7 +712,6 @@ class ZWave:
         if len(rest) >= 2:
             out["chip"] = f"0x{rest[0]:02x}/0x{rest[1]:02x}"
         funcs = None
-        self.funcs = None
         try:
             pl = self.request(ZW_GET_CAPABILITIES, "GetSerialApiCapabilities")
             if len(pl) >= 8:
@@ -691,8 +746,16 @@ class ZWave:
                 out["sdk_source"] = "GetControllerVersion (0x15)"
             except ProbeError as e:
                 self.notes.append(f"GetControllerVersion: {e} — SDK unknown, not fatal")
+        # the Long Range nodes are in no list read so far. lr_nodes None = not known: asked and not answered
+        out["lr_nodes"] = [] if funcs is not None and ZW_GET_LR_NODES not in funcs else None
+        if out["lr_nodes"] is None:
+            try:
+                out["lr_nodes"] = self.lr_nodes()
+            except ProbeError as e:
+                self.notes.append(f"GetLongRangeNodes: {e} — the Long Range nodes are not known: this stick is not called blank")
+        out["lr_node_count"] = len(out["lr_nodes"] or [])
         own = out["own_node_id"]
-        out["verdict"] = "blank" if out["nodes"] == [own] else "live"
+        out["verdict"] = "live" if out["nodes"] != [own] or out["lr_nodes"] else "unknown" if out["lr_nodes"] is None else "blank"
         # the RF config (for the check after a restore): SerialAPISetup GET sub-commands only — read-only,
         # no RF transmission; the driver's "RF region USA (Long Range)" / "powerlevel 14 dBm" lines come from the same reads
         out["rf"] = self.rf_read()
@@ -928,8 +991,8 @@ class ZNP:
             return
         pl = self.sreq(MT_SYS, ZNP_SYS_OSAL_NV_READ, "SYS_OSAL_NV_READ(EXTENDED_PAN_ID)",
                        payload=NV_EXT_PAN_ID.to_bytes(2, "little") + bytes([0]))
-        if pl[0] != 0 or len(pl) < 2 + pl[1]:
-            raise ProbeError(f"SYS_OSAL_NV_READ(EXTENDED_PAN_ID): status 0x{pl[0]:02x}, {len(pl)} byte(s)")
+        if len(pl) < 2 or pl[0] != 0 or len(pl) < 2 + pl[1]:
+            raise ProbeError(f"SYS_OSAL_NV_READ(EXTENDED_PAN_ID): status {('0x%02x' % pl[0]) if pl else 'missing'}, {len(pl)} byte(s)")
         value = pl[2:2 + pl[1]]
         out["nv_extpan"] = ":".join(f"{b:02x}" for b in reversed(value)) if len(value) == 8 else value.hex()
 
@@ -944,7 +1007,10 @@ class ZNP:
             self.notes.append(f"SYS_PING: {e} — the bootloader skip once more")
             self.skip_bootloader()
             pl = self.sreq(MT_SYS, ZNP_SYS_PING, "SYS_PING", attempts=2)
-        out["capabilities"] = f"0x{int.from_bytes(pl[0:2], 'little'):04x}" if len(pl) >= 2 else None
+        caps = int.from_bytes(pl[0:2], "little") if len(pl) >= 2 else None
+        out["capabilities"] = f"0x{caps:04x}" if caps is not None else None
+        # zigpy-znp's detect_zstack_version: no AppConfig subsystem = Z-Stack Home 1.2; with it, 3.0 or 3.30+ ("3" here)
+        out["zstack"] = None if caps is None else "3" if caps & MT_CAP_APP_CNF else "1.2"
         try:
             pl = self.sreq(MT_SYS, ZNP_SYS_VERSION, "SYS_VERSION")
             if len(pl) >= 5:
@@ -963,7 +1029,15 @@ class ZNP:
         out["device_type"] = pl[11]
         out["device_state"] = pl[12]
         out["device_state_name"] = ZNP_DEVICE_STATES.get(pl[12], "unknown")
-        # zigpy-znp's own test, in its order (nvram.py osal_read): the item's length first — 0 = it does not exist
+        if out["zstack"] != "3":
+            # BDBNODEISONANETWORK is Z-Stack 3's: on Home 1.2 it is absent on a stick that runs a network, and zigpy-znp
+            # does not ask for it there (its rule for 1.2 is the NIB, not read here). Absent must not read as blank.
+            out["on_network"] = None
+            out["verdict"] = "unknown"
+            out["nv_why"] = ("Z-Stack Home 1.2 (no APP_CNF in its capabilities %s): it keeps no BDBNODEISONANETWORK" % out["capabilities"]
+                             if out["zstack"] else "SYS_PING answered no capabilities: Z-Stack 3 or Home 1.2 is not known, BDBNODEISONANETWORK not asked")
+            return out
+        # zigpy-znp's test of that item, in its order (nvram.py osal_read): the item's length first — 0 = it does not exist
         pl = self.sreq(MT_SYS, ZNP_SYS_OSAL_NV_LENGTH, "SYS_OSAL_NV_LENGTH(BDBNODEISONANETWORK)",
                        payload=NV_BDBNODEISONANETWORK.to_bytes(2, "little"))
         if len(pl) < 2:
@@ -998,6 +1072,24 @@ class ZNP:
         return out
 
 
+def write_private(path: str, data: bytes) -> None:
+    """The file, 0600 from the moment it exists (not made with the umask and narrowed afterward)."""
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            os.fchmod(fd, 0o600)      # a file that was there keeps its mode otherwise
+            f.write(data)
+    except OSError as e:
+        raise ProbeError(f"--nvm-dump {path}: {e.strerror}") from None
+
+
+def on_sigterm(signum, frame):
+    """SIGTERM while the NVM is open (zradio-sync's `timeout`): an error raised where the read stands, so that nvm_dump's
+    finally sends the Close. A second SIGTERM does not stop that Close."""
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    raise ProbeError("stopped by SIGTERM")
+
+
 def run(kind: str, spec: str, args) -> dict:
     budget = Budget(args.budget)
     res: dict = {"port": spec, "ok": False, "error": None, "verdict": "unknown"}
@@ -1005,26 +1097,28 @@ def run(kind: str, spec: str, args) -> dict:
     link = None
     proto = None
     try:
-        link = Link(spec, args.connect_timeout)
+        link = Link(spec)
         proto = (ZWave if kind == "zwave" else ZNP)(link, args.timeout, budget)
-        if kind == "zwave" and getattr(args, "soft_reset", False):      # --soft-reset: the restart first, then the reads
+        if kind == "zwave" and args.soft_reset:        # --soft-reset: the restart first, then the reads
             proto.allow_soft_reset = True
             res["soft_reset"] = proto.soft_reset(args.reset_timeout or 5.0)
             proto.allow_soft_reset = False
-        if kind == "zwave" and getattr(args, "rf_receive", None):       # --rf-receive off|on: the receiver, then the reads
+        if kind == "zwave" and args.rf_receive:        # --rf-receive off|on: the receiver, then the reads
             proto.allow_rf_mode = True
             res["rf_receive"] = proto.rf_receive(args.rf_receive == "on")
             proto.allow_rf_mode = False
-        if kind == "zigbee" and getattr(args, "zigbee_reset", False):   # --zigbee-reset: the reboot first, then the reads
+        if kind == "zigbee" and args.zigbee_reset:     # --zigbee-reset: the reboot first, then the reads
             proto.allow_reset = True
             res["zigbee_reset"] = proto.quiet(args.reset_timeout or ZNP_ARSP_TIMEOUT)
             proto.allow_reset = False
         res.update(proto.probe())
-        if kind == "zwave" and getattr(args, "nvm_dump", None):         # --nvm-dump: after the reads, the NVM to a file
-            d = proto.nvm_dump(getattr(proto, "funcs", None))
-            with open(args.nvm_dump, "wb") as f:
-                f.write(d["data"])
-            os.chmod(args.nvm_dump, 0o600)
+        if kind == "zwave" and args.nvm_dump:          # --nvm-dump: after the reads, the NVM to a file
+            was = signal.signal(signal.SIGTERM, on_sigterm)
+            try:
+                d = proto.nvm_dump(proto.funcs)
+            finally:
+                signal.signal(signal.SIGTERM, was)
+            write_private(args.nvm_dump, d["data"])
             res["nvm_dump"] = {"file": args.nvm_dump, "size": d["size"], "bytes": len(d["data"]), "ext": d["ext"],
                                "sha256": hashlib.sha256(d["data"]).hexdigest()}
         res["ok"] = True
@@ -1066,13 +1160,15 @@ def human(kind: str, r: dict) -> list[str]:
                          f"the reads below are with it {'on' if rm['enabled'] else 'off'}")
         lines += [f"   OK    {tag} on {r['port']}: home ID {r['home_id']} ({r['home_id_hex']}), own node {r['own_node_id']}"
                  f" ({r['node_id_bits']}-bit IDs), {r['node_count']} node(s) {r['nodes'][:12]}{' …' if r['node_count'] > 12 else ''},"
+                 f" {'Long Range nodes not known' if r['lr_nodes'] is None else '%d Long Range node(s)' % r['lr_node_count']},"
                  f" {r['role']}{' SIS' if r['sis'] else ''}, SDK {r.get('sdk', '?')} ({r.get('sdk_source', 'unknown')}){ident}"
                  f"{rf_text(r.get('rf') or {})} → {r['verdict'].upper()}"]
         if nd:
             lines.append(f"   NOTE  {tag}: NVM dumped to {nd['file']}: {nd['bytes']} of {nd['size']} bytes "
                          f"({'32' if nd['ext'] else '16'}-bit ops), sha256 {nd['sha256'][:16]}…")
     else:
-        fw = f"{r.get('version', '?')}" + (f" build {r['code_revision']}" if "code_revision" in r else "")
+        fw = f"{r.get('version', '?')}" + (f" build {r['code_revision']}" if "code_revision" in r else "") + (
+            f" (Z-Stack {'Home 1.2' if r['zstack'] == '1.2' else '3'})" if r.get("zstack") else "")
         net = {True: "ON a network", False: "not on a network"}.get(r["on_network"], "cannot tell whether it is on a network")
         zr = r.get("zigbee_reset")
         quiet = r['device_state'] not in ZNP_RUNNING_STATES
@@ -1098,6 +1194,9 @@ def classify(kind: str, r: dict, args) -> tuple:
             return "wipe", "home ID %d = the network's (%s, %d node(s)): the stale copy" % (want, r["home_id_hex"], r["node_count"])
         if r["verdict"] == "blank":
             return "skip", "blank already: home ID %s ≠ the network's %d, only its own node %d" % (r["home_id_hex"], want, r["own_node_id"])
+        if r["verdict"] == "unknown":
+            return "refuse", ("home ID %s ≠ the network's %d and only its own node in the classic list, but its Long Range "
+                              "nodes could not be read — not proven blank" % (r["home_id_hex"], want))
         return "refuse", "ANOTHER network: home ID %d (%s), %d nodes — not the network's %d" % (r["home_id"], r["home_id_hex"], r["node_count"], want)
     want = args.expect_zigbee_ieee
     if r["verdict"] == "live" and r["ieee"] == want:
@@ -1132,7 +1231,8 @@ def state_of(kind: str, r: dict, args) -> str:
     if not r.get("ok"):
         return "unknown"
     if kind == "zwave":
-        return "network" if r["home_id"] == args.expect_zwave_home_id else "blank" if r["verdict"] == "blank" else "other"
+        return ("network" if r["home_id"] == args.expect_zwave_home_id else
+                {"blank": "blank", "unknown": "unknown"}.get(r["verdict"], "other"))
     if r["verdict"] == "live":
         return "network" if r["ieee"] == args.expect_zigbee_ieee else "other"
     if r["verdict"] == "blank" and r.get("device_state") in ZNP_RUNNING_STATES:
@@ -1179,7 +1279,7 @@ def wipe_main(args, kinds) -> int:
     tag = {"zwave": "Z-Wave", "zigbee": "Zigbee"}
     result: dict = {"probe": "zradio-probe.py", "mode": "wipe", "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                     "expect": {"zwave_home_id": args.expect_zwave_home_id, "zigbee_ieee": args.expect_zigbee_ieee,
-                               "zigbee_extpan": getattr(args, "expect_zigbee_extpan", None)}}
+                               "zigbee_extpan": args.expect_zigbee_extpan}}
     lines: list = []
     links: dict = {}
     rc = 0
@@ -1188,7 +1288,7 @@ def wipe_main(args, kinds) -> int:
         for kind in kinds:
             spec = getattr(args, kind)
             try:
-                links[kind] = Link(spec, args.connect_timeout)
+                links[kind] = Link(spec)
                 r = read_only(kind, links[kind], args)
             except ProbeError as e:
                 r = {"port": spec, "ok": False, "error": str(e), "verdict": "unknown", "notes": [], "sent": [], "seconds": 0}
@@ -1286,22 +1386,21 @@ def ieee_arg(v: str) -> str:
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description="Read-only identification of a Z-Wave Serial API controller and a Z-Stack ZNP coordinator; "
                                             "--wipe (only) blanks the stale copies of a network (the module docstring).")
-    p.add_argument("--zwave", metavar="PORT", help="tty path or tcp://host:port of the Z-Wave controller")
-    p.add_argument("--zigbee", metavar="PORT", help="tty path or tcp://host:port of the Z-Stack coordinator")
+    p.add_argument("--zwave", metavar="TTY", help="the Z-Wave controller's tty")
+    p.add_argument("--zigbee", metavar="TTY", help="the Z-Stack coordinator's tty")
     p.add_argument("--json", action="store_true", help="JSON on stdout (the human lines go to stderr)")
     p.add_argument("--timeout", type=float, default=5.0, help="seconds per command (default 5)")
     p.add_argument("--budget", type=float, default=45.0, help="seconds per radio, all attempts included (default 45)")
-    p.add_argument("--connect-timeout", type=float, default=5.0, help="seconds for a tcp:// connect (default 5)")
     p.add_argument("--wipe", action="store_true", help="WRITE: wipe each stick that holds the expected network (identified read-only first)")
-    p.add_argument("--soft-reset", action="store_true", help="--zwave, local tty only: SoftReset (0x08) the controller first — it reloads "
+    p.add_argument("--soft-reset", action="store_true", help="--zwave: SoftReset (0x08) the controller first — it reloads "
                    "its NVM (what makes a raw NVM restore visible); then the normal read-only probe")
-    p.add_argument("--rf-receive", choices=("off", "on"), default=None, help="--zwave, local tty only: SetRFReceiveMode (0x10) the "
+    p.add_argument("--rf-receive", choices=("off", "on"), default=None, help="--zwave: SetRFReceiveMode (0x10) the "
                    "controller's receiver off|on first (off = a powered, undriven copy ACKs nothing on the air; on again, or any "
                    "restart, undoes it); then the normal read-only probe")
-    p.add_argument("--zigbee-reset", action="store_true", help="--zigbee, local tty only: SYS_RESET_REQ (soft) the coordinator first "
+    p.add_argument("--zigbee-reset", action="store_true", help="--zigbee: SYS_RESET_REQ (soft) the coordinator first "
                    "— it leaves the air until a host starts it (ZDO_STARTUP_FROM_APP: ZHA's connect); nothing written; then the "
                    "normal read-only probe (device_state says whether it stayed quiet)")
-    p.add_argument("--nvm-dump", metavar="FILE", default=None, help="--zwave, local tty only: after the probe, read the controller's NVM "
+    p.add_argument("--nvm-dump", metavar="FILE", default=None, help="--zwave: after the probe, read the controller's NVM "
                    "(Open/Read/Close, as zwave-js backs it up; no RF toggle: for an idle stick) into FILE (0600) — its size and sha256 in the result")
     p.add_argument("--expect-zwave-home-id", type=lambda v: int(v, 0), default=None, metavar="N",
                    help="--wipe: the network's Z-Wave home ID (decimal or 0x…): a controller with it is the stale copy")
@@ -1319,35 +1418,23 @@ def main(argv=None) -> int:
                           or args.expect_zigbee_extpan or (args.reset_timeout is not None and not (args.soft_reset or args.zigbee_reset))):
         p.error("--expect-zwave-home-id, --expect-zigbee-ieee, --expect-zigbee-extpan and --reset-timeout are for --wipe only "
                 "(--reset-timeout also for --soft-reset / --zigbee-reset)")
-    if args.soft_reset:
-        if args.wipe or not args.zwave:
-            p.error("--soft-reset goes with --zwave (and not with --wipe)")
-        if args.zwave.startswith("tcp://"):
-            p.error("--soft-reset opens a local tty only: %s is a tcp:// port (through ser2net this would restart the LIVE controller)" % args.zwave)
-    if args.rf_receive:
-        if args.wipe or not args.zwave:
-            p.error("--rf-receive goes with --zwave (and not with --wipe)")
-        if args.zwave.startswith("tcp://"):
-            p.error("--rf-receive opens a local tty only: %s is a tcp:// port (through ser2net this would silence the LIVE controller)" % args.zwave)
-    if args.zigbee_reset:
-        if args.wipe or not args.zigbee:
-            p.error("--zigbee-reset goes with --zigbee (and not with --wipe)")
-        if args.zigbee.startswith("tcp://"):
-            p.error("--zigbee-reset opens a local tty only: %s is a tcp:// port (through ser2net this would reboot the LIVE coordinator)" % args.zigbee)
-    if args.nvm_dump:
-        if args.wipe or not args.zwave:
-            p.error("--nvm-dump goes with --zwave (and not with --wipe)")
-        if args.zwave.startswith("tcp://"):
-            p.error("--nvm-dump opens a local tty only: %s is a tcp:// port (the LIVE stick's NVM is not for dumping through ser2net)" % args.zwave)
+    for k in ("zwave", "zigbee"):
+        spec = getattr(args, k)
+        if spec and "://" in spec:
+            # Once a network is copied, the live stick and its copy answer the same home ID and coordinator IEEE: only
+            # the HOST tells them apart, and this tool has no host checks. And ser2net gives its port to the newest
+            # client (kickolduser): a read there takes the stick from Home Assistant.
+            p.error("this tool opens local ttys only: %s is a network port — through ser2net it would reach the LIVE "
+                    "stick of the VM that serves, and take it from Home Assistant" % spec)
+    if args.soft_reset and (args.wipe or not args.zwave):
+        p.error("--soft-reset goes with --zwave (and not with --wipe)")
+    if args.rf_receive and (args.wipe or not args.zwave):
+        p.error("--rf-receive goes with --zwave (and not with --wipe)")
+    if args.zigbee_reset and (args.wipe or not args.zigbee):
+        p.error("--zigbee-reset goes with --zigbee (and not with --wipe)")
+    if args.nvm_dump and (args.wipe or not args.zwave):
+        p.error("--nvm-dump goes with --zwave (and not with --wipe)")
     if args.wipe:
-        # the wipe's last line of defense. Once a network is copied, the LIVE sticks answer the same home ID and
-        # coordinator IEEE as the copy — only the HOST tells them apart, and zradio-probe has no host checks. The
-        # wipe therefore runs on local ttys only: a tcp:// port (ser2net) is a usage error, exit 2.
-        for k in ("zwave", "zigbee"):
-            spec = getattr(args, k)
-            if spec and spec.startswith("tcp://"):
-                p.error("--wipe opens local ttys only: %s is a tcp:// port — through ser2net this would reach the LIVE "
-                        "sticks of the target host" % spec)
         if args.zwave and args.expect_zwave_home_id is None:
             p.error("--wipe --zwave needs --expect-zwave-home-id (the network's home ID: what the stale copy holds)")
         if args.zigbee and not args.expect_zigbee_ieee:

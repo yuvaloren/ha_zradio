@@ -1,0 +1,41 @@
+name: pins
+
+# The versions the kit pins where Dependabot cannot see them (a constant in a script: the Z-Wave JS UI image, zigpy-cli,
+# Debian 13) are held against what their makers say: tests/check-pins.sh. Weekly, so that the repository goes red when
+# a pinned version reaches its end of life even while nobody touches it, and whenever a pin changes.
+on:
+  schedule:
+    - cron: '0 15 * * 1'      # Mondays 15:00 UTC (8 am Pacific)
+  push:
+    branches: [main]
+    paths:
+      - guest/lib/zradio-common.sh
+      - zradio.conf.example
+      - vote/install.sh
+      - install.sh
+      - tests/Dockerfile
+      - tests/check-pins.sh
+      - .github/workflows/pins.yml
+  pull_request:
+    paths:
+      - guest/lib/zradio-common.sh
+      - zradio.conf.example
+      - vote/install.sh
+      - install.sh
+      - tests/Dockerfile
+      - tests/check-pins.sh
+      - .github/workflows/pins.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  pins:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      # pinned to a commit, with the release it is in the comment: Dependabot moves both (.github/dependabot.yml)
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: the pinned versions against their makers' end-of-life dates
+        run: bash tests/check-pins.sh

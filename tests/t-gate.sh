@@ -242,4 +242,27 @@ check "ELECTION_WAIT below 20 s (less than a VM needs from its claim to serving)
 vm "$T/bad"; echo "ELECTION=maybe" >> "$T/bad/zradio.conf"; gate "$T/bad" 1
 check "ELECTION with another word: refused (exit 2)" bash -c '[ "$2" = 2 ] && grep -q "ELECTION .maybe.: observe or act" "$1/out"' _ "$T/bad" "$RC"
 check "--help names the rule for preemption" bash -c 'bash "$1" --help | grep -q "A serving peer is preempted when its version is strictly lower"' _ "$TOOL"
+
+echo "-- a takeover that did not hold is not tried again every five minutes"
+vm "$T/pb"; v "$T/pb" 5 yes; peer "$T/pb" serving=yes role=MASTER term=4 used=yes turn=provisional client=yes zbfloor=6000000; gate "$T/pb" 1000
+check "the first attempt: the peer hands over" eq "$(grep -c peer-yield "$T/pb/calls")" 1
+gate "$T/pb" 1310
+check "five minutes later the peer serves again (this VM did not hold the radios): no second attempt yet, and said why" bash -c '[ "$(grep -c peer-yield "$1/calls")" = 1 ] && grep -q "result=loud preempt: the peer handed the radios over and serves again" "$1/journal"' _ "$T/pb"
+gate "$T/pb" 1500
+check "…nor at 500 s: the wait doubled" eq "$(grep -c peer-yield "$T/pb/calls")" 1
+gate "$T/pb" 1601
+check "…at 600 s: the second attempt" eq "$(grep -c peer-yield "$T/pb/calls")" 2
+gate "$T/pb" 2500
+check "…the third only after 1200 s more" eq "$(grep -c peer-yield "$T/pb/calls")" 2
+gate "$T/pb" 2802
+check "…then" eq "$(grep -c peer-yield "$T/pb/calls")" 3
+vm "$T/pc"; v "$T/pc" 5 yes; peer "$T/pc" serving=yes role=MASTER term=4 used=yes turn=provisional client=yes zbfloor=6000000; gate "$T/pc" 1000
+echo 1 > "$T/pc/ser2net"; echo "MASTER x priority=110" > "$T/pc/run/role"; echo confirmed > "$T/pc/run/turn"; v "$T/pc" 6 yes; peer "$T/pc" term=5 used=no; gate "$T/pc" 1010
+check "a takeover that held (this VM serves, and Home Assistant uses it): nothing is remembered against the next one" bash -c '[ ! -e "$1/run/preempt-won" ] && [ ! -e "$1/run/preempt-fails" ]' _ "$T/pc"
+
+echo "-- a sync is not asked for where none can be made; status only reads"
+vm "$T/kn"; v "$T/kn" 4 no; printf 'ZWAVE=served\nZWAVE_FAMILY=zwave-500\nZIGBEE=served\nZIGBEE_FAMILY=ezsp\n' > "$T/kn/radios.conf"; peer "$T/kn" serving=yes role=MASTER term=4 used=yes turn=confirmed client=yes last=none; gate "$T/kn" 5000; gate "$T/kn" 5100; gate "$T/kn" 5500
+check "this VM's sticks are served only (nothing here is synced): the peer is never poked for a sync it cannot make" eq "$(grep -c peer-poke "$T/kn/calls")" 0
+vm "$T/st" observe; mkdir -p "$T/st/keep"; : > "$T/st/run/hold"; echo "term=9 zbfloor=1" > "$T/st/state/outdated"; rm -rf "$T/st/run/observe"; gate "$T/st" 1000 status
+check "status in observe mode: the other mode's files are not removed and no folder is made (a look changes nothing)" bash -c '[ -e "$1/run/hold" ] && [ -e "$1/state/outdated" ] && [ ! -e "$1/run/observe" ] && [ ! -e "$1/state/observe" ]' _ "$T/st"
 finish

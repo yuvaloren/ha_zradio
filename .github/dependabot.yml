@@ -2,6 +2,8 @@
 # gate. An action left on an old major is how the workflow came to run on a deprecated Node.js.
 # Not watched here, on purpose: the Debian release of tests/Dockerfile and of the vote's image (vote/install.sh). They
 # follow the Debian release Proxmox is built on, and change with it.
+# What Dependabot cannot see at all (constants in scripts: the Z-Wave JS UI image, zigpy-cli) has a guard of its own:
+# tests/check-pins.sh, weekly (.github/workflows/pins.yml).
 # https://docs.github.com/code-security/dependabot
 version: 2
 updates:

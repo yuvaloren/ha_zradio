@@ -7,7 +7,7 @@ TOOL="$KIT/get.sh"
 
 site() { # site <dir> [release tag, or nothing]: a fake GitHub with one kit archive, and curl/id on PATH
   local d=$1 tag=${2:-}; rm -rf "$d"; mkdir -p "$d/bin" "$d/src/ha_zradio-x/guest"; : > "$d/calls"
-  printf '#!/usr/bin/env bash\necho "install.sh ran in $PWD with: $*"\n' > "$d/src/ha_zradio-x/install.sh"
+  printf '#!/usr/bin/env bash\necho "install.sh ran in $(cd "$(dirname "$0")" && pwd) with: $*"; echo "from the folder: $PWD"\n' > "$d/src/ha_zradio-x/install.sh"
   echo "# the guest" > "$d/src/ha_zradio-x/guest/install.sh"
   tar -C "$d/src" --format=pax --pax-option=comment=0123456789abcdef0123456789abcdef01234567 -czf "$d/kit.tgz" ha_zradio-x
   [ -z "$tag" ] || printf '{"tag_name": "%s", "name": "%s"}\n' "$tag" "$tag" > "$d/release.json"
@@ -15,7 +15,8 @@ site() { # site <dir> [release tag, or nothing]: a fake GitHub with one kit arch
   fake "$d/bin" curl "echo \"curl \$*\" >> '$d/calls'; out=''; url=''
 while [ \$# -gt 0 ]; do case \"\$1\" in -o) out=\$2; shift 2;; -*) shift;; *) url=\$1; shift;; esac; done
 case \"\$url\" in
-  */releases/latest) [ -f '$d/release.json' ] || exit 22; cat '$d/release.json';;
+  */releases/latest) [ ! -f '$d/api-down' ] || { echo 'curl: (22) The requested URL returned error: 403' >&2; exit 22; }
+     [ -f '$d/release.json' ] || { echo 'curl: (22) The requested URL returned error: 404' >&2; exit 22; }; cat '$d/release.json';;
   */archive/*) [ -f '$d/down' ] && exit 22; cp '$d/kit.tgz' \"\$out\";;
   *) exit 22;; esac"
 }
@@ -40,6 +41,15 @@ check "a branch with a slash: its archive, the folder named with a dash, no rele
 echo "an old file" > "$T/b/opt/ha_zradio/claude-phase1-guest-kit/stale"; ZRADIO_REF=claude/phase1-guest-kit get "$T/b"
 check "run again: the folder is replaced by the new download (an old file is gone), nothing temporary left" bash -c '[ "$2" = 0 ] && [ ! -e "$1/opt/ha_zradio/claude-phase1-guest-kit/stale" ] && [ -f "$1/opt/ha_zradio/claude-phase1-guest-kit/install.sh" ] && [ "$3" = 0 ]' _ "$T/b" "$RC" "$(left "$T/b")"
 
+echo "-- GitHub does not answer the question about the latest release: no kit, and never main in its place"
+site "$T/f" v0.2.0; : > "$T/f/api-down"; get "$T/f"
+check "a 403 (GitHub's limit for one address) or any failure but 404: exit 2, said with what GitHub answered and with ZRADIO_REF; nothing downloaded" bash -c '[ "$2" = 2 ] && grep -q "could not ask GitHub for the latest release: .*error: 403. Try again, or name a version: ZRADIO_REF=" "$1/out" && ! grep -q "archive/" "$1/calls" && [ ! -e "$1/opt/ha_zradio/main" ]' _ "$T/f" "$RC"
+site "$T/g" v0.2.0; echo '{"message": "moved"}' > "$T/g/release.json"; get "$T/g"
+check "an answer that names no release: exit 2, nothing downloaded" bash -c '[ "$2" = 2 ] && grep -q "names no latest release" "$1/out" && ! grep -q "archive/" "$1/calls"' _ "$T/g" "$RC"
+echo "-- the installer runs from the folder the line was pasted in"
+site "$T/c" v0.2.0; mkdir "$T/c/home"; ( cd "$T/c/home" && get "$T/c" --answers my.answers )
+check "a file named in an option is looked for where the user is, not in the kit's folder" bash -c 'grep -qx "from the folder: $1/home" "$1/out" && grep -q "^install.sh ran in $1/opt/ha_zradio/v0.2.0 with: --answers my.answers$" "$1/out"' _ "$T/c"
+
 echo "-- refused"
 site "$T/x"; ZRADIO_REF=../../etc get "$T/x"
 check "a version name with '..': refused, nothing downloaded" bash -c '[ "$2" = 2 ] && grep -q "ZRADIO_REF .*a tag or a branch name" "$1/out" && [ ! -s "$1/calls" ]' _ "$T/x" "$RC"
@@ -53,4 +63,6 @@ site "$T/p"; PATH="$T/p/bin:$PATH" ZRADIO_DEST=/opt bash "$TOOL" > "$T/p/out" 2>
 check "a folder of its own only: ZRADIO_DEST=/opt is refused" bash -c '[ "$2" = 2 ] && grep -q "ZRADIO_DEST ./opt.: an absolute path at least two levels deep" "$1/out"' _ "$T/p" "$RC"
 
 check "the line in the header is the one in the README" bash -c 'l=$(sed -n "s/^#     \(bash -c .*\)$/\1/p" "$1/get.sh"); [ -n "$l" ] && grep -qF "$l" "$1/README.md"' _ "$KIT"
+# (each of those scripts stands alone and so holds the line itself; here they are held to one another)
+check "…and the one each script holds that prints it for another machine: the vote's installer, the node's two (the third vote, Home Assistant), Home Assistant's" bash -c 'l=$(sed -n "s/^#     \(bash -c .*\)$/\1/p" "$1/get.sh"); [ -n "$l" ] && for f in vote/install.sh host/qdevice.sh host/lib.sh homeassistant/install.sh; do [ "$(grep -cF -- "_LINE='"'"'$l _'"'"'" "$1/$f")" = 1 ] || { echo "        not as one literal in $f"; exit 1; }; done && [ "$(cat "$1"/install.sh "$1"/host/*.sh "$1"/vote/*.sh "$1"/homeassistant/*.sh | grep -c "raw.githubusercontent.com/.*/get.sh")" = 4 ]' _ "$KIT"
 finish

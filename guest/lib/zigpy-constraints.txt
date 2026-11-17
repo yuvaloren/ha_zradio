@@ -1,0 +1,44 @@
+# zigpy-constraints.txt — the libraries under zigpy-cli, for guest/install.sh (pip install -c): the versions pip chose
+# for the pinned release below in a Debian 13 venv (Python 3.13) on 2026-11-16. With this file two radio VMs made on
+# different days hold the same code; without it pip takes whatever is newest on the day. It is used only for the
+# zigpy-cli release it names (ZIGPY_VERSION in zradio.conf; the kit's default is in zradio-common.sh): move both
+# together. The kit talks to a Zigbee stick through zigpy and zigpy-znp; the other radio libraries come with zigpy-cli
+# and are not used.
+zigpy-cli==2.0.0
+zigpy==2.4.1
+zigpy-znp==1.1.1
+bellows==1.2.1
+zigpy-deconz==1.1.1
+zigpy-xbee==0.22.0
+zigpy-zigate==0.14.0
+aiohappyeyeballs==2.7.1
+aiohttp==3.14.5
+aiosignal==1.4.0
+aiosqlite==0.22.1
+attrs==26.1.0
+cffi==2.1.1
+click==8.5.1
+click-log==0.4.0
+coloredlogs==15.0.1
+colorzero==2.0
+crccheck==1.3.1
+cryptography==50.0.2
+frozendict==2.5.1
+frozenlist==1.8.0
+gpiozero==2.0.1.post3
+humanfriendly==10.0
+idna==3.20
+jsonschema==4.26.0
+jsonschema-specifications==2025.9.1
+multidict==7.2.1
+propcache==0.5.4
+pycparser==3.12
+pyusb==1.3.1
+referencing==0.37.0
+rpds-py==2026.9.1
+scapy==2.8.0
+serialx==1.15.1
+setuptools==84.2.1
+typing_extensions==4.16.0
+voluptuous==0.16.0
+yarl==1.25.1

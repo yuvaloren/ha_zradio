@@ -3,8 +3,7 @@
 # makes this VM the active one, zradio-serve.service switches the receiver on again.
 [Unit]
 Description=zradio: both sticks silent at boot, before keepalived
-After=systemd-udev-settle.service local-fs.target
-Wants=systemd-udev-settle.service
+After=systemd-udev-trigger.service local-fs.target
 Before=keepalived.service zradio-serve.service
 
 [Service]
@@ -12,6 +11,12 @@ Type=oneshot
 RemainAfterExit=yes
 # first the gate's boot-wait (ELECTION=act: this VM claims nothing until the peer was asked); a failure there must not
 # keep the sticks from being silenced
+# Not on a VM that serves: this unit is for the boot. Started again later (it had failed at boot, and someone starts
+# zradio.target), it must not silence the sticks under Home Assistant.
+ExecCondition=/bin/sh -c '! systemctl -q is-active zradio-serve.service'
+# the sticks' names are udev's: wait for it here (systemd-udev-settle.service, which did this for the whole boot, is
+# deprecated)
+ExecStartPre=-/usr/bin/udevadm settle --timeout=30
 ExecStartPre=-/usr/local/sbin/zradio-gate arm
 ExecStart=/usr/local/sbin/zradio-serve down
 TimeoutStartSec=90

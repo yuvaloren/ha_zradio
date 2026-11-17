@@ -55,12 +55,12 @@ check "no answer to a ping: a NOTE with what to look at, and the rest all the sa
 echo "-- a Home Assistant with the sticks in its own machine: ZHA on a USB path, Z-Wave with the Z-Wave JS app"
 ha "$T/b" "$(zha /dev/serial/by-id/usb-ITead_Sonoff-if00-port0)" "$(zw true ws://core-zwave-js:3000 '"/dev/ttyACM0"' null)"; hass "$T/b" --radios 192.0.2.50
 check "Zigbee: TODO with the path in use, and Home Assistant's own menu names: change the adapter's settings, not migrate; the path to type; keep the network" bash -c '
-  grep -q "^   TODO  Zigbee (ZHA) uses /dev/serial/by-id/usb-ITead_Sonoff-if00-port0 now (znp), not the pair" "$1/out" && grep -q "1. Settings > Devices & services > Zigbee Home Automation > Configure" "$1/out" &&
+  grep -q "^   TODO  Zigbee (ZHA) uses /dev/serial/by-id/usb-ITead_Sonoff-if00-port0 now (znp), not the pair" "$1/out" && grep -q "1. Settings > Devices & services > Zigbee Home Automation > the gear: ZHA.s own page" "$1/out" && grep -q "2. There, \"Migrate adapter\": Migrate. Then \"Change ZHA adapter settings\": Submit" "$1/out" &&
   grep -q "3. \"Change the current adapter.s settings\". NOT \"Migrate to a new adapter\"" "$1/out" && grep -q "4. \"Serial device path\": type  socket://192.0.2.50:6638$" "$1/out" && grep -q "\"Migrate manually\", then \"Keep adapter network settings\"" "$1/out"' _ "$T/b"
 check "Z-Wave: TODO with the adapter in use; Reconfigure, the current adapter, Use Socket and the socket path" bash -c '
   grep -q "^   TODO  Z-Wave (the Z-Wave JS app) uses /dev/ttyACM0 now, not the pair" "$1/out" && grep -q "1. Settings > Devices & services > Z-Wave > the three dots > Reconfigure" "$1/out" &&
   grep -q "2. \"Reconfigure the current adapter\". NOT \"Migrate to a new adapter\"" "$1/out" && grep -q "USB: \"Use Socket\". \"Socket device path\": type  tcp://192.0.2.50:6639 " "$1/out"' _ "$T/b"
-check "the last lines: two to do, nothing changed, and the kit's line to check afterward, with the address" bash -c '[ "$(tail -2 "$1/out" | head -1)" = "== 2 to do (TODO). Nothing was changed. ==" ] && [ "$(tail -1 "$1/out")" = "   Afterward, this again checks it:    $2 --radios 192.0.2.50" ]' _ "$T/b" "$LINE"
+check "the last lines: two to do, nothing changed, and the kit's line to check afterward, with the address" bash -c '[ "$(tail -2 "$1/out" | head -1)" = "== 2 to do (TODO). Nothing was changed. ==" ] && [ "$(tail -1 "$1/out")" = "   Afterward, this again checks it:    $2 --radios 192.0.2.50 --config $1/config" ]' _ "$T/b" "$LINE"
 check "exit 0 (it looked; the steps are the user.s), and no key shown" bash -c '[ "$2" = 0 ] && ! grep -q "$3" "$1/out"' _ "$T/b" "$RC" "$KEY"
 
 echo "-- the Z-Wave JS app on the pair already; other ports; a kind the pair does not have"
@@ -73,7 +73,7 @@ check "--no-zwave: Z-Wave is not looked at or mentioned" bash -c '[ "$2" = 0 ] &
 hass "$T/c" --radios 192.0.2.50 --zwave-port 7001 --no-zigbee
 check "--no-zigbee: Zigbee is not looked at or mentioned" bash -c '[ "$2" = 0 ] && ! grep -qi "zigbee\|ZHA" "$1/out" && grep -q "Nothing to do" "$1/out"' _ "$T/c" "$RC"
 hass "$T/b" --radios 192.0.2.50 --zwave-port 7001 --no-zigbee
-check "the line to run again carries the options it was run with" bash -c '[ "$(tail -1 "$1/out")" = "   Afterward, this again checks it:    $2 --radios 192.0.2.50 --zwave-port 7001 --no-zigbee" ]' _ "$T/b" "$LINE"
+check "the line to run again carries the options it was run with" bash -c '[ "$(tail -1 "$1/out")" = "   Afterward, this again checks it:    $2 --radios 192.0.2.50 --zwave-port 7001 --no-zigbee --config $1/config" ]' _ "$T/b" "$LINE"
 
 echo "-- a Home Assistant with neither yet; an integration that is disabled; a server of the user's own"
 ha "$T/n" - -; hass "$T/n" --radios 192.0.2.50
@@ -91,6 +91,26 @@ check "a ZHA that is disabled is not in use: Zigbee is to be added" has "$T/d/ou
 check "a server of the user's own: CHECK, its address without the user and password in it" bash -c 'grep -q "CHECK Z-Wave: Home Assistant talks to a Z-Wave JS server of your own (ws://10.1.2.3:3000)" "$1/out" && ! grep -q "hunter2" "$1/out"' _ "$T/d"
 check "…both counted in the last lines" bash -c 'grep -qx "== 1 to do (TODO). 1 that cannot be seen from here (CHECK). Nothing was changed. ==" "$1/out"' _ "$T/d"
 
+echo "-- an entry for a discovered stick the user ignored; ZHA's other spelling of a network path; an option without its value"
+ha "$T/ig" "$(zha socket://192.0.2.50:6638)" -
+python3 - "$T/ig/config/.storage/core.config_entries" <<'PY'
+import json, sys
+j = json.load(open(sys.argv[1]))
+j["data"]["entries"] += [{"domain": "zha", "source": "ignore", "disabled_by": None, "data": {}}, {"domain": "zwave_js", "source": "ignore", "disabled_by": None, "data": {}}]
+json.dump(j, open(sys.argv[1], "w"))
+PY
+hass "$T/ig" --radios 192.0.2.50
+check "ignored discoveries are not integrations: ZHA is OK once and nothing says it has no path; Z-Wave is to be added, not a server to look into" bash -c '[ "$2" = 0 ] && [ "$(grep -c "Zigbee" "$1/out")" = 1 ] && grep -q "OK    Zigbee (ZHA) uses the pair" "$1/out" && grep -q "TODO  Z-Wave: Home Assistant has no Z-Wave integration yet" "$1/out" && ! grep -q "CHECK" "$1/out"' _ "$T/ig" "$RC"
+ha "$T/tc" "$(zha tcp://192.0.2.50:6638)" -; hass "$T/tc" --no-zwave
+check "ZHA set to tcp://, which it reads as socket://: the address is found there, and that path is OK" bash -c '[ "$2" = 0 ] && grep -q "OK    Zigbee (ZHA) uses the pair: tcp://192.0.2.50:6638" "$1/out" && grep -q "Nothing to do" "$1/out"' _ "$T/tc" "$RC"
+hass "$T/tc" --radios
+check "--radios given last without an address: exit 2, said (it used to loop for ever)" bash -c '[ "$2" = 2 ] && grep -q "die: --radios needs a value" "$1/out"' _ "$T/tc" "$RC"
+PATH="$T/tc/bin:$PATH" bash "$HASS_TOOL" --radios 192.0.2.50 --no-zwave --config > "$T/tc/out" 2>&1 < /dev/null; RC=$?
+check "…--config the same" bash -c '[ "$2" = 2 ] && grep -q "die: --config needs a value" "$1/out"' _ "$T/tc" "$RC"
+ZRADIO_HA_CONFIG="$T/b/config" PATH="$T/b/bin:$PATH" bash "$HASS_TOOL" --radios 192.0.2.50 > "$T/b/out" 2>&1 < /dev/null
+check "the line to run again names --config only when the run did" bash -c '[ "$(tail -1 "$1/out")" = "   Afterward, this again checks it:    $2 --radios 192.0.2.50" ]' _ "$T/b" "$LINE"
+check "a ping that is answered says that and no more (it cannot know what answered)" bash -c 'grep -qx "   OK    192.0.2.50 answers a ping from here" "$1/out"' _ "$T/b"
+
 echo "-- asked for the address on a terminal"
 ha "$T/q" "$(zha socket://192.0.2.50:6638)" -
 PATH="$T/q/bin:$PATH" ZRADIO_HA_ASK=1 bash "$HASS_TOOL" --config "$T/q/config" --no-zwave > "$T/q/out" 2>&1 <<< "192.0.2.50"; RC=$?
@@ -100,8 +120,8 @@ check "an answer that is no address: exit 2" eq "$RC" 2
 
 echo "-- no --radios: the address is looked for in Home Assistant's own settings"
 ha "$T/f" "$(zha socket://192.0.2.50:6638)" "$(zw true ws://core-zwave-js:3000 '"/dev/ttyACM0"' null)"; hass "$T/f"
-check "ZHA is on a network path, nobody to ask: that address is taken, and said to be taken from there; Zigbee OK, Z-Wave TODO; exit 0" bash -c '[ "$2" = 0 ] && grep -q "     - Zigbee (ZHA) is set to socket://192.0.2.50:6638" "$1/out" && grep -q "^   NOTE  192.0.2.50 is taken as the pair.s floating address from Home Assistant.s own settings (Zigbee (ZHA) is set to socket://192.0.2.50:6638). Another pair: --radios A.B.C.D" "$1/out" && grep -q "OK    Zigbee (ZHA) uses the pair" "$1/out" && grep -q "TODO  Z-Wave (the Z-Wave JS app) uses /dev/ttyACM0 now" "$1/out" && grep -q "_ --radios 192.0.2.50$" "$1/out"' _ "$T/f" "$RC"
-check "…with --radios nothing is said to be taken from anywhere" bash -c 'hass() { :; }; ! grep -q "is taken as" "$1/out"' _ "$T/b"
+check "ZHA is on a network path, nobody to ask: that address is taken, and said to be taken from there; Zigbee OK, Z-Wave TODO; exit 0" bash -c '[ "$2" = 0 ] && grep -q "     - Zigbee (ZHA) is set to socket://192.0.2.50:6638" "$1/out" && grep -q "^   NOTE  192.0.2.50 is taken as the pair.s floating address from Home Assistant.s own settings (Zigbee (ZHA) is set to socket://192.0.2.50:6638). Another pair: --radios A.B.C.D" "$1/out" && grep -q "OK    Zigbee (ZHA) uses the pair" "$1/out" && grep -q "TODO  Z-Wave (the Z-Wave JS app) uses /dev/ttyACM0 now" "$1/out" && grep -q "_ --radios 192.0.2.50 --config $1/config$" "$1/out"' _ "$T/f" "$RC"
+check "…with --radios nothing is said to be taken from anywhere" bash -c '! grep -q "is taken as" "$1/out"' _ "$T/b"
 ha "$T/f2" "$(zha /dev/ttyUSB0)" "$(zw true ws://core-zwave-js:3000 null '"tcp://192.0.2.60:6639"')"; hass "$T/f2"
 check "only the Z-Wave JS app is on a network path: its address is taken; Z-Wave OK, Zigbee TODO" bash -c '[ "$2" = 0 ] && grep -q "from Home Assistant.s own settings (Z-Wave (the Z-Wave JS app) is set to tcp://192.0.2.60:6639)" "$1/out" && grep -q "OK    Z-Wave (the Z-Wave JS app) uses the pair: tcp://192.0.2.60:6639" "$1/out" && grep -q "TODO  Zigbee (ZHA) uses /dev/ttyUSB0 now" "$1/out"' _ "$T/f2" "$RC"
 ha "$T/f3" "$(zha socket://192.0.2.50:6638)" "$(zw true ws://core-zwave-js:3000 null '"tcp://192.0.2.60:6639"')"; hass "$T/f3"
@@ -147,4 +167,5 @@ check "no python3 on PATH: the latest release is found in GitHub's answer (sever
 PATH="$G/bin:$G/base" ZRADIO_REF=main ZRADIO_DEST="$G/opt/ha_zradio" bash "$KIT/get.sh" > "$G/out" 2>&1 < /dev/null; RC=$?
 check "…and a branch: the commit is read from the archive's header without python" bash -c '[ "$2" = 0 ] && [ "$(cat "$1/opt/ha_zradio/main/gen/version")" = "main@0123456" ] && grep -q "(commit 0123456789ab)" "$1/out"' _ "$G" "$RC"
 check "get.sh itself runs no python3" bash -c '! grep -q "python3" "$1"' _ "$KIT/get.sh"
+check "every ZRADIO_HA_* knob homeassistant/install.sh reads is named in its header" bash -c 'k=$(grep -oE "ZRADIO_HA_[A-Z_]+" "$1" | sort -u) && [ -n "$k" ] && c=$(sed -n "1,/^set -uo pipefail\$/p" "$1") && for n in $k; do printf "%s\n" "$c" | grep -qw "$n" || { echo "        not named: $n"; exit 1; }; done' _ "$HASS_TOOL"
 finish

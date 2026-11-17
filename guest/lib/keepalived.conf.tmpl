@@ -2,10 +2,13 @@
 # Rendered by zradio-render from /etc/zradio/zradio.conf for @NAME@; do not edit here: edit that file and render.
 #
 # Both radio VMs run this with state BACKUP and nopreempt: whoever holds @VIP@ keeps it until it stops, dies or fails
-# its health check; a VM that comes back stays the standby. Adverts go unicast between the two VMs. A graceful stop
+# its health check; a VM that comes back stays the standby. Adverts go unicast between the two VMs, and one that does
+# not come from the peer's address is not taken (the instance's source check): VRRP version 3 has no authentication, and
+# without that line any machine of this network could claim the address with an advert of its own. A graceful stop
 # sends a priority-0 advert, so the peer takes over at once; a peer that vanishes is noticed after three missed adverts.
 # A VM that has no PEER yet (the pair's first VM, until the second is installed) gets this file without the unicast
-# lines: it holds the address alone and sends VRRP's ordinary multicast adverts until it is told its peer.
+# lines: it holds the address alone and sends VRRP's ordinary multicast adverts until it is told its peer. Until then
+# it takes an advert from any machine of its network: the time between the two installs.
 global_defs {
     router_id @NAME@
     enable_script_security
@@ -29,6 +32,7 @@ vrrp_instance RADIO {
     priority @PRIORITY@
     advert_int 1
     unicast_src_ip @SELF@
+    check_unicast_src
     unicast_peer {
         @PEER@
     }

@@ -4,6 +4,9 @@
 # bridges are folders. The guest agent is real bash: a script install.sh sends into a VM is RUN, with the VM's paths
 # (/etc, /var, /root, /opt, /usr/local) turned into <dir>/g/<vmid>/root/… — so the scripts themselves are tested.
 #   node <dir> [sticks on nodea: both|zwave|none|twins|dark]      the cluster's votes: <dir>/votes ("<total> <quorum>")
+#   the Debian image: the cache holds the one the web's list names (nothing to download). Knobs, files in <dir>:
+#     web (the image the web has now, when it is another one), sum (the checksum its list gives instead of the
+#     true one), list-fail (the list cannot be read), image-fail (the image's download breaks off halfway)
 #   canned guests (the default): cloud-init, systemctl, zradio-sync and zradio-serve in the VM are fakes, and the
 #     kit's installer "runs" by copying <dir>/install.log and install.rc into place.          knobs: files in <dir>
 #     The VM's conf is the one cloud-init wrote; one without SELF (a VM on DHCP) gets the address in <dir>/lease.
@@ -25,7 +28,7 @@ node() {
   usb "$d/sys-nodeb" 2-1 10c4 ea70 "CP2105 Dual USB to UART Bridge Controller"; usb "$d/sys-nodeb" 2-2 10c4 ea60 "Sonoff Zigbee 3.0 USB Dongle Plus"
   echo '[]' > "$d/usbmap.json"; echo '[]' > "$d/vms.json"
   echo '[{"storage":"local","type":"dir","content":"images,snippets,iso,vztmpl","path":"'"$d"'/store"},{"storage":"local-zfs","type":"zfspool","content":"images,rootdir"}]' > "$d/storages.json"
-  echo "image-bytes" > "$d/cache/debian-13-generic-amd64.qcow2"; echo "abcdef0123456789abcdef" > "$d/cache/debian-13-generic-amd64.qcow2.sha512"
+  echo image-from-the-web > "$d/cache/debian-13-generic-amd64.qcow2"; sha512sum < "$d/cache/debian-13-generic-amd64.qcow2" | cut -d' ' -f1 > "$d/cache/debian-13-generic-amd64.qcow2.sha512"
   printf '== 2. keepalived and ser2net (Debian'"'"'s packages) ==\nOK    keepalived 2.3.3 installed\nDONE  the radios are detected and named\n== installed ==\n' > "$d/install.log"
   echo 0 > "$d/install.rc"; echo "done" > "$d/ci-status"; printf 'ZWAVE=synced\nZIGBEE=synced\n' > "$d/radios.conf"
   local rec; rec="echo \"\$(basename \$0) \$*\" >> '$d/calls'"
@@ -34,8 +37,13 @@ node() {
   echo "3 2" > "$d/votes"     # "<total votes> <quorum>": three votes by default; a test of two nodes without a third vote sets "2 2"
   fake "$d/bin" pvecm "case \"\$1\" in status) read -r t q < '$d/votes'; printf 'Expected votes:   %s\\nTotal votes:      %s\\nQuorum:           %s\\n' \"\$t\" \"\$t\" \"\$q\";; *) $rec;; esac"
   fake "$d/bin" pvesm "$rec"
-  fake "$d/bin" wget "$rec; out=\${*: -1}; case \"\$2\" in */SHA512SUMS) printf '%s  debian-13-generic-amd64.qcow2\n' \"\$(cat '$d/sum' 2>/dev/null || echo image-from-the-web | sha512sum | cut -d' ' -f1)\" > \"\$out\";; *) echo image-from-the-web > \"\$out\";; esac"
-  fake "$d/bin" qm "$rec; [ ! -f '$d/qm-fail' ] || exit 1; case \"\$1\" in create) '$d/bin/vmreg' create \"\${@:2}\";; start) '$d/bin/vmreg' start \"\$2\";; esac; exit 0"
+  fake "$d/bin" wget "$rec; out=\${*: -1}; web() { cat '$d/web' 2>/dev/null || echo image-from-the-web; }
+    u=; for a; do case \"\$a\" in *://*) u=\$a;; esac; done      # the URL, wherever the options put it
+    case \"\$u\" in
+      */SHA512SUMS) [ ! -f '$d/list-fail' ] || { : > \"\$out\"; exit 4; }; printf '%s  debian-13-generic-amd64.qcow2\n' \"\$(cat '$d/sum' 2>/dev/null || web | sha512sum | cut -d' ' -f1)\" > \"\$out\";;
+      *) [ ! -f '$d/image-fail' ] || { web | head -c 5 > \"\$out\"; exit 4; }; web > \"\$out\";;
+    esac"
+  fake "$d/bin" qm "$rec; [ ! -f '$d/qm-fail' ] || exit 1; case \"\$1\" in create) '$d/bin/vmreg' create \"\${@:2}\";; start) '$d/bin/vmreg' start \"\$2\";; set) '$d/bin/vmreg' set \"\${@:2}\";; esac; exit 0"
   fake "$d/bin" pvesh "case \"\$1 \$2\" in
     'get /cluster/mapping/usb') cat '$d/usbmap.json';;
     'get /cluster/resources') cat '$d/vms.json';;
@@ -60,6 +68,10 @@ if verb == "create":
     with open("%s/pve/nodes/%s/qemu-server/%d.conf" % (d, node, vmid), "w") as f:
         for k, v in sorted(o.items()):
             if k.startswith(("net", "ipconfig", "usb")) or k in ("name", "tags", "cicustom"): f.write("%s: %s\n" % (k, v))
+elif verb == "set":
+    o = dict(zip([a[2:] for a in rest[0::2]], rest[1::2]))
+    for v in vms:
+        if v["vmid"] == vmid and "tags" in o: v["tags"] = o["tags"]
 else:
     for v in vms:
         if v["vmid"] == vmid: v["status"] = "running"

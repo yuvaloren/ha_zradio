@@ -10,7 +10,7 @@
 #
 # Steps with --run:
 #   0. checks: this VM serves (ser2net active, keepalived's last word MASTER); the standby answers hello as BACKUP, not
-#      serving, not dirty, not applying.
+#      serving, not dirty, not applying, and not held by the election's gate (wait).
 #   1. the standby's copy: when it does not hold this VM's last sync (or --sync), one `zradio-sync run --reason switch`
 #      first — that sync is its own short pause for Home Assistant; a standby that holds the last sync is taken as it is.
 #   2. systemctl stop keepalived here: its last advert has priority 0, the standby takes the floating address at once
@@ -19,7 +19,7 @@
 #   3. wait (20 s at most) until the standby says MASTER and serving; then keepalived is started here again: this VM is
 #      the standby now (nopreempt: it does not take the role back).
 #   If the standby did not take the role in 20 s: keepalived is started here anyway — with no other MASTER this VM takes
-#   the address back after ~4 s — and the exit is 1.
+#   the address back within about 10 s — and the exit is 1. The same when this script is interrupted in between.
 # Afterward the new active's tick (every 15 min) syncs this VM once: the copy of a VM that just gave the role away has
 # a Zigbee frame counter BELOW the new active's, and only a sync raises it.
 # [V reference pair 2026-11-11: Home Assistant's Z-Wave back after 1.3 s, Zigbee after 7 s.]
@@ -42,8 +42,6 @@ WAIT=${ZRADIO_SWITCH_WAIT:-20}     # s for the standby to say MASTER and serving
 POLL=0.5                           # s between two of its hellos
 zr_markers
 log() { zr_log switch "$@"; }
-now() { printf '%s' "${EPOCHREALTIME:-$(date +%s)}"; }
-since() { awk -v a="$1" -v b="$(now)" 'BEGIN { printf "%.1f", b - a }'; }
 peer_hello() { "$SYNCCMD" peer-hello 2>/dev/null | tail -1; }
 [ "$(id -u)" = 0 ] || { bad "not root"; exit 1; }
 
@@ -78,20 +76,32 @@ fi
 
 if [ $NEED_SYNC = 1 ]; then
   echo "== 1. the sync first =="
-  "$SYNCCMD" run --reason switch 2>&1 | sed 's/^/    /'
-  if [ "${PIPESTATUS[0]}" != 0 ]; then
+  "$SYNCCMD" run --reason switch 2>&1 | sed 's/^/    /'; src=${PIPESTATUS[0]}
+  if [ "$src" = 75 ]; then      # another sync holds the lock: it may be reading, sending, or waiting to try again
+    bad "another sync is running — no switch onto a copy nobody confirmed (this VM still serves). When it has ended: this again"; log failed "step=sync busy"; exit 1
+  elif [ "$src" != 0 ]; then
     bad "the sync did not end clean — no switch onto a copy that was not confirmed (this VM still serves)"; log failed "step=sync"; exit 1
   fi
   done_ "the standby holds a fresh copy"
 fi
 echo "== 2. the switch =="
-T0=$(now)
-"$SYSTEMCTL" stop keepalived || { bad "systemctl stop keepalived failed — this VM still serves"; log failed "step=stop"; exit 1; }
-done_ "keepalived stopped here after $(since "$T0") s (priority-0 advert sent; this VM's serving stops with it)"
+T0=$(zr_now)
+# From the stop to the start, this VM is out of the pair. However this script ends in between — Ctrl-C, a dropped
+# session, a kill — keepalived is started here again: with the standby serving this VM stands by; with nobody serving
+# it takes the address back.
+KA_DOWN=0
+back() { local rc=$?; trap - EXIT INT TERM HUP; [ $KA_DOWN = 0 ] || "$SYSTEMCTL" start keepalived || true; exit $rc; }
+trap back EXIT; trap 'exit 143' TERM; trap 'exit 130' INT; trap 'exit 129' HUP
+KA_DOWN=1
+"$SYSTEMCTL" stop keepalived || { KA_DOWN=0; bad "systemctl stop keepalived failed — this VM still serves"; log failed "step=stop"; exit 1; }
+done_ "keepalived stopped here after $(zr_since "$T0") s (priority-0 advert sent; this VM's serving stops with it)"
 took=""
+# $WAIT seconds, by the clock: a hello that hangs (the standby's ssh stops answering) is cut off at what is left of them
+SECONDS=0
 for _ in $(seq 1 "$(awk -v w="$WAIT" -v p="$POLL" 'BEGIN { print int(w / p) }')"); do
-  H=$(peer_hello) || true
-  if [ "$(zr_field "$H" role)" = MASTER ] && [ "$(zr_field "$H" serving)" = yes ]; then took=$(since "$T0"); break; fi
+  left=$((WAIT - SECONDS)); [ $left -ge 1 ] || break
+  H=$(timeout "$left" "$SYNCCMD" peer-hello 2>/dev/null | tail -1) || true
+  if [ "$(zr_field "$H" role)" = MASTER ] && [ "$(zr_field "$H" serving)" = yes ]; then took=$(zr_since "$T0"); break; fi
   sleep "$POLL"
 done
 MARKED=0
@@ -109,6 +119,7 @@ if [ -n "$took" ]; then
     zr_version_unlock
   else bad "the version lock was held for more than $ZR_LOCK_WAIT s: the version and the outdated mark were not written"; fi
 fi
+KA_DOWN=0
 "$SYSTEMCTL" start keepalived || bad "systemctl start keepalived failed here — this VM is out of the pair until it runs"
 if [ -n "$took" ]; then
   done_ "the standby says MASTER and serving $took s after the stop; keepalived runs here again (this VM is the standby)"

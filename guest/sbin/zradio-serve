@@ -5,6 +5,7 @@
 #
 #   zradio-serve up       serve: the Z-Wave receiver on, then ser2net. A new turn drops this VM's sync records
 #                         (synced.json, last-sync.json), so zradio-sync's tick syncs the peer once in every turn.
+#                         Refused on a VM whose interfaces do not hold the floating address (--force: all the same).
 #   zradio-serve down     stand by, silent: ser2net stopped, the Z-Wave receiver off, the Zigbee coordinator reset.
 #                         Also at boot, before keepalived (zradio-quiet.service): a stick powers up listening.
 #   zradio-serve hush     a standby silenced again: the receiver off; the coordinator reset only if it runs a network.
@@ -24,6 +25,13 @@
 # missing; no interface holds SELF (an address from DHCP that changed: the peer cannot hear this VM); a set is being
 # written or was not written to the end (applying, standby-dirty); a stick stopped answering (stick-wedged); `up`
 # failed less than $FAILED_FOR s ago (serve-failed); or the election's gate holds this VM (boot-wait, hold: ELECTION=act).
+# The role and the serving must agree, and nothing else looks at both. So check also fails — and writes serve-failed —
+# on a VM that has held the floating address for $SERVE_GRACE s (counted by the check itself, from the first time it
+# saw that) with ser2net not active and nobody at the sticks (an
+# `up` that never got the sticks, a ser2net that died, a read that was killed): the other VM takes over, and this one
+# is tried again after $FAILED_FOR s. And hush stops a VM that serves without the address for $SERVE_GRACE s (a `down`
+# that never got the sticks). "Holds the address" is what its interfaces show; keepalived's last word only where that
+# cannot be seen: two notifies that come within milliseconds can be written in either order.
 # A serving turn is `confirmed` or `provisional` ($RUN/turn): provisional when, in act mode, this VM serves without
 # knowing that nobody is ahead of it (outdated, or nobody answered at boot); it never advances the version.
 # up, down and hush hold the sticks lock (zr_sticks_lock), as do zradio-sync's read and a standby's marking before a
@@ -43,17 +51,22 @@ RUN=${ZRADIO_SERVE_RUN:-/run/zradio}
 STATE=${ZRADIO_SERVE_STATE:-/var/lib/zradio}
 ZR_RF_TRIES=${ZRADIO_SERVE_TRIES:-$ZR_RF_TRIES}
 ZR_RF_PAUSE=${ZRADIO_SERVE_PAUSE:-$ZR_RF_PAUSE}
+ADDR_WAIT=${ZRADIO_SERVE_ADDR_WAIT:-10}  # s `up` waits for the floating address to show on an interface (keepalived sets it before its notify)
+UNSERVED_GAP=20                    # s between two health checks at most (keepalived runs one every 3 s): a longer gap is a new count
+SERVE_GRACE=${ZRADIO_SERVE_GRACE:-30}   # s the role and the serving may disagree while the unit's own start or stop is on its way
 FAILED_FOR=${ZRADIO_SERVE_HOLD:-300}  # s a failed `up` keeps this VM out of the election (or it would claim every few s)
 GATE_SLACK=240                     # s a boot-wait may outlive ELECTION_WAIT: the gate's last look (a peer hello, a
                                    # Zigbee counter raise) can run past the wait; older = the gate died
 ZIGBEE_RUNNING="8|9"               # Z-Stack device states StartingAsCoordinator, StartedAsCoordinator
 zr_markers
+UNSERVED="$RUN/unserved-since"     # the health check's own count: when it first saw this VM hold the address without serving
 RADIOS_OK=1; zr_load_radios || RADIOS_OK=0
 ZW=${ZRADIO_SERVE_ZWAVE_TTY:-$ZWAVE_TTY}
 ZB=${ZRADIO_SERVE_ZIGBEE_TTY:-$ZIGBEE_TTY}
 
 say() { zr_say serve "$@"; }
-ERR=$(mktemp) || exit 1; trap 'rm -f "$ERR"' EXIT
+# (a file for a probe's stderr; not for check and status: the health check runs every 3 s and must not write a file)
+ERR=""; case "${1:-}" in check|status) ;; *) ERR=$(mktemp) || exit 1; trap 'rm -f "$ERR"' EXIT;; esac
 probe_json() { python3 "$PROBE" "$@" --json 2>"$ERR"; }
 why() { grep -E '^   FAIL' "$ERR" | head -1 | cut -c1-160; }
 receiver() { zr_receiver "$1" "$ZW" "$ERR"; }
@@ -74,13 +87,36 @@ fail_up() { : > "$FAILED"; say failed "$1"; exit 1; }   # fail_up <text>: not se
 sticks_lock() {
   zr_sticks_lock || { say loud "step=lock — the sticks were held for more than $ZR_LOCK_WAIT s (another zradio-serve, or a sync)"; exit 1; }
 }
-master_or_serving() { zr_serving || [ "$(zr_role)" = MASTER ]; }
+holds_address() { # this VM holds the floating address: seen on its interfaces, or — where that cannot be told — by keepalived's last word
+  local rc; zr_holds_vip; rc=$?
+  if [ $rc = 2 ]; then [ "$(zr_role)" = MASTER ]; return; fi
+  return $rc
+}
+serves_without_address() { # ser2net is active and this VM does not hold the floating address
+  zr_serving || return 1
+  local rc; zr_holds_vip; rc=$?
+  [ $rc != 0 ] || return 1
+  [ $rc != 1 ] || return 0
+  case "$(zr_role)" in BACKUP|FAULT|STOP) return 0;; esac; return 1
+}
+sticks_free() { ( exec 7>>"$STICKS_LOCK" && flock -n 7 ) 2>/dev/null; }      # nobody holds the sticks lock right now (it is not kept)
 
 case "$MODE" in
 up)
   zr_need_root
   sticks_lock
   if zr_serving; then rm -f "$FAILED"; say up-already "ser2net is active: this VM serves already — nothing done"; exit 0; fi
+  # Only where the floating address is: a start that reaches this unit without it (keepalived's MASTER and BACKUP
+  # notifies a few milliseconds apart, taken by systemd in the other order; a start by hand on the standby) would put
+  # a second listening stick beside the VM that serves. Not a failed `up`: this VM stays in the election.
+  if [ "${2:-}" != --force ] && zr_load_conf 2>/dev/null; then
+    t=0; while zr_holds_vip; [ $? = 1 ] && [ "$t" -lt "$ADDR_WAIT" ]; do sleep 1; t=$((t + 1)); done
+    zr_holds_vip; if [ $? = 1 ]; then
+      say loud "step=no-address — no interface of this VM holds the floating address ${VIP%/*} (keepalived's last word: $(zr_role)): \
+nothing started, no stick touched. The VM that holds it serves (zradio-serve up --force starts this one all the same)"
+      exit 1
+    fi
+  fi
   need_radios || fail_up "$WHY: not serving"
   gone=$(missing)
   [ -z "$gone" ] || fail_up "step=tty — no $gone: a stick is gone; not serving"
@@ -96,12 +132,16 @@ the sticks answer a probe (zradio-serve hush tries; a hung stick wants a power c
   if zr_load_conf 2>/dev/null && [ "$ELECTION" = act ] && { [ -e "$OUTDATED" ] || [ -e "$ALONE" ]; }; then turn=provisional; fi
   echo "$turn" > "$TURN_F"
   if ! "$SYSTEMCTL" start ser2net || ! zr_serving; then
-    rm -f "$TURN_F"; fail_up "step=ser2net — ser2net did not start: not serving, out of the election for $FAILED_FOR s"
+    rm -f "$TURN_F"
+    # the receiver was just turned on: off again, or this stick listens to the mesh beside the VM that takes over
+    # (systemd runs no ExecStop — `down` — after a start that failed)
+    if zr_has zwave synced && ! receiver off; then say loud "step=zwave-receiver — SetRFReceiveMode off did not answer after ser2net failed to start ($(why)): this stick still listens to the mesh"; fi
+    fail_up "step=ser2net — ser2net did not start: not serving, out of the election for $FAILED_FOR s"
   fi
   # a new turn: these sticks are no longer "a copy of sync X" (synced.json), and what this VM sent in an earlier turn
   # (last-sync.json) says nothing about the peer now. With both gone, the tick syncs the peer once in this turn — the
   # sync that lifts the returning VM's Zigbee frame counter above this one's.
-  rm -f "$STATE/synced.json" "$STATE/last-sync.json" "$FAILED"
+  rm -f "$STATE/synced.json" "$STATE/last-sync.json" "$STATE/sync-pending.json" "$FAILED"      # (a pending mark of an earlier turn: its failed tries are not this turn's)
   if [ $turn = provisional ]; then
     if [ -e "$OUTDATED" ]; then why_p="it is outdated: $(cat "$OUTDATED" 2>/dev/null)"; else why_p="the peer did not answer at boot"; fi
     say provisional "this VM serves without knowing that it holds the newest networks ($why_p): its version does not advance, \
@@ -142,11 +182,20 @@ it runs the network by itself, a second coordinator is on the air"; rc=1
 
 hush)
   zr_need_root
-  if master_or_serving; then echo "this VM serves or is about to — nothing to hush"; exit 0; fi
+  # a VM that serves without the role (its unit's stop never got the sticks, or never came): stopped here, once the
+  # role has been settled for a while — a stop that is on its way is left to finish
+  zr_load_conf 2>/dev/null || true
+  if serves_without_address && [ "$(age_of "$ROLE_F")" -ge "$SERVE_GRACE" ]; then
+    say loud "step=role — ser2net is active and this VM does not hold the floating address (keepalived's last word: $(zr_role), $(age_of "$ROLE_F") s ago): it serves without the role. Stopping it"
+    "$SYSTEMCTL" stop zradio-serve.service || true      # its ExecStop is `zradio-serve down`
+    if zr_serving; then rm -f "$ERR"; exec bash "$0" down; fi      # the unit was not active, so its stop did nothing
+    exit 0
+  fi
+  if zr_master_or_serving; then echo "this VM serves or is about to — nothing to hush"; exit 0; fi
   [ $RADIOS_OK = 1 ] || { echo "$ZR_ERR — nothing to hush"; exit 0; }
   sticks_lock
   # again under the lock: an up that ran meanwhile has the last word, and a write that has begun is not disturbed
-  if master_or_serving; then echo "this VM serves — nothing to hush"; exit 0; fi
+  if zr_master_or_serving; then echo "this VM serves — nothing to hush"; exit 0; fi
   if [ -e "$APPLYING" ]; then echo "a synced set is being written — nothing to hush"; exit 0; fi
   rc=0
   if zr_has zwave synced && [ -e "$ZW" ] && ! receiver off; then
@@ -163,7 +212,10 @@ hush)
     fi
   fi
   if [ -e "$WEDGED" ]; then
-    if [ $rc = 0 ] && [ -z "$(missing)" ]; then
+    wk=$(cut -d' ' -f1 "$WEDGED" 2>/dev/null); case "$wk" in zwave|zigbee) ;; *) wk="";; esac      # the stick the mark names
+    if [ -n "$wk" ] && ! zr_has "$wk" synced; then
+      echo "stick-wedged stays: it names the $wk stick, which is served only — the kit has no question it could ask that stick. After a power cycle of it (stop and start this VM): rm $WEDGED"
+    elif [ $rc = 0 ] && [ -z "$(missing)" ]; then
       rm -f "$WEDGED"; say unwedged "both sticks answer again: stick-wedged is removed, this VM may stand by and serve"
     else echo "stick-wedged stays: a stick still does not answer (a hung stick wants a power cycle: stop and start this VM)"; fi
   fi
@@ -177,6 +229,20 @@ check)
   for m in "$APPLYING" "$DIRTY" "$WEDGED" "$HOLD"; do [ ! -e "$m" ] || exit 1; done
   [ -e "$BOOT_WAIT" ] && [ "$(age_of "$BOOT_WAIT")" -lt $((ELECTION_WAIT + GATE_SLACK)) ] && exit 1
   [ -e "$FAILED" ] && [ "$(age_of "$FAILED")" -lt "$FAILED_FOR" ] && exit 1
+  # the role without the serving, with nobody working on it (up, down, hush and a sync's read all hold the sticks lock)
+  # The $SERVE_GRACE s are counted by this check itself, from the first time it sees that — never by the role file's
+  # age: keepalived sets the address and then runs its notify, so a check in between sees the address with a role
+  # file of hours ago. The file holds the first sighting; its own age says whether the sightings were one after the
+  # other (a check that passed in between, or that never ran, starts the count again).
+  if holds_address && ! zr_serving; then
+    since=$(cat "$UNSERVED" 2>/dev/null); now_s=$(date +%s)
+    if [[ "$since" =~ ^[0-9]{1,12}$ ]] && [ "$(age_of "$UNSERVED")" -le "$UNSERVED_GAP" ]; then echo "$since" > "$UNSERVED"; else since=$now_s; echo "$since" > "$UNSERVED"; fi
+  else since=""; [ ! -e "$UNSERVED" ] || rm -f "$UNSERVED"; fi
+  if [ -n "$since" ] && [ $((now_s - since)) -ge "$SERVE_GRACE" ] && sticks_free; then
+    : > "$FAILED"; rm -f "$UNSERVED"
+    zr_log serve loud "step=not-serving — this VM holds the floating address (keepalived's last word: $(zr_role), $(age_of "$ROLE_F") s ago), ser2net is not active and nobody is at the sticks: it holds the address without serving. Out of the election for $FAILED_FOR s: the other VM takes the role"
+    exit 1
+  fi
   exit 0;;
 
 status)
@@ -203,5 +269,5 @@ so it does not serve. An address from DHCP that changed: give this VM $SELF back
 
 -h|--help) sed -n '2,/^set -uo pipefail$/{/^set -uo pipefail$/!p}' "$0"; exit 0;;
 
-*) echo "usage: zradio-serve up|down|hush|check|status (--help)" >&2; exit 2;;
+*) echo "usage: zradio-serve up [--force]|down|hush|check|status (--help)" >&2; exit 2;;
 esac

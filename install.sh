@@ -4,9 +4,9 @@
 # It asks what it needs, shows what it would do, and does it after a yes: the VM (Debian 13), this node's Z-Wave
 # and/or Zigbee sticks passed through, the kit installed inside (through the guest agent), a watchdog that resets a
 # hung VM. No Proxmox HA: the two VMs decide between them which one serves. The VM takes its own address from DHCP; the one address
-# asked for is the floating one Home Assistant connects to. On the second node it takes the network from the first VM
-# and introduces the two to each other. On a node whose radio VM exists, the same command UPDATES that VM and the
-# pair's other one to this kit (or says they are up to date).
+# asked for is the floating one Home Assistant connects to. On the second node it takes the pair's addresses and
+# settings from the first VM and introduces the two to each other. On a node whose radio VM exists, the same command
+# UPDATES that VM and the pair's other one to this kit (or says they are up to date).
 #
 # Without a terminal nothing is asked: every answer is an option, and nothing is changed without --run.
 #   --answers FILE           the options below as lines of a file, KEY=value (answers.example); for unattended runs
@@ -25,13 +25,19 @@
 #   --join NAME              the first radio VM, to pair with (found by itself when there is one);  --no-pair
 #   --start                  put the VM into the pair at the end        --run   do it
 #   more: --vrid --priority --pair-mac --usb-mapping --vmid --storage --snippets --memory --cores --disk --hookscript
-#         --ssh-keys --conf KEY=VALUE --no-usb --allow-no-radios --image-dir --third-vote-port   (docs/DESIGN.md)
+#         --ssh-keys --conf KEY=VALUE --no-usb --allow-no-radios --image-dir --third-vote-port --third-vote-hostkey   (docs/DESIGN.md)
 #   --third-vote A.B.C.D     not a VM: a third vote for a cluster of two nodes, from a machine at that address, where
 #                            this same command went first (there it sets up the vote, and prints the line for here).
 #
 # Needs to reach GitHub: the table of known sticks is built from Home Assistant's USB lists at every run, into gen/.
-# Tests: tests/t-host.sh, t-update.sh, t-e2e.sh (Proxmox and the guests are fakes there). Not yet run on a real node.
+# Tests: tests/t-host.sh, t-update.sh, t-e2e.sh (Proxmox and the guests are fakes there).
 set -uo pipefail
+# Env for the tests (tests/fake-node.sh; nothing a user sets). Where this node's things are: ZRADIO_VM_KIT (the kit's
+# folder), ZRADIO_VM_SYS (/sys/bus/usb/devices), ZRADIO_VM_NET (/sys/class/net), ZRADIO_VM_PVE (/etc/pve),
+# ZRADIO_VM_CACHE (the image cache), ZRADIO_VM_KEYS (root's authorized_keys). ZRADIO_VM_ASK=1: ask as on a terminal.
+# ZRADIO_VM_WAIT, ZRADIO_VM_POLL: the seconds between two looks at a VM, and at a command in it or at the votes.
+# For --third-vote (host/qdevice.sh): ZRADIO_VM_SSH_DIR (root's .ssh), ZRADIO_VM_QDEV_DB (a node's certificates for
+# the vote), ZRADIO_VM_QNETD_PORT (the vote's TCP port).
 HERE=$(cd "$(dirname "$0")" && pwd)
 KIT=${ZRADIO_VM_KIT:-$HERE}
 SYS=${ZRADIO_VM_SYS:-/sys/bus/usb/devices}
@@ -65,7 +71,7 @@ fi
 NAME="" ROLE="" SELF="" PEER="" VIP="" VRID="" PRIORITY="" BRIDGE="" PAIR_BRIDGE="" GATEWAY="" PAIR_MAC="" VMID="" STORAGE="" SNIP=local
 MEMORY=2048 CORES=2 DISK=8G HOOK="" KEYS=${ZRADIO_VM_KEYS:-/root/.ssh/authorized_keys} FIRST=0 START=0 NORADIOS=0 NOUSB=0
 IMAGE_DIR=https://cloud.debian.org/images/cloud/trixie/latest
-USBMAPS=() EXTRA=() STICKS=0 JOIN="" PAIR=1 PASS=() UPDATE="" THIRD=0 VOTE="" VOTE_PORT=22
+USBMAPS=() EXTRA=() STICKS=0 JOIN="" PAIR=1 PASS=() UPDATE="" THIRD=0 VOTE="" VOTE_PORT=22 VOTE_HOSTKEY=""
 # --answers FILE: the options as lines, KEY=value (INITIAL_ROLE=primary, SELF=…, USB_MAPPING=… once per mapping) and
 # yes/no for the ones without a value (FIRST=yes, START=yes, NO_PAIR=yes …). An option on the command line wins.
 # RUN is not an answer: nothing is changed without --run on the command line.
@@ -84,7 +90,10 @@ while [ $# -gt 0 ]; do if [ "$1" = --answers ]; then
     done < "$2"; shift 2
   else A+=("$1"); shift; fi; done
 set -- ${F[@]+"${F[@]}"} ${A[@]+"${A[@]}"}
-while [ $# -gt 0 ]; do case "$1" in
+while [ $# -gt 0 ]; do
+  case "$1" in --name|--initial-role|--self|--peer|--vip|--vrid|--priority|--bridge|--pair-bridge|--gateway|--join|--update|--pair-mac|--vmid|--storage|--snippets|--memory|--cores|--disk|--hookscript|--third-vote|--third-vote-port|--third-vote-hostkey|--ssh-keys|--image-dir|--usb-mapping|--conf)
+    [ $# -ge 2 ] || die "$1 needs a value (./install.sh --help)";; esac
+  case "$1" in
   -h|--help) sed -n '2,/^set -uo pipefail$/{/^set -uo pipefail$/!p}' "$0"; exit 0;;
   --sticks) STICKS=1; shift;; --run) RUN=1; shift;; --first) FIRST=1; shift;; --start) START=1; shift;; --no-pair) PAIR=0; shift;;
   --allow-no-radios) NORADIOS=1; PASS+=("$1"); shift;; --no-usb) NOUSB=1; PASS+=("$1"); shift;;
@@ -92,10 +101,11 @@ while [ $# -gt 0 ]; do case "$1" in
   --priority) PRIORITY=$2; shift 2;; --bridge) BRIDGE=$2; shift 2;; --pair-bridge) PAIR_BRIDGE=$2; shift 2;; --gateway) GATEWAY=$2; shift 2;; --join) JOIN=$2; shift 2;; --update) UPDATE=$2; shift 2;;
   --pair-mac) PAIR_MAC=$2; PASS+=("$1" "$2"); shift 2;; --vmid) VMID=$2; PASS+=("$1" "$2"); shift 2;; --storage) STORAGE=$2; PASS+=("$1" "$2"); shift 2;; --snippets) SNIP=$2; PASS+=("$1" "$2"); shift 2;;
   --memory) MEMORY=$2; PASS+=("$1" "$2"); shift 2;; --cores) CORES=$2; PASS+=("$1" "$2"); shift 2;; --disk) DISK=$2; PASS+=("$1" "$2"); shift 2;; --hookscript) HOOK=$2; PASS+=("$1" "$2"); shift 2;;
-  --third-vote) THIRD=1; VOTE=${2:-}; shift 2;; --third-vote-port) VOTE_PORT=${2:-}; shift 2;;
+  --third-vote) THIRD=1; VOTE=$2; shift 2;; --third-vote-port) VOTE_PORT=$2; shift 2;; --third-vote-hostkey) VOTE_HOSTKEY=$2; shift 2;;
   --ssh-keys) KEYS=$2; PASS+=("$1" "$2"); shift 2;; --image-dir) IMAGE_DIR=$2; PASS+=("$1" "$2"); shift 2;; --usb-mapping) USBMAPS+=("$2"); PASS+=("$1" "$2"); shift 2;; --conf) EXTRA+=("$2"); PASS+=("$1" "$2"); shift 2;;
   *) echo "unknown option: $1 (./install.sh --help)" >&2; exit 2;; esac; done
 [ "$(id -u)" = 0 ] || die "run as root on the Proxmox node"
+# (reached on a machine that is no node only when --help is some option's value, which keeps the hand-over above from happening)
 command -v qm >/dev/null 2>&1 && command -v pvesh >/dev/null 2>&1 || die "no qm / pvesh here: this runs on a Proxmox VE node"
 if [ $THIRD = 1 ]; then      # the cluster's third vote, not a VM: no sticks, no kit for a guest
   # shellcheck source=host/qdevice.sh

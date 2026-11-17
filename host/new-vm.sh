@@ -5,6 +5,11 @@
 # ------------------------------------------------------------- the first radio VM, when this node gets the second
 # A VM with the tag `zradio` on another node is the pair's first VM: its addresses, its bridge and its initial role
 # decide this one's, and the two are introduced to each other at the end.
+# A VM is tagged zradio-building from its creation until this run has finished with it (the kit installed in it, the
+# pair introduced), and zradio from then on. So a run that stopped halfway leaves no VM that passes for a radio VM:
+# nothing updates it, and the other node does not pair with it.
+HALF=$(printf '%s\n' "$VMS" | awk -v me="$NODE" '$3 == me && (";" $5 ";") ~ /;zradio-building;/ { printf "%s%s (%s)", s, $2, $1; s = ", " }')
+[ -z "$HALF" ] || die "$HALF on $NODE: a radio VM that an earlier run did not finish, or a drill (--no-usb). It is not updated and not built upon. Remove it, then this again: qm stop <id>; qm destroy <id> --purge; and its cloud-init file <name>-zradio.yaml in the snippets storage"
 PNODE="" PVMID="" PNAME="" P_ROLE="" P_ZWAVE="" P_ZIGBEE=""
 if [ $PAIR = 1 ] && [ $NOUSB = 0 ]; then
   if [ -n "$JOIN" ]; then C=$(printf '%s\n' "$VMS" | awk -v n="$JOIN" -v me="$NODE" '$2 == n && $3 != me')
@@ -22,30 +27,35 @@ fi
 if [ -n "$PVMID" ]; then
   agent_up "$PNODE" "$PVMID" || die "$PNAME on $PNODE does not answer (its guest agent): start it first — this node's VM takes its addresses from it and is introduced to it. (--no-pair: do neither.)"
   # shellcheck disable=SC2016  # the script runs in the VM
-  PF=$(gx "$PNODE" "$PVMID" 20 'cat /etc/zradio/zradio.conf 2>/dev/null; printf "INITIAL_ROLE=%s\n" "$(cat /var/lib/zradio/initial-role 2>/dev/null)"; sed -n "s/^\(ZWAVE\|ZIGBEE\)=/P_&/p" /etc/zradio/radios.conf 2>/dev/null') \
+  PF=$(gx "$PNODE" "$PVMID" 20 'cat /etc/zradio/zradio.conf 2>/dev/null; echo; printf "INITIAL_ROLE=%s\n" "$(cat /var/lib/zradio/initial-role 2>/dev/null)"; sed -n "s/^\(ZWAVE\|ZIGBEE\)=/P_&/p" /etc/zradio/radios.conf 2>/dev/null') \
     || die "could not read $PNAME's configuration through its guest agent"
   pf() { printf '%s\n' "$PF" | sed -n "s/^$1=//p" | tail -1 | tr -dc 'A-Za-z0-9./:_-'; }
   P_SELF=$(pf SELF); P_PEER=$(pf PEER); P_ROLE=$(pf INITIAL_ROLE); P_ZWAVE=$(pf P_ZWAVE); P_ZIGBEE=$(pf P_ZIGBEE)
   ip4 "$P_SELF" || die "$PNAME has no /etc/zradio/zradio.conf with SELF: the kit is not installed in it"
   [ -z "$P_PEER" ] || ip4 "$P_PEER" || die "$PNAME's /etc/zradio/zradio.conf names a PEER that is no address: '$P_PEER'"
   [ -n "$PEER" ] || PEER=$P_SELF
-  [ -n "$VIP" ] || VIP=$(pf VIP)
-  [ -n "$VRID" ] || VRID=$(pf VRID)
+  # what the two VMs of a pair share comes from the first one; an option of this run that says otherwise is refused
+  P_VIP=$(pf VIP); P_VRID=$(pf VRID)
+  [ -z "$VIP" ] || [ -z "$P_VIP" ] || [ "${VIP%/*}" = "${P_VIP%/*}" ] || die "--vip ${VIP%/*}: $PNAME holds the pair's floating address as ${P_VIP%/*}. Both VMs of a pair have the same one (--no-pair: a pair of its own)"
+  [ -z "$VRID" ] || [ -z "$P_VRID" ] || [ "$VRID" = "$P_VRID" ] || die "--vrid $VRID: $PNAME has $P_VRID. Both VMs of a pair have the same one, or neither hears the other (--no-pair: a pair of its own)"
+  [ -n "$VIP" ] || VIP=$P_VIP
+  [ -n "$VRID" ] || VRID=$P_VRID
+  for k in ZWAVE_PORT ZIGBEE_PORT SYNC_AT SYNC_TZ ELECTION ELECTION_WAIT ZUI_IMAGE ZIGPY_VERSION; do
+    v=$(printf '%s\n' "$PF" | sed -n "s/^$k=//p" | tail -1 | tr -dc 'A-Za-z0-9./:_@+-'); mine=""
+    for e in ${EXTRA[@]+"${EXTRA[@]}"}; do [ "${e%%=*}" != "$k" ] || mine=${e#*=}; done
+    if [ -z "$v" ]; then [ -z "$mine" ] || warn "--conf $k=$mine: $PNAME's zradio.conf does not set $k (it runs with the default). The two VMs of a pair must agree on it"
+    elif [ -z "$mine" ]; then EXTRA+=("$k=$v")
+    elif [ "$mine" != "$v" ]; then die "--conf $k=$mine: $PNAME has $k=$v. Both VMs of a pair have the same one (leave the option out: it is taken from $PNAME)"; fi
+  done
   # the network, from the first VM's own lines in the cluster's files: the ipconfig that holds its address, and that interface's bridge
   PC="$PVE/nodes/$PNODE/qemu-server/$PVMID.conf"
   pk=$(sed -n '/^\[/q; s/^ipconfig\([0-9]\):.*ip='"${P_SELF//./\\.}"'\/\([0-9]*\).*/\1 \2/p' "$PC" 2>/dev/null | head -1)
   pbr() { sed -n '/^\[/q; s/^net'"$1"':.*bridge=\([A-Za-z0-9._-]*\).*/\1/p' "$PC" | head -1; }
-  if [ -z "$pk" ]; then                      # the first VM has its address from DHCP: so does this one, on the same bridge
-    [ -n "$BRIDGE" ] || BRIDGE=$(pbr 0)
-  else
+  [ -n "$BRIDGE" ] || BRIDGE=$(pbr 0)        # net0 is on the first VM's bridge, however the addresses are given
+  if [ -n "$pk" ]; then                      # (none: the first VM has its address from DHCP, and so does this one)
     [ -n "$SELF" ] || [ -z "$P_PEER" ] || SELF="$P_PEER/${pk#* }"
-    if [ "${pk% *}" = 0 ]; then
-      [ -n "$BRIDGE" ] || BRIDGE=$(pbr 0)
-      [ -n "$GATEWAY" ] || GATEWAY=$(sed -n '/^\[/q; s/^ipconfig0:.*gw=\([0-9.]*\).*/\1/p' "$PC" | head -1)
-    else
-      [ -n "$BRIDGE" ] || BRIDGE=$(pbr 0)
-      [ -n "$PAIR_BRIDGE" ] || PAIR_BRIDGE=$(pbr "${pk% *}")
-    fi
+    if [ "${pk% *}" = 0 ]; then [ -n "$GATEWAY" ] || GATEWAY=$(sed -n '/^\[/q; s/^ipconfig0:.*gw=\([0-9.]*\).*/\1/p' "$PC" | head -1)
+    else [ -n "$PAIR_BRIDGE" ] || PAIR_BRIDGE=$(pbr "${pk% *}"); fi
   fi
   case "$P_ROLE" in
     primary) [ "${ROLE:-standby}" = standby ] || die "$PNAME was installed as the initial primary: this node's VM is the initial standby (two primaries would be two different sets of networks)"; ROLE=standby;;
@@ -148,12 +158,17 @@ if [ $DHCP = 0 ] && [ -z "$PAIR_BRIDGE" ]; then ip4 "$GATEWAY" || die "without -
 [ -z "$VMID" ] || { [[ "$VMID" =~ ^[0-9]{3,9}$ ]] && [ "$VMID" -ge 100 ]; } || die "--vmid '$VMID'"
 [[ "$MEMORY" =~ ^[0-9]{3,6}$ ]] && [[ "$CORES" =~ ^[0-9]{1,2}$ ]] && [[ "$DISK" =~ ^[0-9]+G$ ]] || die "--memory MB, --cores N, --disk <n>G"
 [ -z "$HOOK" ] || [[ "$HOOK" =~ ^[A-Za-z0-9_-]+:snippets/[A-Za-z0-9._-]+$ ]] || die "--hookscript '$HOOK': a volume id like local:snippets/my-hook.sh"
+IMAGE_DIR=${IMAGE_DIR%/}
+[[ "$IMAGE_DIR" =~ ^(https?://|file:///)[][A-Za-z0-9._~:/@%+-]+$ ]] || die "--image-dir '$IMAGE_DIR': where the Debian image and its SHA512SUMS are — https://…, or file:///folder for a folder of this node"
 for m in ${USBMAPS[@]+"${USBMAPS[@]}"}; do [[ "$m" =~ ^[A-Za-z][A-Za-z0-9_-]{0,60}$ ]] || die "--usb-mapping '$m'"; done
 [ $NOUSB = 0 ] || [ ${#USBMAPS[@]} -eq 0 ] || die "--no-usb and --usb-mapping contradict each other"
 [ $NOUSB = 0 ] || [ $START = 0 ] || die "--no-usb is a drill: a VM without a stick is not put into a pair (--start)"
 for e in ${EXTRA[@]+"${EXTRA[@]}"}; do
   [[ "$e" =~ ^[A-Z][A-Z0-9_]*=[A-Za-z0-9./:_@+-]*$ ]] || die "--conf '$e': KEY=value"
-  case "${e%%=*}" in NAME|SELF|PEER|VIP|VRID|PRIORITY) die "--conf ${e%%=*}: that one has its own option";; esac
+  case "${e%%=*}" in NAME|SELF|PEER|VIP|VRID|PRIORITY) die "--conf ${e%%=*}: that one has its own option";;
+    # (the keys of zradio.conf that have no option of their own: guest/lib/zradio-common.sh refuses a conf with any other)
+    IFACE|ZWAVE_PORT|ZIGBEE_PORT|SYNC_AT|SYNC_TZ|ELECTION|ELECTION_WAIT|ZUI_IMAGE|ZIGPY_VERSION) ;;
+    *) die "--conf ${e%%=*}: not a key of zradio.conf (zradio.conf.example lists them)";; esac
 done
 if [ -n "$PVMID" ]; then
   [ "$PEER" = "$P_SELF" ] || die "$PNAME says it is $P_SELF; this VM would have its peer at $PEER — the two do not fit (--no-pair: a pair of its own)"
@@ -215,6 +230,11 @@ else
 fi
 [ -s "$KEYS" ] && grep -qE '^(ssh-|ecdsa-|sk-)' "$KEYS" && ok "root's keys for the VM: $(grep -cE '^(ssh-|ecdsa-|sk-)' "$KEYS") from $KEYS" \
   || bad "no public key in $KEYS: the VM would have no way in (--ssh-keys FILE)"
+case "$IMAGE_DIR" in
+  file://*) [ -d "${IMAGE_DIR#file://}" ] || bad "--image-dir $IMAGE_DIR: no such folder on this node";;
+  *) command -v wget >/dev/null 2>&1 || bad "no wget on this node: the Debian image and its checksum list are fetched with it (apt-get install wget; or from a folder of this node: --image-dir file:///folder)"
+    [ "${IMAGE_DIR%%:*}" != http ] || warn "--image-dir $IMAGE_DIR is plain http: nothing protects the image or its checksum list on the way (both come over that link). Yours to decide; https and file:/// do not have that";;
+esac
 quorum_check
 
 echo "== 1. the sticks on $NODE =="
@@ -269,7 +289,7 @@ else
       other) TODO+=("extend $mid $id $path");;
       none) TODO+=("create $mid $id $path");;
     esac
-    USE+=("$mid"); DEVS+=("$id $path")
+    USE+=("$mid"); DEVS+=("$id $port")
   done <<< "$S"
   if [ ${#USE[@]} -eq 0 ]; then
     if [ $NORADIOS = 1 ]; then warn "no stick on $NODE that the kit's table names — the VM is built without one (--allow-no-radios)"
@@ -298,14 +318,43 @@ for t in ${TODO[@]+"${TODO[@]}"}; do
 done
 
 echo "== 2. the Debian image =="
-if [ -s "$CACHE/$IMAGE_NAME" ] && [ -s "$CACHE/$IMAGE_NAME.sha512" ]; then ok "image cached: $CACHE/$IMAGE_NAME ($(cut -c1-16 "$CACHE/$IMAGE_NAME.sha512")…)"
-elif [ $RUN = 1 ]; then
-  mkdir -p "$CACHE"
-  ( cd "$CACHE" && wget -q "$IMAGE_DIR/SHA512SUMS" -O SHA512SUMS.tmp && wget -q "$IMAGE_DIR/$IMAGE_NAME" -O "$IMAGE_NAME.tmp" ) || { bad "download from $IMAGE_DIR failed"; exit 1; }
-  want=$(awk -v n="$IMAGE_NAME" '$2 == n { print $1 }' "$CACHE/SHA512SUMS.tmp"); got=$(sha512sum "$CACHE/$IMAGE_NAME.tmp" | awk '{ print $1 }')
-  if [ -n "$want" ] && [ "$want" = "$got" ]; then mv -f "$CACHE/$IMAGE_NAME.tmp" "$CACHE/$IMAGE_NAME"; echo "$got" > "$CACHE/$IMAGE_NAME.sha512"; unlink "$CACHE/SHA512SUMS.tmp"; done_ "image $IMAGE_NAME, sha512 ${got:0:16}… (from $IMAGE_DIR)"
-  else unlink "$CACHE/$IMAGE_NAME.tmp"; unlink "$CACHE/SHA512SUMS.tmp"; bad "sha512 mismatch for $IMAGE_NAME (the list says ${want:-nothing}, the file is $got)"; exit 1; fi
-else would "download $IMAGE_DIR/$IMAGE_NAME and SHA512SUMS, check, keep under $CACHE"; fi
+# What vouches for the image is HTTPS to cloud.debian.org. Debian publishes no signature of SHA512SUMS beside its cloud
+# images (that folder holds the images, their .json files and SHA512SUMS, nothing else: looked at on 2026-11-16), so
+# the list comes from the same server as the image: it catches a download that was damaged or cut short, not a server
+# that lies. A cached image is used only when it is the file its stored checksum was made of, and --run asks the list
+# whether it is still Debian's image (the one under `latest` is replaced every week or two). When the list or the
+# newer image cannot be had, a whole cached image is used, and that is said.
+img_get() { # img_get <file> <to>: one file of --image-dir
+  case "$IMAGE_DIR" in file://*) cp "${IMAGE_DIR#file://}/$1" "$2" 2>/dev/null;; *) wget -q -T 20 -t 2 "$IMAGE_DIR/$1" -O "$2";; esac      # (two tries of 20 s: a server that is not reached must not hold the run)
+}
+IMG="$CACHE/$IMAGE_NAME"; HAVE=""          # HAVE: the cached image's checksum, when it is whole
+if [ -s "$IMG" ] && [ -s "$IMG.sha512" ]; then
+  HAVE=$(sha512sum "$IMG" | awk '{ print $1 }')
+  [ "$HAVE" = "$(awk '{ print $1; exit }' "$IMG.sha512")" ] || { warn "the cached image $IMG is not the file its checksum was stored for (damaged, or replaced by hand): it is not used"; HAVE=""; }
+fi
+if [ $RUN = 0 ]; then
+  if [ -n "$HAVE" ]; then ok "image cached, and whole by its stored checksum: $IMG (${HAVE:0:16}…)"
+    would "ask $IMAGE_DIR/SHA512SUMS whether that is still Debian's image, and download the one there when it is not"
+  else would "download $IMAGE_DIR/$IMAGE_NAME and SHA512SUMS, check, keep under $CACHE"; fi
+else
+  mkdir -p "$CACHE" || { bad "cannot make $CACHE"; exit 1; }
+  trap 'rm -f "$CACHE/SHA512SUMS.tmp" "$IMG.tmp"' EXIT          # however this ends, nothing half-downloaded stays in the cache
+  want=""; ! img_get SHA512SUMS "$CACHE/SHA512SUMS.tmp" || want=$(awk -v n="$IMAGE_NAME" '$2 == n { print $1; exit }' "$CACHE/SHA512SUMS.tmp")
+  if [ -z "$want" ]; then
+    [ -n "$HAVE" ] || { bad "$IMAGE_DIR/SHA512SUMS could not be read, or names no $IMAGE_NAME: the image's checksum is not known, so it is not downloaded"; exit 1; }
+    warn "$IMAGE_DIR/SHA512SUMS could not be read, or names no $IMAGE_NAME: whether Debian has a newer image is not known. The cached one is used: $IMG (${HAVE:0:16}…)"
+  elif [ "$want" = "$HAVE" ]; then ok "image cached, whole, and still the one at $IMAGE_DIR: $IMG (${HAVE:0:16}…)"
+  else
+    got=""; ! img_get "$IMAGE_NAME" "$IMG.tmp" || got=$(sha512sum "$IMG.tmp" | awk '{ print $1 }')
+    if [ "$got" = "$want" ]; then
+      mv -f "$IMG.tmp" "$IMG" && echo "$got" > "$IMG.sha512" || { bad "could not put the image into $CACHE"; exit 1; }
+      done_ "image $IMAGE_NAME, sha512 ${got:0:16}… (from $IMAGE_DIR$([ -z "$HAVE" ] || echo ": the image there now, in place of the cached one"))"
+    elif [ -n "$HAVE" ]; then warn "the newer image at $IMAGE_DIR did not arrive whole ($([ -n "$got" ] && echo "its list says ${want:0:16}…, the file is ${got:0:16}…" || echo "the download failed")). The cached one is used: $IMG (${HAVE:0:16}…)"
+    elif [ -z "$got" ]; then bad "the download of $IMAGE_DIR/$IMAGE_NAME failed"; exit 1
+    else bad "sha512 mismatch for $IMAGE_NAME (the list says $want, the file is $got). While Debian puts a new image there the two can differ for a while: later again"; exit 1; fi
+  fi
+  rm -f "$CACHE/SHA512SUMS.tmp" "$IMG.tmp"; trap - EXIT
+fi
 
 echo "== 3. the cloud-init file $SNIPDIR/$NAME-zradio.yaml =="
 mk_user_data() {
@@ -324,7 +373,8 @@ packages:
 users:
   - name: root
     ssh_authorized_keys:
-$(grep -E '^(ssh-|ecdsa-|sk-)' "$KEYS" | sed 's/^/      - /')
+$(grep -E '^(ssh-|ecdsa-|sk-)' "$KEYS" | python3 -c 'import json, sys
+for line in sys.stdin: print("      - " + json.dumps(line.rstrip("\n")))')
 write_files:
   - path: /root/zradio.conf
     permissions: "0600"
@@ -352,16 +402,16 @@ if [ $RUN = 1 ]; then
 else would "write $SNIPDIR/$NAME-zradio.yaml: root's keys, qemu-guest-agent, the kit's guest folder, zradio.conf (NAME=$NAME$([ $DHCP = 1 ] && echo ", its own address filled in by the VM" || echo " SELF=${SELF%/*}")${PEER:+ PEER=$PEER} VIP=$VIP VRID=$VRID PRIORITY=$PRIORITY${EXTRA[*]:+ ${EXTRA[*]}})"; fi
 
 echo "== 4. the VM $NAME ($VMID) =="
-NETS=(--net0 "virtio,bridge=$BRIDGE")
-if [ -n "$PAIR_BRIDGE" ]; then
-  NETS+=(--ipconfig0 ip=dhcp --net1 "virtio${PAIR_MAC:+=$PAIR_MAC},bridge=$PAIR_BRIDGE" --ipconfig1 "ip=$SELF")
+if [ -n "$PAIR_BRIDGE" ]; then NETS=(--net0 "virtio,bridge=$BRIDGE" --ipconfig0 ip=dhcp --net1 "virtio${PAIR_MAC:+=$PAIR_MAC},bridge=$PAIR_BRIDGE" --ipconfig1 "ip=$SELF")
 elif [ $DHCP = 1 ]; then NETS=(--net0 "virtio${PAIR_MAC:+=$PAIR_MAC},bridge=$BRIDGE" --ipconfig0 ip=dhcp)
 else NETS=(--net0 "virtio${PAIR_MAC:+=$PAIR_MAC},bridge=$BRIDGE" --ipconfig0 "ip=$SELF,gw=$GATEWAY"); fi
 USBS=(); i=0; for m in ${USE[@]+"${USE[@]}"}; do USBS+=("--usb$i" "mapping=$m"); i=$((i + 1)); done
 do_ qm create "$VMID" --name "$NAME" --ostype l26 --machine q35 --bios ovmf --cores "$CORES" --memory "$MEMORY" --cpu host --scsihw virtio-scsi-single \
     --agent enabled=1 "${NETS[@]}" --serial0 socket --vga serial0 --onboot 1 --watchdog model=i6300esb,action=reset --efidisk0 "$STORAGE:1,efitype=4m,pre-enrolled-keys=0" \
     --ide2 "$STORAGE:cloudinit" --cicustom "user=$SNIP:snippets/$NAME-zradio.yaml" ${USBS[@]+"${USBS[@]}"} ${HOOK:+--hookscript "$HOOK"} \
-    --tags zradio --description "$NAME: one radio VM of a zradio pair — this node's Z-Wave / Zigbee sticks, served to Home Assistant on ${VIP%/*} while it holds that address, kept silent otherwise. Pinned to $NODE (its sticks are here). https://github.com/yuvaloren/ha_zradio" || exit 1
+    --tags zradio-building --description "$NAME: one radio VM of a zradio pair — this node's Z-Wave / Zigbee sticks, served to Home Assistant on ${VIP%/*} while it holds that address, kept silent otherwise. Pinned to $NODE (its sticks are here). https://github.com/yuvaloren/ha_zradio" || exit 1
+# from here on a run that stops leaves a VM behind: say how to start over, whatever line it stopped at
+[ "$RUN" = 0 ] || trap 'rc=$?; [ $rc = 0 ] || echo "== $NAME ($VMID) was not finished: nothing updates it or pairs with it as it is. To start over: qm stop $VMID; qm destroy $VMID --purge; rm $SNIPDIR/$NAME-zradio.yaml; then this again =="' EXIT
 do_ qm set "$VMID" --scsi0 "$STORAGE:0,import-from=$CACHE/$IMAGE_NAME,discard=on" || exit 1
 do_ qm disk resize "$VMID" scsi0 "$DISK" || exit 1
 do_ qm set "$VMID" --boot order=scsi0 || exit 1
@@ -375,7 +425,7 @@ if [ $RUN = 0 ]; then
   if [ -n "$PVMID" ]; then
     [ $DHCP = 0 ] && [ -n "$P_PEER" ] || would "tell $PNAME ($PNODE) this VM's address once DHCP has given it one (PEER in its zradio.conf; its keepalived is reloaded: when $PNAME serves, the floating address is gone for about 4 seconds)"
     would "introduce $NAME and $PNAME ($PNODE) to each other: each one's sync key and host key into the other (zradio-sync keys / trust), then a hello over that link"
-  elif [ $NOUSB = 0 ]; then warn "this is the pair's first VM: run ./install.sh on the other node next — it finds $NAME and takes everything from it"; fi
+  elif [ $NOUSB = 0 ]; then warn "this is the pair's first VM: run ./install.sh on the other node next — it finds $NAME and takes the pair's addresses and settings from it"; fi
   [ $START = 0 ] || would "systemctl start zradio.target in $NAME: it joins the pair"
   go_ahead "${ARGS[@]}"
 fi
@@ -395,9 +445,10 @@ run_guest_installer "$NODE" "$VMID" "$NAME" "$INST"; rc=$?
 if [ $rc = 0 ]; then ok "the kit is installed in $NAME, as the initial $ROLE"
 elif [ $NOUSB = 1 ] && printf '%s' "$GUEST_LOG" | grep -q "FAIL  zradio-detect did not end clean"; then
   ok "the drill went as far as a VM without a stick can: the VM, cloud-init, the kit unpacked, its packages — and the installer stopped at the detection, with no stick to find"
+  trap - EXIT
   echo "== a drill. To remove it: qm stop $VMID; qm destroy $VMID --purge; and the file $SNIPDIR/$NAME-zradio.yaml =="
   exit 0
-else bad "the installer ended $([ $rc = 98 ] && echo "without an exit code" || echo "$rc") in $NAME — nothing was started there. Its lines are above; to run it again in the VM: $INST"; exit 1; fi
+else bad "the installer ended $([ $rc = 98 ] && echo "without an exit code" || echo "$rc") in $NAME — nothing was started there. Its lines are above; to see it fail again in the VM: $INST"; exit 1; fi
 VSELF=$(gx "$NODE" "$VMID" 20 'sed -n "s/^SELF=//p" /etc/zradio/zradio.conf' | tail -1 | tr -dc 0-9.)
 ip4 "$VSELF" || { bad "could not read $NAME's own address from its /etc/zradio/zradio.conf (SELF)"; exit 1; }
 VMAC=$(sed -n '/^\[/q; s/^net0:[^,]*=\([0-9A-Fa-f:]\{17\}\).*/\1/p' "$PVE/nodes/$NODE/qemu-server/$VMID.conf" 2>/dev/null | head -1)
@@ -441,6 +492,9 @@ if [ -n "$PVMID" ]; then
   else bad "could not read the two VMs' public keys (zradio-sync keys in $NAME and in $PNAME)"; exit 1; fi
 fi
 
+if qm set "$VMID" --tags zradio >/dev/null; then trap - EXIT; done_ "$NAME is a radio VM of the kit from here on (its tag: zradio): ./install.sh on this node updates it"
+else bad "qm set $VMID --tags zradio failed: $NAME stays marked as not finished"; exit 1; fi
+
 echo "== $([ -n "$PVMID" ] && echo 8 || echo 7). the start =="
 if [ $START = 0 ] && [ $ASK = 1 ]; then
   echo "   Starting $NAME puts it into the pair: $([ "$ROLE" = primary ] && echo "it takes the floating address ${VIP%/*} and serves this node's sticks" || echo "it stands by, and serves only after the primary's first sync has filled its sticks")."
@@ -454,7 +508,7 @@ else warn "$NAME is installed and not started. To start it: qm guest exec $VMID 
 zp=6639; gp=6638; for e in ${EXTRA[@]+"${EXTRA[@]}"}; do case "$e" in ZWAVE_PORT=*) zp=${e#*=};; ZIGBEE_PORT=*) gp=${e#*=};; esac; done
 echo "== done: $NAME on $NODE =="
 if [ -n "$PVMID" ]; then echo "   The pair is complete: $PNAME on $PNODE, $NAME on $NODE. $([ "$ROLE" = standby ] && echo "$PNAME" || echo "$NAME") writes its networks onto the other's sticks within 15 minutes of both being started."
-else echo "   Next: ./install.sh on the other node. It finds $NAME, takes the network from it and pairs the two."; fi
+else echo "   Next: ./install.sh on the other node. It finds $NAME, takes the pair's addresses and settings from it, and introduces the two to each other."; fi
 if [ $DHCP = 1 ]; then
   echo "   In your DHCP server (the router): RESERVE $VSELF for $NAME${VMAC:+ (MAC $VMAC)}, and keep ${VIP%/*} out of the range it hands out."
   echo "   The pair knows $NAME by $VSELF: a VM whose address changes stops serving until it has that address back."

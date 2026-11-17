@@ -27,13 +27,26 @@ esac
 # A VM that gives the radios up in an orderly way — keepalived stopped (a planned switch, a shutdown) or its own
 # health check failed — no longer claims to hold the copy in use: whoever takes over is not behind it (docs/DESIGN.md,
 # "Who serves when it is not obvious"). MASTER -> BACKUP is different: that is a VM displaced by the other MASTER after a cut link, and it keeps its claim.
+# Under the version lock (zradio-common.sh: zr_version_lock), and looked at under it: a sync's landing, the gate and
+# the state line write the version under that lock, and a release made between their reading and their writing would
+# be written over — or would write over theirs. keepalived does not wait for this script, so the wait holds nothing up.
+LOCK_WAIT=5          # s; then the release is made without the lock, and that is said
 prev=$([ -f "$RUN/role" ] && cut -d' ' -f1 < "$RUN/role" || echo none)
-if [ "$prev" = MASTER ] && { [ "$state" = FAULT ] || [ "$state" = STOP ]; } && grep -q ' used=yes$' "$STATE/version" 2>/dev/null; then
-  sed -i 's/ used=yes$/ used=no/' "$STATE/version" \
-    && "$LOGGER" -t zradio "event=version result=released $(cat "$STATE/version" 2>/dev/null) — this VM gave the radios up ($state): \
+if [ "$prev" = MASTER ] && { [ "$state" = FAULT ] || [ "$state" = STOP ]; } && [ -f "$STATE/version" ]; then
+  mkdir -p "$RUN"
+  if ! { exec 6>"$RUN/version.lock" && flock -w "$LOCK_WAIT" 6; } 2>/dev/null; then
+    "$LOGGER" -t zradio "event=version result=loud the version lock did not come in $LOCK_WAIT s: the release is made without it" 2>/dev/null || true
+  fi
+  if grep -q ' used=yes$' "$STATE/version" 2>/dev/null; then
+    sed -i 's/ used=yes$/ used=no/' "$STATE/version" \
+      && "$LOGGER" -t zradio "event=version result=released $(cat "$STATE/version" 2>/dev/null) — this VM gave the radios up ($state): \
 it no longer claims to hold the copy in use" 2>/dev/null || true
+  fi
+  exec 6>&- 2>/dev/null || true
 fi
-mkdir -p "$RUN" && printf '%s %s priority=%s\n' "$state" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$prio" > "$RUN/role.tmp" && mv -f "$RUN/role.tmp" "$RUN/role"
+# (a name of its own for the file in the making: two notifies a few milliseconds apart each write a whole line)
+mkdir -p "$RUN" && printf '%s %s priority=%s\n' "$state" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$prio" > "$RUN/.role.$$" && mv -f "$RUN/.role.$$" "$RUN/role"
+rm -f "$RUN/unserved-since" 2>/dev/null || true      # a new state: zradio-serve check counts "the address without serving" from now
 "$LOGGER" -t zradio "event=role state=$state instance=$name priority=$prio — $verb $UNIT" 2>/dev/null || true
 : > "$RUN/gate-kick" 2>/dev/null || true     # a role change is news: zradio-gate looks at the peer now, not at its next round
 # BACKUP is also what keepalived says when a stick's tty is back after a FAULT: such a stick listens again, so the

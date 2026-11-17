@@ -66,8 +66,8 @@ esac
 [ -r "$TMPL" ] || die "no template $TMPL"
 zr_iface || die "$ZR_ERR"
 IFACE=$ZR_IFACE
-if [ -z "$PEER" ]; then      # not paired yet: the unicast lines go, all four
-  TMPL_NOPEER=$(sed -e '/^ *unicast_src_ip /d' -e '/^ *unicast_peer {$/,/^ *}$/d' "$TMPL") || die "sed failed"
+if [ -z "$PEER" ]; then      # not paired yet: the unicast lines go, all five
+  TMPL_NOPEER=$(sed -e '/^ *unicast_src_ip /d' -e '/^ *check_unicast_src$/d' -e '/^ *unicast_peer {$/,/^ *}$/d' "$TMPL") || die "sed failed"
   case "$TMPL_NOPEER" in *@PEER@*|*unicast_*) die "the template's unicast lines are not the ones this tool takes out for a VM without a peer";; esac
 else TMPL_NOPEER=""; fi
 out=$(sed -e "s|@NAME@|$NAME|g" -e "s|@IFACE@|$IFACE|g" -e "s|@SELF@|$SELF|g" -e "s|@PEER@|$PEER|g" \

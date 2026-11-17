@@ -24,8 +24,14 @@ command -v curl >/dev/null 2>&1 && command -v tar >/dev/null 2>&1 || die "needs 
 [[ "$DEST" =~ ^/[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)+$ ]] || die "ZRADIO_DEST '$DEST': an absolute path at least two levels deep"
 
 REF=${ZRADIO_REF:-} RELEASE=""
-if [ -z "$REF" ]; then          # the latest release; a repository without one: main
-  RELEASE=$(curl -fsSL "$API/repos/$REPO/releases/latest" 2>/dev/null | tr -d '\n' | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p') || RELEASE=""
+if [ -z "$REF" ]; then          # the latest release. A repository without one (GitHub answers 404): main
+  # Any other failure stops here: a node must not get main's unreleased code because GitHub was busy or out of reach.
+  if ANSWER=$(curl -fsSL "$API/repos/$REPO/releases/latest" 2>&1); then
+    RELEASE=$(printf '%s' "$ANSWER" | tr -d '\n' | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+    [ -n "$RELEASE" ] || die "GitHub's answer names no latest release ($API/repos/$REPO/releases/latest). A version by name: ZRADIO_REF=<tag or branch> before the line"
+  else
+    case "$ANSWER" in *"error: 404"*) ;; *) die "could not ask GitHub for the latest release: $(printf '%s' "$ANSWER" | tail -n 1). Try again, or name a version: ZRADIO_REF=<tag or branch> before the line";; esac
+  fi
   REF=${RELEASE:-main}
 fi
 [[ "$REF" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$ ]] && [[ "$REF" != *..* ]] || die "ZRADIO_REF '$REF': a tag or a branch name"
@@ -51,5 +57,4 @@ mv "$TMP/kit" "$DIR" || die "cannot put the kit at $DIR"
 cleanup; trap - EXIT
 echo "   the kit is in $DIR${SHA:+ (commit $SHA)}. To run its installer again: cd $DIR && ./install.sh"
 echo
-cd "$DIR" || die "cannot enter $DIR"
-exec bash ./install.sh "$@"
+exec bash "$DIR/install.sh" "$@"      # from the folder the line was pasted in: a file named in an option (--answers) is found

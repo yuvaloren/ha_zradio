@@ -20,7 +20,7 @@ vm() { # vm <dir> [role: MASTER|BACKUP] [ser2net: 1|0] [peer takes over: yes|no]
           [ \"\$(cat '$d/takes')\" = yes ] && sed -i 's/role=BACKUP serving=no/role=MASTER serving=yes/' '$d/peer'; exit 0;;
     start) $rec; echo 1 > '$d/keepalived'; [ -e '$d/run/hold' ] && : > '$d/held-at-start'; exit 0;;
     *) $rec; exit 9;; esac"
-  fake "$d/sync" zradio-sync "$rec; case \"\$1\" in peer-hello) [ -f '$d/peer-down' ] && exit 255; cat '$d/peer';; run) [ -f '$d/sync-fail' ] && { echo 'failed  step=apply'; exit 1; }; g=20261112T050000Z; echo \"{\\\"gen\\\": \\\"\$g\\\"}\" > '$d/state/last-sync.json'; sed -i \"s/gen=[^ ]*/gen=\$g/\" '$d/peer'; echo 'ok  gen='\$g;; esac"
+  fake "$d/sync" zradio-sync "$rec; case \"\$1\" in peer-hello) [ -f '$d/peer-down' ] && exit 255; [ -f '$d/hello-hangs' ] && [ \"\$(cat '$d/keepalived')\" = 0 ] && { : > '$d/in-wait'; command -p sleep 8; }; cat '$d/peer';; run) [ -f '$d/sync-busy' ] && { echo 'a sync is running already — nothing done by this one'; exit 75; }; [ -f '$d/sync-fail' ] && { echo 'failed  step=apply'; exit 1; }; g=20261112T050000Z; echo \"{\\\"gen\\\": \\\"\$g\\\"}\" > '$d/state/last-sync.json'; sed -i \"s/gen=[^ ]*/gen=\$g/\" '$d/peer'; echo 'ok  gen='\$g;; esac"
 }
 sw() { local d=$1; shift
   PATH="$d/bin:$PATH" ZRADIO_SWITCH_SYNC="$d/sync/zradio-sync" ZRADIO_SWITCH_STATE="$d/state" ZRADIO_SWITCH_RUN="$d/run" ZRADIO_SWITCH_WAIT=2 bash "$TOOL" "$@" > "$d/out" 2>&1; RC=$?; }
@@ -79,4 +79,14 @@ check "an ordinary planned switch also drops 'used' (the role was given away kno
 vm "$T/y3"; sed -i 's/$/ wait=yes/' "$T/y3/peer"; sw "$T/y3" --run
 check "a standby that is itself held back (wait=yes) is not ready: no switch" bash -c '[ "$2" = 1 ] && ! grep -q "stop keepalived" "$1/calls"' _ "$T/y3" "$RC"
 
+echo "-- a sync that is running already; a switch that is interrupted; a standby that stops answering"
+vm "$T/q1" MASTER 1 yes 20261112T001339Z 20261111T000000Z; : > "$T/q1/sync-busy"; sw "$T/q1" --run
+check "another sync holds the lock (exit 75 from zradio-sync run): no switch onto a copy nobody confirmed — said, exit 1, keepalived not stopped" bash -c '[ "$2" = 1 ] && grep -q "a sync is running already" "$1/out" && grep -q "FAIL  another sync is running" "$1/out" && ! grep -q "^systemctl stop keepalived" "$1/calls"' _ "$T/q1" "$RC"
+vm "$T/q2" MASTER 1 no; : > "$T/q2/hello-hangs"
+( PATH="$T/q2/bin:$PATH" ZRADIO_SWITCH_SYNC="$T/q2/sync/zradio-sync" ZRADIO_SWITCH_STATE="$T/q2/state" ZRADIO_SWITCH_RUN="$T/q2/run" ZRADIO_SWITCH_WAIT=20 exec bash "$TOOL" --run ) > "$T/q2/out" 2>&1 & KP=$!
+for _ in $(seq 1 100); do [ -e "$T/q2/in-wait" ] && break; command -p sleep 0.1; done
+kill -TERM "$KP"; wait "$KP" 2>/dev/null
+check "the switch is interrupted after keepalived was stopped (Ctrl-C, a dropped session): keepalived is started here again — the VM is never left out of the pair" bash -c 'grep -q "^systemctl stop keepalived" "$1/calls" && [ "$(grep "^systemctl" "$1/calls" | tail -1)" = "systemctl start keepalived" ] && [ "$(cat "$1/keepalived")" = 1 ]' _ "$T/q2"
+vm "$T/q3" MASTER 1 no; : > "$T/q3/hello-hangs"; SECONDS=0; sw "$T/q3" --run; TOOK=$SECONDS
+check "the standby stops answering after the stop: the wait ends after its seconds (2 here), not after forty hellos — keepalived started again, exit 1" bash -c '[ "$2" = 1 ] && [ "$3" -le 6 ] && [ "$(cat "$1/keepalived")" = 1 ] && grep -q "did not say MASTER and serving within 2 s" "$1/out"' _ "$T/q3" "$RC" "$TOOK"
 finish

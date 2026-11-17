@@ -1,6 +1,7 @@
 # answers.example — ./install.sh without questions:   ./install.sh --answers my.answers --run
 # One option per line, as KEY=value (the option's name in capitals, - as _). Anything left out is asked when someone
-# is there, and otherwise takes its default. An option given on the command line wins. ./install.sh --help lists them.
+# is there, and otherwise takes its default — except INITIAL_ROLE, which has none: a run that nobody can be asked in
+# is refused without it. An option given on the command line wins. ./install.sh --help lists them.
 
 # What this node is INITIALLY. primary: its sticks hold your networks and stay as they are.
 # standby: its sticks WILL BE WIPED by the first sync. (Afterward the two VMs swap.)

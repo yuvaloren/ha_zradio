@@ -11,7 +11,10 @@
 . "$(dirname "$0")/lib.sh"
 IMAGE=alpine:3.24      # Home Assistant's Terminal & SSH app 10.6 is Alpine 3.24
 KEY=5ec4e75ec4e75ec4e75ec4e75ec4e7aa
-if ! docker info >/dev/null 2>&1; then echo "SKIP  docker does not answer here: nothing was tested"; finish; exit; fi
+if ! docker info >/dev/null 2>&1; then      # no docker on a developer's machine: nothing to test. In CI that is a failure, not a pass
+  [ -z "${CI:-}" ] || check "docker answers here (CI: this test must run)" false
+  echo "SKIP  docker does not answer here: nothing was tested"; finish; exit
+fi
 chmod 755 "$T"; R=yuvaloren/ha_zradio
 mkdir -p "$T/site/$R/archive" "$T/site/api/repos/$R/releases" "$T/config-a/.storage" "$T/config-b/.storage"
 cp "$KIT/get.sh" "$T/get.sh"
@@ -52,7 +55,7 @@ check "Zigbee OK, Z-Wave CHECK, exit 0" bash -c 'grep -q "^   OK    Zigbee (ZHA)
 echo "-- a branch, and a Home Assistant with the sticks in its own machine"
 check "the commit is read from the archive's header by busybox's tools: main@0123456" bash -c 'grep -qx "version=main@0123456" <<< "$1" && grep -q "(commit 0123456789ab)" <<< "$1"' _ "$B"
 check "an address that answers: OK" bash -c 'grep -q "^   OK    127.0.0.1 answers a ping from here" <<< "$1"' _ "$B"
-check "two TODO with what each uses now and the steps; the line to check afterward; exit 0" bash -c 'grep -q "^   TODO  Zigbee (ZHA) uses /dev/serial/by-id/usb-ITead_Sonoff-if00-port0 now (znp), not the pair" <<< "$1" && grep -q "^   TODO  Z-Wave (the Z-Wave JS app) uses /dev/ttyACM0 now, not the pair" <<< "$1" && grep -q "4. \"Serial device path\": type  socket://127.0.0.1:6638$" <<< "$1" && grep -qx "== 2 to do (TODO). Nothing was changed. ==" <<< "$1" && grep -q "Afterward, this again checks it: .* _ --radios 127.0.0.1$" <<< "$1" && grep -qx "rc=0" <<< "$1"' _ "$B"
+check "two TODO with what each uses now and the steps; the line to check afterward; exit 0" bash -c 'grep -q "^   TODO  Zigbee (ZHA) uses /dev/serial/by-id/usb-ITead_Sonoff-if00-port0 now (znp), not the pair" <<< "$1" && grep -q "^   TODO  Z-Wave (the Z-Wave JS app) uses /dev/ttyACM0 now, not the pair" <<< "$1" && grep -q "4. \"Serial device path\": type  socket://127.0.0.1:6638$" <<< "$1" && grep -qx "== 2 to do (TODO). Nothing was changed. ==" <<< "$1" && grep -q "Afterward, this again checks it: .* _ --radios 127.0.0.1 --config /t/config-b$" <<< "$1" && grep -qx "rc=0" <<< "$1"' _ "$B"
 echo "-- the bare install line: no address given"
 check "the address is found in Home Assistant's own settings (ZHA's path), said to be taken from there, and the look goes on; exit 0" bash -c 'grep -q "     - Zigbee (ZHA) is set to socket://192.0.2.50:6638" <<< "$1" && grep -q "^   NOTE  192.0.2.50 is taken as the pair.s floating address from Home Assistant.s own settings" <<< "$1" && grep -q "^   OK    Zigbee (ZHA) uses the pair" <<< "$1" && grep -qx "rc=0" <<< "$1"' _ "$C"
 check "no key of a network anywhere in what was said" bash -c '! grep -q "$2" "$1/out"' _ "$T" "$KEY"

@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # host/lib.sh — what install.sh and its parts (host/new-vm.sh, host/update.sh, host/qdevice.sh) share on the node:
 # the output lines, the cluster's lists, a command in a VM through its guest agent, and the cluster's votes.
-# Sourced by install.sh after it has set KIT, SYS, PVE, NODE, RUN and TABLE.
+# Sourced by install.sh after it has set KIT, SYS, PVE, NODE and RUN; TABLE is set before any function here is called.
 
 FAILS=0
 ok() { printf '   OK    %s\n' "$*"; }
@@ -38,19 +38,23 @@ go_ahead() { # go_ahead <the options of the same run>: after a report, "Go ahead
 
 # ------------------------------------------------------------------------------------------- the cluster's lists
 sticks_here() { # one line per USB device of this node that the kit's table names: "<bus-port> <vid:pid> <kinds> <product>"
+  # Matched as the VM matches (zradio-detect): the USB id, and the entry's glob on the product string and its
+  # manufacturer where it has them. A plain serial adapter that shares a chip's USB id with a stick is not one.
   python3 - "$TABLE" "$SYS" <<'PY'
-import json, os, sys
+import fnmatch, json, os, sys
 table, sysdir = sys.argv[1:3]
-kinds = {}
-for e in json.load(open(table))["entries"]:
-    kinds.setdefault((e["vid"].lower(), e["pid"].lower()), set()).add(e["kind"])
+entries = json.load(open(table))["entries"]
 def rd(p):
     try: return open(p).read().strip()
     except OSError: return ""
 for d in sorted(os.listdir(sysdir)) if os.path.isdir(sysdir) else []:
     v, p = rd(os.path.join(sysdir, d, "idVendor")).lower(), rd(os.path.join(sysdir, d, "idProduct")).lower()
-    if (v, p) in kinds:
-        print(d, "%s:%s" % (v, p), "+".join(sorted(kinds[(v, p)])), rd(os.path.join(sysdir, d, "product")) or "-")
+    product, maker = rd(os.path.join(sysdir, d, "product")), rd(os.path.join(sysdir, d, "manufacturer"))
+    kinds = {e["kind"] for e in entries
+             if (e["vid"].lower(), e["pid"].lower()) == (v, p)
+             and fnmatch.fnmatch(product.lower(), e.get("description", "*"))
+             and (not e.get("manufacturer") or fnmatch.fnmatch(maker.lower(), "*%s*" % e["manufacturer"]))}
+    if kinds: print(d, "%s:%s" % (v, p), "+".join(sorted(kinds)), product or "-")
 PY
 }
 mappings() { # the cluster's USB mappings: "<id> <node> <vid:pid> <path or ->" per entry (nothing when there are none)
@@ -68,7 +72,7 @@ vm_lines() { # every VM of the cluster: "<vmid> <name> <node> <status> <tags or 
 import json, sys
 try: vms = json.load(sys.stdin)
 except ValueError: vms = []
-for v in vms: print(v.get("vmid"), v.get("name", "-"), v.get("node", "-"), v.get("status", "-"), v.get("tags") or "-")'
+for v in vms: print(v.get("vmid"), "_".join(str(v.get("name") or "-").split()), v.get("node", "-"), v.get("status", "-"), v.get("tags") or "-")'
 }
 kit_vms() { # kit_vms here|elsewhere: the kit's radio VMs (tag zradio) on this node, or on the other nodes: vm_lines' lines
   printf '%s\n' "$VMS" | awk -v me="$NODE" -v w="$1" '(";" $5 ";") ~ /;zradio;/ && (w == "here") == ($3 == me)'
@@ -158,7 +162,9 @@ send_kit() { # send_kit <node> <vmid> <name>: this kit into the VM's /opt/zradio
   gx "$1" "$2" 60 'set -e; base64 -d /root/zradio-kit.b64 > /root/zradio-kit.tgz; rm -f /root/zradio-kit.b64
     [ "$(sha256sum < /root/zradio-kit.tgz | cut -c1-64)" = '"$sum"' ] || { echo "the kit arrived damaged"; exit 1; }
     rm -rf /opt/zradio/kit.new; mkdir -p /opt/zradio/kit.new; tar -xzf /root/zradio-kit.tgz -C /opt/zradio/kit.new
-    rm -rf /opt/zradio/kit.previous; [ ! -d /opt/zradio/kit ] || mv /opt/zradio/kit /opt/zradio/kit.previous
+    # the kit before is kept, to go back to. A second try with the same kit keeps the one that is kept already.
+    if [ -d /opt/zradio/kit ] && [ -d /opt/zradio/kit.previous ] && cmp -s /opt/zradio/kit/gen/kit-version /opt/zradio/kit.new/gen/kit-version; then rm -rf /opt/zradio/kit
+    else rm -rf /opt/zradio/kit.previous; [ ! -d /opt/zradio/kit ] || mv /opt/zradio/kit /opt/zradio/kit.previous; fi
     mv /opt/zradio/kit.new /opt/zradio/kit' >/dev/null \
     && done_ "the kit is in $3 ($n piece(s) through its guest agent, checked): /opt/zradio/kit, the one before it kept as /opt/zradio/kit.previous" \
     || { bad "the kit did not unpack in $3 (its old kit, if any, is still at /opt/zradio/kit)"; return 1; }
@@ -173,7 +179,8 @@ run_guest_installer() { # run_guest_installer <node> <vmid> <name> <command>: th
   GUEST_LOG=""
   while :; do     # its finished lines as they come (@@at: how many were sent so far); the last round carries the exit code (@@rc)
     # shellcheck disable=SC2016  # the script runs in the VM
-    chunk=$(gx "$1" "$2" 20 "L=$at"'; f=/var/log/zradio-install.log; n=$(wc -l < $f); [ "$n" -le "$L" ] || sed -n "$((L + 1)),${n}p" $f; echo "@@at $n"; [ ! -f /root/zradio-install.rc ] || echo "@@rc $(cat /root/zradio-install.rc)"') || chunk=""
+    # (the exit code is looked for BEFORE the lines are counted: an installer that ends in between is seen next round, whole)
+    chunk=$(gx "$1" "$2" 20 "L=$at"'; f=/var/log/zradio-install.log; r=""; [ ! -f /root/zradio-install.rc ] || r=$(cat /root/zradio-install.rc); n=$(wc -l < $f); [ "$n" -le "$L" ] || sed -n "$((L + 1)),${n}p" $f; echo "@@at $n"; [ -z "$r" ] || echo "@@rc $r"') || chunk=""
     rc=$(printf '%s\n' "$chunk" | sed -n 's/^@@rc \([0-9]*\)$/\1/p' | tail -1)
     got=$(printf '%s\n' "$chunk" | sed -n 's/^@@at \([0-9]*\)$/\1/p' | tail -1); [ -z "$got" ] || at=$got
     chunk=$(printf '%s\n' "$chunk" | sed '/^@@\(rc\|at\) [0-9]*$/d; /^$/d')
@@ -191,10 +198,11 @@ vm_kit() { # vm_kit <node> <vmid>: "VERSION=…", "CONTENT=…" of the kit insta
     echo "HA_VIP=${v%/*}"; for k in ZWAVE_PORT ZIGBEE_PORT; do echo "HA_$k=$(sed -n "s/^$k=//p" /etc/zradio/zradio.conf 2>/dev/null | tail -1)"; done
     for k in ZWAVE ZIGBEE; do echo "HA_$k=$(sed -n "s/^$k=//p" /etc/zradio/radios.conf 2>/dev/null | tail -1)"; done'
 }
+GET_LINE='bash -c "$(curl -fsSL https://raw.githubusercontent.com/yuvaloren/ha_zradio/main/get.sh)" _'      # the kit's one install line
 ha_lines() { # ha_lines <floating address> <Z-Wave port> <Zigbee port> <Z-Wave stick: 1|0> <Zigbee stick: 1|0>: where Home
   # Assistant connects, and the kit's line for Home Assistant's terminal (homeassistant/install.sh) with the address in it
   echo "   In Home Assistant:$([ "$4" = 1 ] && echo "  Z-Wave JS → tcp://$1:$2")$([ "$5" = 1 ] && echo "  ZHA → socket://$1:$3")"
   echo "   What to set where, for your Home Assistant: this line in Home Assistant's terminal (Settings > Apps > Terminal & SSH):"
-  echo "      bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/yuvaloren/ha_zradio/main/get.sh)\" _ --radios $1$([ "$2" = 6639 ] || echo " --zwave-port $2")$([ "$3" = 6638 ] || echo " --zigbee-port $3")$([ "$4" = 1 ] || echo " --no-zwave")$([ "$5" = 1 ] || echo " --no-zigbee")"
+  echo "      $GET_LINE --radios $1$([ "$2" = 6639 ] || echo " --zwave-port $2")$([ "$3" = 6638 ] || echo " --zigbee-port $3")$([ "$4" = 1 ] || echo " --no-zwave")$([ "$5" = 1 ] || echo " --no-zigbee")"
 }
 kv() { printf '%s\n' "$2" | sed -n "s/^$1=//p" | tail -1 | tr -dc 'A-Za-z0-9./@:_+-'; }     # kv <KEY> <text of KEY=value lines>

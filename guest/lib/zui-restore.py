@@ -34,7 +34,7 @@ import sys
 import time
 
 
-class HAError(Exception):
+class ZuiError(Exception):
     """Z-Wave JS UI answered with an error."""
 
     def __init__(self, code, message):
@@ -85,7 +85,7 @@ class WSConn(object):
         hdr += key
         try:
             self.sock.sendall(bytes(hdr) + ws_mask(payload, key))
-        except socket.timeout:
+        except TimeoutError:
             raise WSClosed("send timed out")
         except OSError as e:
             raise WSClosed("send failed: %s" % e)
@@ -127,51 +127,13 @@ class WSConn(object):
         self.sock.settimeout(min(remaining, 30.0))
         try:
             data = self.sock.recv(262144)
-        except socket.timeout:
+        except TimeoutError:
             return
         except OSError as e:
             raise WSClosed("receive failed: %s" % e)
         if not data:
             raise WSClosed("the connection was closed")
         self.buf += data
-
-    def recv_text(self, deadline):
-        """The next whole text message (continuations joined); pings answered on the way; WSTimeout at the deadline."""
-        while True:
-            f = self._parse()
-            if f is None:
-                self._fill(deadline)
-                continue
-            fin, op, payload = f
-            if op == 0x9:                       # ping → pong with the same payload (§5.5.2)
-                self.send_frame(0xA, payload)
-                continue
-            if op == 0xA:                       # unsolicited pong
-                continue
-            if op == 0x8:                       # close: echo it, then the connection is gone (§5.5.1)
-                try:
-                    self.send_frame(0x8, payload[:2])
-                except NotAnswering:
-                    pass
-                code = struct.unpack("!H", payload[:2])[0] if len(payload) >= 2 else 1005
-                raise WSClosed("the WebSocket was closed (code %d)" % code)
-            if op in (0x1, 0x2):
-                if self.frag_op is not None:
-                    raise WSClosed("protocol error: a new message inside a fragmented one")
-                if fin:
-                    return payload.decode("utf-8")
-                self.frag_op, self.frag = op, [payload]
-                continue
-            if op == 0x0:
-                if self.frag_op is None:
-                    raise WSClosed("protocol error: a continuation frame without a first frame")
-                self.frag.append(payload)
-                if fin:
-                    data = b"".join(self.frag)
-                    self.frag_op, self.frag = None, []
-                    return data.decode("utf-8")
-                continue
-            raise WSClosed("protocol error: opcode %d" % op)
 
     def close(self):
         try:
@@ -185,24 +147,22 @@ class WSConn(object):
             pass
 
 
-
-
 class ZuiSocket(object):
     """socket.io v4 over one WebSocket to a Z-Wave JS UI (what its own web page speaks). Binary attachments travel as
     binary frames (both ways); a Buffer in any event Z-Wave JS UI emits arrives as a binary frame too, so the receive
     loop keeps the opcode and never decodes a binary message as text."""
 
-    def __init__(self, ha, entry, sess, timeout=30.0):
-        self.ha, self.timeout = ha, timeout
+    PATH = "/socket.io/?EIO=4&transport=websocket"
+
+    def __init__(self, host, port, timeout=30.0):
+        self.timeout = timeout
         self.ack_id = 100
-        path = entry.rstrip("/") + "/socket.io/?EIO=4&transport=websocket"
         key = base64.b64encode(os.urandom(16)).decode("ascii")
-        host = ha.host if ha.port in (80, 443) else "%s:%d" % (ha.host, ha.port)
         try:
-            sock = socket.create_connection((ha.host, ha.port), timeout=timeout)
+            sock = socket.create_connection((host, port), timeout=timeout)
             req = ("GET %s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %s\r\n"
                    "Sec-WebSocket-Version: 13\r\nUser-Agent: zradio\r\n\r\n"
-                   % (path, host, key))
+                   % (self.PATH, host if port in (80, 443) else "%s:%d" % (host, port), key))
             sock.sendall(req.encode("ascii"))
             raw = b""
             deadline = time.time() + timeout
@@ -231,7 +191,7 @@ class ZuiSocket(object):
             if m.startswith("40"):
                 break
             if m.startswith("44"):
-                raise HAError("socket.io", "Z-Wave JS UI refused the connection: %s" % m[2:200])
+                raise ZuiError("socket.io", "Z-Wave JS UI refused the connection: %s" % m[2:200])
 
     def _recv_message(self, deadline):
         """The next whole WebSocket message as (opcode, bytes): pings answered, close honored, binary kept."""
@@ -314,31 +274,28 @@ class ZuiSocket(object):
         self.ws.close()
 
 
-
-
 READ_CODE = ("const c = driver.controller; "
              "return {ready: driver.ready, homeId: c.homeId, nodes: c.nodes.size, sdk: c.sdkVersion, "
              "fw: c.firmwareVersion, rfRegion: c.rfRegion, txPower: c.txPower};")
 
 
-def stub(url):
-    """host and port of the local Z-Wave JS UI, as ZuiSocket reads them."""
-    if not url.startswith("http://"):
+def endpoint(url):
+    """(host, port) of the local Z-Wave JS UI, from --url; exit 2 when it is not http://host[:port]."""
+    host, _, port = url[len("http://"):].rstrip("/").partition(":")
+    if not url.startswith("http://") or not host or not (port or "80").isdecimal():
         print("usage error: --url must be http://host:port (the local container; no TLS)", file=sys.stderr)
         sys.exit(2)
-    hp = url[len("http://"):].rstrip("/")
-    host, _, port = hp.partition(":")
-    return argparse.Namespace(host=host, port=int(port or 80))
+    return host, int(port or 80)
 
 
-def read_once(ha, timeout):
-    sock = ZuiSocket(ha, "", "", timeout=timeout)
+def read_once(zui, timeout):
+    sock = ZuiSocket(*zui, timeout=timeout)
     try:
         res = sock.call("driverFunction", [READ_CODE], timeout=timeout)
     finally:
         sock.close()
     if not isinstance(res, dict) or not res.get("success"):
-        raise HAError("driverFunction", "%s" % (res.get("message") if isinstance(res, dict) else res))
+        raise ZuiError("driverFunction", "%s" % (res.get("message") if isinstance(res, dict) else res))
     r = res.get("result") or {}
     hid = r.get("homeId")
     return {"ready": bool(r.get("ready")), "home_id": hid, "home_id_hex": (hex(int(hid)) if hid is not None else None),
@@ -346,13 +303,13 @@ def read_once(ha, timeout):
             "tx_power": r.get("txPower")}
 
 
-def read_ready(ha, wait, timeout):
+def read_ready(zui, wait, timeout):
     """The driver's view once it is ready, or None after `wait` seconds (the last error printed)."""
     deadline = time.time() + wait
     last = None
     while True:
         try:
-            v = read_once(ha, timeout)
+            v = read_once(zui, timeout)
             if v["ready"] and v["home_id"] is not None:
                 return v
             last = "driver not ready yet (%s)" % json.dumps(v)
@@ -376,9 +333,9 @@ def main():
     ap.add_argument("--wait", type=float, default=120.0, help="seconds to wait for a ready driver (default 120)")
     ap.add_argument("--timeout", type=float, default=30.0, help="seconds per socket call (default 30)")
     a = ap.parse_args()
-    ha = stub(a.url)
+    zui = endpoint(a.url)
 
-    v = read_ready(ha, a.wait, a.timeout)
+    v = read_ready(zui, a.wait, a.timeout)
     if v is None:
         return 1
     if a.cmd == "read":
@@ -412,15 +369,17 @@ def main():
             if m and m != last["msg"]:
                 last["msg"] = m
                 print("      controller: %s" % m)
-    sock = ZuiSocket(ha, "", "", timeout=max(a.timeout, 60.0))
+    sock = None
     try:
+        sock = ZuiSocket(*zui, timeout=max(a.timeout, 60.0))      # inside the try: a Z-Wave JS UI gone since the read is a FAIL line
         res = sock.call("restoreNVM", [{"_placeholder": True, "num": 0}, use_raw], timeout=600, on_event=on_event, binary=image)
     except Exception as e:
         print("FAIL  restoreNVM did not answer: %s: %s" % (type(e).__name__, str(e)[:200]), file=sys.stderr)
         return 1
     finally:
         try:
-            sock.close()
+            if sock is not None:
+                sock.close()
         except Exception:
             pass
     if not isinstance(res, dict) or not res.get("success"):

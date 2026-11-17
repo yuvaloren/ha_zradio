@@ -69,4 +69,11 @@ zvm "$T/w" --name attic5 --initial-role primary --vip 192.168.1.21 --no-pair --v
 check "--name of a VM that does not exist: a new VM, not an update" bash -c '! grep -q "an update to" "$1/out" && grep -q "WOULD qm create" "$1/out"' _ "$T/w"
 : > "$T/w/agent-down-110"; zvm "$T/w" --run
 check "the other VM does not answer: refused before anything is sent, with how to start it" bash -c '[ "$2" = 1 ] && grep -q "attic2 on nodeb does not answer (its guest agent): start it first" "$1/out" && [ "$(pieces "$1")" = 0 ]' _ "$T/w" "$RC"
+
+echo "-- a second try after a failed update keeps the kit to go back to"
+pair "$T/k"; for id in 109 110; do mkdir -p "$T/k/g/$id/root/opt/zradio/kit/gen"; echo "the kit that works" > "$T/k/g/$id/root/opt/zradio/kit/marker"; echo "CONTENT=0000000000000000" > "$T/k/g/$id/root/opt/zradio/kit/gen/kit-version"; done
+echo 1 > "$T/k/install.rc"; zvm "$T/k" --run
+check "the first failed try: the kit the VM had is kit.previous" bash -c '[ "$2" = 1 ] && [ "$(cat "$1/g/109/root/opt/zradio/kit.previous/marker")" = "the kit that works" ] && [ ! -e "$1/g/109/root/opt/zradio/kit/marker" ]' _ "$T/k" "$RC"
+zvm "$T/k" --run
+check "the second try with the same kit: kit.previous is still the kit that works, not the one that just failed" bash -c '[ "$2" = 1 ] && [ "$(cat "$1/g/109/root/opt/zradio/kit.previous/marker" 2>/dev/null)" = "the kit that works" ] && [ -f "$1/g/109/root/opt/zradio/kit/guest/install.sh" ]' _ "$T/k" "$RC"
 finish

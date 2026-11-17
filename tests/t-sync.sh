@@ -31,6 +31,8 @@ EOF
   local rec; rec="echo \"\$(basename \$0) \$*\" >> '$d/calls'"
   fake "$d/bin" id 'case "${1:-}" in -u) echo 0;; *) command -p id "$@";; esac'
   fake "$d/bin" sleep "$rec"
+  # the VM's addresses: its own, and the floating one while keepalived's last word is MASTER (as on a real pair)
+  fake "$d/bin" ip "echo '2: eth0    inet $self/24 scope global eth0'; ! grep -q '^MASTER' '$d/run/role' 2>/dev/null || echo '2: eth0    inet 10.20.30.50/24 scope global secondary eth0'"
   fake "$d/bin" logger "echo \"\$*\" >> '$d/journal'"
   fake "$d/bin" ss "[ -f '$d/ss-broken' ] && exit 1; [ -f '$d/client' ] && echo 'ESTAB 0 0 10.20.30.50:6639 10.20.30.10:51234'; exit 0"
   printf '#!/usr/bin/env bash\necho "zradio-switch $*" >> %q\n[ -f %q ] && { echo "FAIL  the standby is not ready"; exit 1; }\necho "DONE  handed over"\n' "$d/calls" "$d/switch-fail" > "$d/switch"; chmod +x "$d/switch"
@@ -39,8 +41,8 @@ EOF
     start) $rec; [ -f '$d/nostart' ] && exit 1; echo 1 > '$d/ser2net';;
     stop)  $rec; echo 0 > '$d/ser2net';;
     *) $rec; exit 9;; esac"
-  fake "$d/bin" ssh "$rec; [ -f '$d/ssh-down' ] && exit 255; cmd=\"\${*: -1}\"; ( . '$pd/env.sh'; SSH_ORIGINAL_COMMAND=\"\$cmd\" bash '$TOOL' serve-ssh )"
-  fake "$d/bin" zigpy "$rec; [ -f '$d/zb-fail' ] && { echo 'Traceback: no SRSP'; exit 1; }
+  fake "$d/bin" ssh "$rec; [ -f '$d/ssh-down' ] && exit 255; cmd=\"\${*: -1}\"; [ ! -f '$d/hello-drops-role' ] || echo 'BACKUP 2026-11-12T00:00:00Z priority=100' > '$d/run/role'; ( . '$pd/env.sh'; SSH_ORIGINAL_COMMAND=\"\$cmd\" bash '$TOOL' serve-ssh )"
+  fake "$d/bin" zigpy "$rec; flock -n '$d/run/sticks.lock' true && echo free > '$d/lock-during-zigpy' || echo held > '$d/lock-during-zigpy'; [ -f '$d/zb-fail' ] && { echo 'Traceback: no SRSP'; exit 1; }
     key=$NETKEY; pan=1a2b; [ -f '$d/zb-blank' ] && { key=00000000000000000000000000000000; pan=ffff; }
     printf '{\"coordinator_ieee\": \"00124b00aabbccdd\", \"pan_id\": \"%s\", \"channel\": 25, \"extended_pan_id\": \"dd\", \"network_key\": {\"key\": \"%s\", \"frame_counter\": 4943413, \"sequence_number\": 0}, \"devices\": [{}, {}, {}], \"metadata\": {}}\n' \"\$pan\" \"\$key\" > \"\$5\""
   printf '#!/usr/bin/env bash\n. %q\nexec bash %q "$@"\n' "$d/env.sh" "$TOOL" > "$d/self"; chmod +x "$d/self"
@@ -61,6 +63,8 @@ if "--nvm-dump" in sys.argv:
     free = subprocess.run(["flock", "-n", d + "/run/sticks.lock", "true"]).returncode == 0
     open(d + "/lock-during-read", "w").write("free" if free else "held")
     if knob("drop-role"): open(d + "/run/role", "w").write("BACKUP 2026-11-12T00:00:00Z priority=100\n")   # keepalived, mid-read
+    if knob("dump-hang"):          # a read that is still going when the sync is interrupted
+        import time; open(d + "/reading", "w").close(); time.sleep(6)
     if knob("dump-fail"):
         print("   FAIL  Z-Wave on /dev/zradio-zwave: NVM read: no answer", file=sys.stderr); sys.exit(1)
     f = sys.argv[sys.argv.index("--nvm-dump") + 1]
@@ -74,6 +78,8 @@ echo "zradio-apply \$*" >> "$d/calls"
 dir=""; prev=""; for x in "\$@"; do [ "\$prev" = --from ] && dir=\$x; prev=\$x; done
 [ -e "$d/state/standby-dirty" ] && [ -e "$d/run/applying" ] && echo yes > "$d/marked-during-restore"
 cp "\$dir/fetch.json" "$d/fetch-seen.json" 2>/dev/null
+# as the real zradio-apply does, it leaves its logs beside the set it tried to write
+[ ! -d "\$dir" ] || for f in zui-convert.log zui-raw.log probe.err probe-rf-off-convert.err zigpy-restore.log; do echo "a log line" > "\$dir/\$f"; done
 [ -f "\$dir/zha-backup-restore.json" ] && python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["network_key"]["frame_counter"])' "\$dir/zha-backup-restore.json" > "$d/restored-counter"
 if [ -f "$d/restore-fail" ]; then echo "FAIL  after the converting pass the stick reads home ID '0xf4486cba' with '49' nodes"; exit 1; fi
 echo "== done: restored and verified =="
@@ -97,11 +103,11 @@ echo "-- one sync, both networks: hello, the pause (ser2net off, both reads, ser
 pair "$T/p1"; sync "$T/p1/a" run --reason nightly
 A="$T/p1/a"; B="$T/p1/b"
 check "exit 0" eq "$RC" 0
-check "the Z-Wave order on the active: receiver off, the NVM read, receiver on" eq "$(grep -oE '^zradio-probe.py --zwave [^ ]+ (--rf-receive (on|off)|--budget 300 --nvm-dump)' "$A/calls" | sed 's/^zradio-probe.py --zwave [^ ]* //; s/--budget 300 //' | tr '\n' ';')" "--rf-receive off;--nvm-dump;--rf-receive on;"
+check "the Z-Wave order on the active: receiver off, the NVM read, receiver on" eq "$(grep -oE '^zradio-probe.py --zwave [^ ]+ (--rf-receive (on|off)|--budget [0-9]+ --nvm-dump)' "$A/calls" | sed -E 's/^zradio-probe.py --zwave [^ ]* //; s/--budget [0-9]+ //' | tr '\n' ';')" "--rf-receive off;--nvm-dump;--rf-receive on;"
 check "zigpy's backup of the coordinator ran once" eq "$(grep -c '^zigpy radio znp .*/dev/zigbee backup ' "$A/calls")" 1
 check "ser2net: stopped before the first read, started after the last, once each" eq "$(grep -nE '^(systemctl|zradio-probe.py|zigpy)' "$A/calls" | sed -n '1p;$p' | sed 's/^[0-9]*://; s/ --.*//' | tr '\n' ';')" "systemctl stop ser2net;systemctl start ser2net;"
 check "the active serves again and its receiver is on" bash -c '[ "$(cat "$1/ser2net")" = 1 ] && [ "$(cat "$1/rf-state")" = on ]' _ "$A"
-check "ssh: the sync key, the pinned host key, bound to SELF, to root@PEER — hello then receive" bash -c '[ "$(grep -c "^ssh -i $1/etc/sync.key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$1/etc/known .* -b 10.20.30.5 root@10.20.30.6 " "$1/calls")" = 2 ] && [ "$(grep -oE "(hello|receive)$" "$1/calls" | tr "\n" ";")" = "hello;receive;" ]' _ "$A"
+check "ssh: the sync key, the pinned host key, bound to SELF, to root@PEER — hello then receive" bash -c '[ "$(grep -c "^ssh -F /dev/null -i $1/etc/sync.key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$1/etc/known .* -b 10.20.30.5 root@10.20.30.6 " "$1/calls")" = 2 ] && [ "$(grep -oE "(hello|receive)$" "$1/calls" | tr "\n" ";")" = "hello;receive;" ]' _ "$A"
 check "the standby wrote the set with zradio-apply --run --from <in/current>, then silenced its sticks" eq "$(grep -E '^(zradio-apply|zradio-serve)' "$B/calls" | sed "s#$B##g" | tr '\n' ';')" "zradio-apply --run --from /secrets/sync/in/current;zradio-serve down;"
 check "standby-dirty and applying were set while the restore ran, and are gone after it" bash -c '[ "$(cat "$1/marked-during-restore")" = yes ] && [ ! -e "$1/state/standby-dirty" ] && [ ! -e "$1/run/applying" ]' _ "$B"
 check "the Zigbee counter the standby wrote: the active's reading + 1,000,000" eq "$(cat "$B/restored-counter")" 5943413
@@ -188,7 +194,8 @@ A="$T/p6/a"; B="$T/p6/b"
 check "exit 1, step=apply, three tries" bash -c '[ "$2" = 1 ] && grep -q "step=apply .* tries=3 — not confirmed by the standby (last answer: FAILED gen=" "$1/out"' _ "$A" "$RC"
 check "one read only; the retry pauses 30 s and 120 s" bash -c '[ "$(grep -c "systemctl stop" "$1/calls")" = 1 ] && [ "$(grep "^sleep" "$1/calls" | tr "\n" ";")" = "sleep 30;sleep 120;" ]' _ "$A"
 check "the read set and the pending mark stay on the active (0700)" bash -c '[ -f "$1/secrets/sync/out/manifest.json" ] && [ -f "$1/secrets/sync/out/zwave-nvm.bin" ] && [ "$(stat -c %a "$1/secrets/sync/out")" = 700 ] && [ -f "$1/state/sync-pending.json" ]' _ "$A"
-check "the standby: standby-dirty stays, applying is gone, the set is kept, no zradio-serve down, the journal names the FAIL line" bash -c '[ -e "$1/state/standby-dirty" ] && [ ! -e "$1/run/applying" ] && [ -f "$1/secrets/sync/in/current/zwave-nvm.bin" ] && ! grep -q "zradio-serve" "$1/calls" && grep -q "event=sync-apply result=failed gen=.* step=restore rc=1 — FAIL  after the converting pass" "$1/journal"' _ "$B"
+check "the standby: after each failed write its sticks are silenced (zradio-serve down): a coordinator that the write left on the air must not stay there" bash -c '[ "$(grep -c "^zradio-serve down" "$1/calls")" = 3 ] && grep -q "result=failed gen=.* step=restore .*the sticks were silenced" "$1/journal"' _ "$B"
+check "the standby: standby-dirty stays, applying is gone, the set is kept, the journal names the FAIL line" bash -c '[ -e "$1/state/standby-dirty" ] && [ ! -e "$1/run/applying" ] && [ -f "$1/secrets/sync/in/current/zwave-nvm.bin" ] && grep -q "event=sync-apply result=failed gen=.* step=restore rc=1 — FAIL  after the converting pass" "$1/journal"' _ "$B"
 sync "$B" hello
 check "hello says dirty=yes" has "$B/out" "dirty=yes"
 sync "$A" tick
@@ -396,4 +403,87 @@ fake "$T/ac/bin" ip 'printf "2: eth0    inet 10.20.30.99/24 scope global dynamic
 sync "$T/ac" tick
 check "tick when the VM's address is not SELF any more: one loud journal line with both addresses and what to do" bash -c '[ "$(grep -c "event=address result=loud this VM does not hold its address 10.20.30.5 any more (it holds 10.20.30.99)" "$1/journal")" = 1 ] && grep -q "reservation in the DHCP server" "$1/journal"' _ "$T/ac"
 
+echo "-- a sync interrupted during its read (Ctrl-C, a stopped unit, a dropped session)"
+pair "$T/ki"; : > "$T/ki/a/dump-hang"
+( . "$T/ki/a/env.sh"; exec bash "$TOOL" run --reason manual ) > "$T/ki/a/out" 2>&1 & KP=$!
+for _ in $(seq 1 100); do [ -e "$T/ki/a/reading" ] && break; command -p sleep 0.1; done
+kill -TERM "$KP"; wait "$KP" 2>/dev/null
+check "the read was under way: ser2net was stopped and the Z-Wave receiver off" bash -c '[ -e "$1/reading" ] && grep -q "^systemctl stop ser2net" "$1/calls" && grep -q -- "--rf-receive off" "$1/calls"' _ "$T/ki/a"
+check "the VM still serves: the receiver is turned ON again BEFORE ser2net is started — Home Assistant is never handed a deaf stick" bash -c 'on=$(grep -n -- "--rf-receive on" "$1/calls" | tail -1 | cut -d: -f1) && st=$(grep -n "^systemctl start ser2net" "$1/calls" | tail -1 | cut -d: -f1) && [ -n "$on" ] && [ -n "$st" ] && [ "$on" -lt "$st" ] && [ "$(cat "$1/rf-state")" = on ] && [ "$(cat "$1/ser2net")" = 1 ]' _ "$T/ki/a"
+pair "$T/kj"; : > "$T/kj/a/dump-hang"; : > "$T/kj/a/rf-on-fail"
+( . "$T/kj/a/env.sh"; exec bash "$TOOL" run --reason manual ) > "$T/kj/a/out" 2>&1 & KP=$!
+for _ in $(seq 1 100); do [ -e "$T/kj/a/reading" ] && break; command -p sleep 0.1; done
+kill -TERM "$KP"; wait "$KP" 2>/dev/null
+check "…and when the receiver does not come back on: ser2net stays stopped, and the VM takes itself out (serve-failed), loudly" bash -c '[ "$(cat "$1/ser2net")" = 0 ] && [ -e "$1/run/serve-failed" ] && grep -q "event=sync result=loud step=zwave-receiver" "$1/journal"' _ "$T/kj/a"
+
+echo "-- standby-dirty names the sticks in doubt: a write of one network does not clear the other's"
+pair "$T/d1"; A="$T/d1/a"; B="$T/d1/b"; : > "$B/restore-fail"; ZRADIO_SYNC_RETRY_PAUSES="" sync "$A" run
+check "a full write failed: both networks are named in standby-dirty" eq "$(tr '\n' ' ' < "$B/state/standby-dirty")" "zwave zigbee "
+rm "$B/restore-fail"; sync "$A" run --only zigbee
+check "a Zigbee-only write then succeeds: standby-dirty stays, naming Z-Wave — the VM does not serve a half-written Z-Wave stick" bash -c '[ "$2" = 0 ] && [ "$(tr "\n" " " < "$1/state/standby-dirty")" = "zwave " ] && grep -q "dirty=yes" <<< "$(. "$1/env.sh"; bash "$3" hello)"' _ "$B" "$RC" "$TOOL"
+sync "$A" tick
+check "…the active's tick sees a dirty standby and syncs both again: then the mark is gone" bash -c '[ ! -e "$1/state/standby-dirty" ]' _ "$B"
+pair "$T/d2"; B="$T/d2/b"; : > "$B/state/standby-dirty"; : > "$T/d2/a/zb-ok"; sync "$B" self-raise --above 100
+check "a mark without names (written by an older kit) counts for both: a self-raise (Zigbee only) leaves Z-Wave in it" bash -c '[ "$2" = 0 ] && [ "$(tr "\n" " " < "$1/state/standby-dirty")" = "zwave " ]' _ "$B" "$RC"
+
+pair "$T/d3"; A="$T/d3/a"; B="$T/d3/b"; echo "install.sh: the initial standby, not filled yet" > "$B/state/standby-dirty"; sync "$A" run
+check "the installer's mark on a new standby (words, no network named): the first good sync clears it — the standby is filled, may take over, and is not synced again every 15 minutes" bash -c '[ "$2" = 0 ] && [ ! -e "$1/state/standby-dirty" ]' _ "$B" "$RC"
+pair "$T/d4"; A="$T/d4/a"; B="$T/d4/b"; for x in "$A" "$B"; do printf 'ZWAVE=synced\nZWAVE_FAMILY=zwave-800\nZIGBEE=served\nZIGBEE_FAMILY=ezsp\n' > "$x/etc/radios.conf"; done; : > "$B/state/standby-dirty"; sync "$A" run
+check "a pair with ONE synced stick and a mark without names: it stands for the sticks synced here only — a good write of that one clears it" bash -c '[ "$2" = 0 ] && [ ! -e "$1/state/standby-dirty" ]' _ "$B" "$RC"
+
+echo "-- a VM that took itself out during its sync does not send: the standby stays ready to take over"
+pair "$T/n1"; A="$T/n1/a"; : > "$A/nostart"; sync "$A" run
+check "ser2net did not start after the read: exit 1, serve-failed, and NOTHING is sent — the standby is not marked dirty while it must take over" bash -c '[ "$2" = 1 ] && [ -e "$1/run/serve-failed" ] && ! grep -q "^ssh .*receive" "$1/calls" && [ ! -e "$3/state/standby-dirty" ] && grep -q "result=failed step=not-sent" "$1/journal"' _ "$A" "$RC" "$T/n1/b"
+pair "$T/n2"; A="$T/n2/a"; : > "$A/drop-role"; sync "$A" run
+check "the role was lost during the read: nothing is sent either" bash -c '[ "$2" = 1 ] && ! grep -q "^ssh .*receive" "$1/calls" && [ ! -e "$3/state/standby-dirty" ]' _ "$A" "$RC" "$T/n2/b"
+
+echo "-- a kept read set belongs to the turn it was read in, and a device change is always read fresh"
+pair "$T/k1"; A="$T/k1/a"; B="$T/k1/b"; : > "$B/restore-fail"; ZRADIO_SYNC_RETRY_PAUSES="" sync "$A" run; rm "$B/restore-fail"
+command -p sleep 1.1; echo "MASTER 2026-11-12T01:00:00Z priority=100" > "$A/run/role"; : > "$A/calls"      # this VM lost the role and has it again: a new turn
+sync "$A" run
+check "a set kept from an earlier turn is not sent again: the sticks are read again" bash -c '[ "$2" = 0 ] && grep -q "^systemctl stop ser2net" "$1/calls" && ! grep -q "is sent again" "$1/out"' _ "$A" "$RC"
+pair "$T/k2"; A="$T/k2/a"; B="$T/k2/b"; : > "$B/restore-fail"; ZRADIO_SYNC_RETRY_PAUSES="" sync "$A" run; rm "$B/restore-fail"; : > "$A/calls"
+sync "$A" run --reason device-change
+check "a device was added since: the kept set (read before the change) is not sent, the sticks are read again" bash -c '[ "$2" = 0 ] && grep -q "^systemctl stop ser2net" "$1/calls" && ! grep -q "is sent again" "$1/out"' _ "$A" "$RC"
+pair "$T/k3"; A="$T/k3/a"; B="$T/k3/b"; : > "$B/restore-fail"; ZRADIO_SYNC_RETRY_PAUSES="" sync "$A" run; rm "$B/restore-fail"; : > "$A/calls"
+sync "$A" run --reason catch-up
+check "the same turn, any other reason: the kept set is sent again, as before (no second read)" bash -c '[ "$2" = 0 ] && ! grep -q "^systemctl stop ser2net" "$1/calls" && grep -q "is sent again" "$1/out"' _ "$A" "$RC"
+pair "$T/k4"; A="$T/k4/a"; B="$T/k4/b"; : > "$B/restore-fail"; ZRADIO_SYNC_RETRY_PAUSES="" sync "$A" run; : > "$B/ssh-down"; : > "$A/ssh-down"
+touch -d '2 days ago' "$A/secrets/sync/out/manifest.json"; sync "$A" tick
+check "the standby stays away and the kept set is older than a day: the images are removed (no key material waits for ever); the pending mark stays, so the next sync reads" bash -c '[ ! -e "$1/secrets/sync/out" ] && [ -f "$1/state/sync-pending.json" ]' _ "$A"
+pair "$T/k5"; A="$T/k5/a"; B="$T/k5/b"; act "$A"; act "$B"; sync "$A" run; echo "term=7 used=yes" > "$A/state/version"; : > "$A/calls"; sync "$A" tick
+check "ELECTION=act: the standby holds this VM's last sync but an older term (Home Assistant connected after the read): the tick syncs once more, so the standby is not left behind" bash -c 'grep -q "^systemctl stop ser2net" "$1/calls" && grep -q "^term=7 used=no$" "$2/state/version"' _ "$A" "$B"
+pair "$T/k6"; A="$T/k6/a"; B="$T/k6/b"; sync "$A" run; echo "term=7 used=yes" > "$A/state/version"; : > "$A/calls"; sync "$A" tick
+check "…observe mode (the default): a term that differs costs no extra sync" bash -c '! grep -q "^systemctl stop ser2net" "$1/calls"' _ "$A"
+
+pair "$T/k7"; A="$T/k7/a"; sync "$A" run
+check "the probe's own budget for the NVM read is shorter than the time after which it would be killed: it ends by itself, closes the NVM and says why" bash -c 'b=$(grep -oE -- "--budget [0-9]+ --nvm-dump" "$1/calls" | grep -oE "[0-9]+") && [ -n "$b" ] && [ "$b" -lt 90 ]' _ "$A"
+
+echo "-- one sync at a time, and the callers can tell"
+pair "$T/q1"; A="$T/q1/a"; mkdir -p "$A/run"; flock "$A/run/sync-out.lock" sleep 3 & LP=$!; command -p sleep 0.5; sync "$A" run; wait $LP 2>/dev/null
+check "a sync is running already: exit 75 (busy), not 0 — a caller must not take it for a sync that was done" bash -c '[ "$2" = 75 ] && grep -q "a sync is running already" "$1/out" && ! grep -q "^systemctl stop" "$1/calls"' _ "$A" "$RC"
+
+echo "-- the sticks lock and the version lock"
+pair "$T/l1"; B="$T/l1/b"; sync "$B" self-raise --above 9000000
+check "self-raise holds the sticks lock while zigpy reads this VM's own coordinator (a hush must not talk to it meanwhile)" eq "$(cat "$B/lock-during-zigpy")" held
+pair "$T/l2"; A="$T/l2/a"; echo "term=4 used=no" > "$A/state/version"; echo confirmed > "$A/run/turn"; : > "$A/client"; : > "$A/hello-drops-role"; sync "$A" beat
+check "beat: the role went away while the peer was being asked: the version does not advance on a VM that has just given the radios up" eq "$(cat "$A/state/version")" "term=4 used=no"
+
+echo "-- what stays on disk after a failure; what the peer may send"
+pair "$T/m1"; A="$T/m1/a"; : > "$A/dump-fail"; sync "$A" run
+check "a read that failed leaves no image behind (a complete Zigbee backup, with the network key, could be among them)" bash -c '[ "$2" = 1 ] && [ ! -e "$1/secrets/sync/out/zha-backup.json" ] && [ ! -e "$1/secrets/sync/out/zwave-nvm.bin" ] && [ -f "$1/state/sync-pending.json" ]' _ "$A" "$RC"
+pair "$T/m2"; B="$T/m2/b"; : > "$B/restore-fail"; sync "$B" self-raise --above 100
+check "a self-raise that failed keeps no backup of the coordinator" bash -c '[ "$2" = 1 ] && [ ! -e "$1/secrets/sync/in/raise" ]' _ "$B" "$RC"
+pair "$T/m3"; A="$T/m3/a"; sync "$A" run
+check "the sync's ssh reads no ssh_config: root's own (a Host entry, a ProxyCommand) cannot bend it" bash -c 'grep "^ssh " "$1/calls" | grep -vq -- "-F /dev/null" && exit 1; grep -q "^ssh .*-F /dev/null" "$1/calls"' _ "$A"
+pair "$T/m4"; B="$T/m4/b"; head -c 300000 /dev/zero | ( . "$B/env.sh"; ZRADIO_SYNC_RECV_MAX=100000 SSH_ORIGINAL_COMMAND=receive bash "$TOOL" serve-ssh ) > "$B/out" 2>&1
+check "a stream larger than any set is cut off and refused before anything is unpacked for good" bash -c 'grep -qE "^(FAILED|REFUSED)" "$1/out" && [ ! -e "$1/secrets/sync/in/incoming" ] && [ ! -e "$1/secrets/sync/in/current" ]' _ "$B"
+pair "$T/m5"; B="$T/m5/b"; mkdir -p "$B/run" "$B/state"; : > "$B/run/applying"; echo zwave > "$B/state/standby-dirty"; sync "$B" tick
+check "the standby's tick finds an applying mark that nobody holds (a write that was killed): dropped, and said" bash -c '[ ! -e "$1/run/applying" ] && grep -q "event=sync-apply result=note .*applying.* nobody" "$1/journal"' _ "$B"
+
+echo "-- the tick stops a VM that serves without the floating address"
+pair "$T/z1"; A="$T/z1/a"; fake "$A/bin" ip "echo '2: eth0    inet 10.20.30.5/24 scope global eth0'"; sync "$A" tick      # ser2net active, the role file says MASTER, the address is not here
+check "ser2net is active and no interface holds the floating address: zradio-serve hush is called first (it stops such a VM)" eq "$(head -1 "$A/calls")" "zradio-serve hush"
+pair "$T/z2"; A="$T/z2/a"; sync "$A" tick
+check "…the address is here: no hush on a VM that serves" bash -c '! grep -q "^zradio-serve hush" "$1/calls"' _ "$A"
 finish

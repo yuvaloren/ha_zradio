@@ -23,13 +23,13 @@ check "the nine tools 0755 and the library" bash -c 'for f in zradio-serve zradi
 check "the conf is in place, byte for byte" cmp -s "$T/w/my.conf" "$(R "$T/w" /etc/zradio/zradio.conf)"
 check "keepalived and ser2net installed; both stopped again and not enabled by their packages" bash -c 'grep -q "^apt-get install -y -q keepalived" "$1/calls" && grep -q "^apt-get install -y -q ser2net" "$1/calls" && grep -q "^systemctl disable --now ser2net" "$1/calls" && grep -q "^systemctl disable --now keepalived" "$1/calls" && [ "$(cat "$1/ser2net")" = 0 ]' _ "$T/w"
 check "detection ran once, with --write" eq "$(grep -c '^zradio-detect --write$' "$T/w/calls")" 1
-check "a synced Z-Wave stick: podman installed, the pinned image pulled" bash -c 'grep -q "^apt-get install -y -q podman" "$1/calls" && grep -q "^podman pull -q docker.io/zwavejs/zwave-js-ui:11.25.2" "$1/calls"' _ "$T/w"
+check "a synced Z-Wave stick: podman installed, the pinned image pulled" bash -c 'grep -q "^apt-get install -y -q podman" "$1/calls" && grep -q "^podman pull -q docker.io/zwavejs/zwave-js-ui:11.27.0@sha256:[0-9a-f]\{64\}$" "$1/calls"' _ "$T/w"
 check "a synced Zigbee stick: zigpy in its own venv" bash -c 'grep -q "^zigpy-setup .*/opt/zradio/zigpy" "$1/calls" && [ -x "$1/root/opt/zradio/zigpy/bin/zigpy" ]' _ "$T/w"
 # the real line (no setup hook): python3 -m venv, then pip with the PINNED release from zradio.conf's default
 vm "$T/pin"; REALPY=$(command -v python3)
 fake "$T/pin/bin" python3 "if [ \"\$1 \$2\" = '-m venv' ]; then mkdir -p \"\$3/bin\" && printf '#!/bin/sh\necho \"pip \$*\" >> %s\nprintf \"#!/bin/sh\\\\n\" > %s/bin/zigpy; chmod +x %s/bin/zigpy\n' '$T/pin/calls' \"\$3\" \"\$3\" > \"\$3/bin/pip\" && chmod +x \"\$3/bin/pip\"; else exec '$REALPY' \"\$@\"; fi"
 PATH="$T/pin/bin:$PATH" ZRADIO_INSTALL_ROOT="$T/pin/root" ZRADIO_INSTALL_DETECT="$T/pin/detect" bash "$TOOL" --conf "$T/pin/my.conf" --run > "$T/pin/out" 2>&1
-check "zigpy-cli is installed at a pinned release (2.0.0 unless zradio.conf says otherwise), not whatever is newest that day" bash -c 'grep -qx "pip install -q zigpy-cli==2.0.0" "$1/calls" && grep -q "zigpy-cli 2.0.0 installed in its own venv" "$1/out"' _ "$T/pin"
+check "zigpy-cli is installed at a pinned release (2.0.0 unless zradio.conf says otherwise), not whatever is newest that day" bash -c 'grep -q "^pip install -q -c .*/guest/lib/zigpy-constraints.txt zigpy-cli==2.0.0$" "$1/calls" && grep -q "zigpy-cli 2.0.0 installed in its own venv" "$1/out"' _ "$T/pin"
 vm "$T/pin2"; echo "ZIGPY_VERSION=latest" >> "$T/pin2/my.conf"; inst "$T/pin2" --conf "$T/pin2/my.conf" --run
 check "ZIGPY_VERSION that is not a release number: the conf is refused, nothing installed" bash -c '[ "$2" != 0 ] && grep -q "ZIGPY_VERSION .latest.: a zigpy-cli release" "$1/out" && ! grep -q "^apt-get" "$1/calls"' _ "$T/pin2" "$RC"
 check "keepalived.conf rendered for this VM (eth1 holds SELF) and checked with keepalived -t" bash -c 'grep -qx "    interface eth1" "$1/root/etc/keepalived/keepalived.conf" && grep -qx "    unicast_src_ip 10.20.30.6" "$1/root/etc/keepalived/keepalived.conf" && grep -q "^keepalived -t -f " "$1/calls"' _ "$T/w"
@@ -63,6 +63,9 @@ check "THE SWAP: the same line run again later does not mark the VM — the init
 inst "$T/rs" --initial-role primary --detect --run
 check "a VM in the middle of being filled by a sync, said to be the primary: refused, zradio-sync's mark stays" bash -c '[ "$2" = 1 ] && [ -e "$1/root/var/lib/zradio/standby-dirty" ] && [ ! -s "$1/root/var/lib/zradio/standby-dirty" ] && grep -q "FAIL  this VM is to start as the PRIMARY, but a set from the other VM was being written" "$1/out" && [ "$(cat "$1/root/var/lib/zradio/initial-role")" = standby ]' _ "$T/rs" "$RC"
 sc0 "$T/rs"; check "…and it still does not serve" eq "$?" 1
+printf 'zwave\nzigbee\n' > "$T/rs/root/var/lib/zradio/standby-dirty"        # zradio-sync's mark as it is now: the networks in doubt
+inst "$T/rs" --initial-role primary --detect --run
+check "…the same with the mark that names the networks: refused, and the mark is as it was (it is not the installer's to lift)" bash -c '[ "$2" = 1 ] && [ "$(tr "\n" " " < "$1/root/var/lib/zradio/standby-dirty")" = "zwave zigbee " ] && grep -q "FAIL  this VM is to start as the PRIMARY, but a set from the other VM was being written" "$1/out"' _ "$T/rs" "$RC"
 rm -f "$T/rs/root/var/lib/zradio/standby-dirty" "$T/rs/root/var/lib/zradio/initial-role"; echo '{"gen":"g1"}' > "$T/rs/root/var/lib/zradio/synced.json"
 inst "$T/rs" --initial-role standby --detect --run       # a VM from before the role was asked, filled by a sync
 check "a standby that a sync has filled and that never had an initial role: not marked, the role is kept" bash -c '[ "$2" = 0 ] && [ ! -e "$1/root/var/lib/zradio/standby-dirty" ] && grep -q "filled by a sync before" "$1/out" && [ "$(cat "$1/root/var/lib/zradio/initial-role")" = standby ]' _ "$T/rs" "$RC"
@@ -109,8 +112,17 @@ vm "$T/x2"; inst "$T/x2" --run
 check "no conf anywhere: REFUSED, says where it belongs" bash -c '[ "$2" = 1 ] && grep -q "copy zradio.conf.example there" "$1/out"' _ "$T/x2" "$RC"
 vm "$T/x3"; : > "$T/x3/detect-fail"; inst "$T/x3" --conf "$T/x3/my.conf" --run
 check "no stick found: exit 1 after the files and packages, before any service file" bash -c '[ "$2" = 1 ] && grep -q "FAIL  zradio-detect did not end clean" "$1/out" && [ ! -e "$1/root/etc/keepalived/keepalived.conf" ] && ! grep -q "^systemctl enable" "$1/calls"' _ "$T/x3" "$RC"
-vm "$T/x4"; : > "$T/x4/kt-fail"; inst "$T/x4" --conf "$T/x4/my.conf" --run
+vm "$T/x4"; mkdir -p "$T/x4/root/etc/keepalived"; echo "# the config this VM runs with" > "$T/x4/root/etc/keepalived/keepalived.conf"; : > "$T/x4/kt-fail"; inst "$T/x4" --conf "$T/x4/my.conf" --run
+check "…and the file is tried BEFORE it is put in place: the config the VM runs with is left as it was" bash -c '[ "$(cat "$1/root/etc/keepalived/keepalived.conf")" = "# the config this VM runs with" ] && grep -q "is left as it was" "$1/out"' _ "$T/x4"
 check "keepalived -t rejects the rendered file: exit 1, nothing enabled" bash -c '[ "$2" = 1 ] && grep -q "FAIL  keepalived -t" "$1/out" && ! grep -q "^systemctl enable" "$1/calls"' _ "$T/x4" "$RC"
+# (podman's list, as it is for an image pulled by its digest: no tag; and an earlier pin's, pulled by its tag)
+vm "$T/im"; printf '%s\n' "714decaa6080 docker.io/zwavejs/zwave-js-ui:<none>" "4f9744b6069c docker.io/zwavejs/zwave-js-ui:11.25.2" > "$T/im/images"; inst "$T/im" --conf "$T/im/my.conf" --run
+check "an image of an earlier pin is on the VM: removed by its id once the pinned one is here (400 MB of a small disk); the pinned one is not touched" bash -c '[ "$2" = 0 ] && grep -qx "podman rmi 4f9744b6069c" "$1/calls" && [ "$(grep -c "^podman rmi" "$1/calls")" = 1 ] && grep -q "DONE  image docker.io/zwavejs/zwave-js-ui:11.25.2 removed (an earlier pin" "$1/out" && grep -q "^podman images --noheading .* --filter reference=docker.io/zwavejs/zwave-js-ui$" "$1/calls"' _ "$T/im" "$RC"
+vm "$T/im2"; echo "4f9744b6069c docker.io/zwavejs/zwave-js-ui:11.25.2" > "$T/im2/images"; : > "$T/im2/rmi-fail"; inst "$T/im2" --conf "$T/im2/my.conf" --run
+check "…it cannot be removed (a container still uses it): a warning, and the install goes on" bash -c '[ "$2" = 0 ] && grep -q "WARN  image docker.io/zwavejs/zwave-js-ui:11.25.2 (an earlier pin) could not be removed" "$1/out"' _ "$T/im2" "$RC"
+check "the pins agree: the example conf names the Z-Wave JS UI image and the zigpy-cli release the kit itself pins" bash -c 'z=$(sed -n "s/^ZR_ZUI_IMAGE=\([^ ]*\).*/\1/p" "$1/guest/lib/zradio-common.sh") && [ -n "$z" ] && grep -qx "ZUI_IMAGE=$z" "$1/zradio.conf.example" && v=$(sed -n "s/^ *ZIGPY_VERSION=\([0-9][0-9a-z.]*\)$/\1/p" "$1/guest/lib/zradio-common.sh" | head -1) && [ -n "$v" ] && grep -qx "#ZIGPY_VERSION=$v" "$1/zradio.conf.example"' _ "$KIT"
+vm "$T/x5"; inst "$T/x5" --conf "$T/x5/my.conf" --run --peer
+check "--peer given last without an address: exit 2, said (it used to loop for ever), nothing done" bash -c '[ "$2" = 2 ] && grep -q "^--peer needs a value" "$1/out" && [ ! -s "$1/calls" ]' _ "$T/x5" "$RC"
 vm "$T/x5"; : > "$T/x5/apt-fail"; inst "$T/x5" --conf "$T/x5/my.conf" --run
 check "apt-get fails: exit 1 at the package, no detection" bash -c '[ "$2" = 1 ] && grep -q "FAIL  apt-get install keepalived failed" "$1/out" && ! grep -q "^zradio-detect" "$1/calls"' _ "$T/x5" "$RC"
 
@@ -132,7 +144,7 @@ inst "$T/dh" --conf "$T/dh/dhcp.conf" --run
 check "the same line again: nothing is rewritten" bash -c '[ "$2" = 0 ] && grep -q "OK    /etc/zradio/zradio.conf is current" "$1/out" && grep -q "OK    /etc/keepalived/keepalived.conf is current" "$1/out"' _ "$T/dh" "$RC"
 echo 1 > "$T/dh/keepalived"          # the VM is in the pair by now: keepalived runs
 inst "$T/dh" --peer 192.168.1.45 --from-node --run
-check "--peer (the second VM exists now): PEER is in the conf, keepalived.conf has the unicast lines, nothing is detected again" bash -c '[ "$3" = 0 ] && grep -qx "PEER=192.168.1.45" "$1" && grep -qx "SELF=192.168.1.44" "$1" && grep -A2 "unicast_src_ip 192.168.1.44" "$2/root/etc/keepalived/keepalived.conf" | grep -q "^ *192.168.1.45$" && [ "$(grep -c "^zradio-detect" "$2/calls")" = 1 ]' _ "$(C "$T/dh")" "$T/dh" "$RC"
+check "--peer (the second VM exists now): PEER is in the conf, keepalived.conf has the unicast lines, nothing is detected again" bash -c '[ "$3" = 0 ] && grep -qx "PEER=192.168.1.45" "$1" && grep -qx "SELF=192.168.1.44" "$1" && grep -A3 "unicast_src_ip 192.168.1.44" "$2/root/etc/keepalived/keepalived.conf" | grep -q "^ *192.168.1.45$" && [ "$(grep -c "^zradio-detect" "$2/calls")" = 1 ]' _ "$(C "$T/dh")" "$T/dh" "$RC"
 check "…and the keepalived that runs is reloaded, with what that costs said" bash -c 'grep -q "^systemctl reload keepalived" "$1/calls" && grep -q "DONE  keepalived reloaded: this VM sends its adverts to its peer 192.168.1.45 now.*about 4 seconds" "$1/out" && ! grep -q "systemctl restart keepalived" "$1/out"' _ "$T/dh"
 inst "$T/dh" --conf "$T/dh/dhcp.conf" --run
 check "a later run with the first conf (it names no peer) does not take the peer away" bash -c '[ "$2" = 0 ] && grep -qx "PEER=192.168.1.45" "$1" && grep -q "OK    /etc/zradio/zradio.conf is current"  "$3/out"' _ "$(C "$T/dh")" "$RC" "$T/dh"
@@ -181,4 +193,64 @@ vm "$T/wd"; : > "$T/wd/watchdog"; ZRADIO_INSTALL_WATCHDOG="$T/wd/watchdog" inst 
 check "a watchdog device: systemd feeds it (RuntimeWatchdogSec=30s), and systemd is re-executed to take it now" bash -c '[ "$2" = 0 ] && grep -q "^RuntimeWatchdogSec=30s$" "$1/root/etc/systemd/system.conf.d/90-zradio-watchdog.conf" && grep -q "^systemctl daemon-reexec" "$1/calls"' _ "$T/wd" "$RC"
 : > "$T/wd/calls"; ZRADIO_INSTALL_WATCHDOG="$T/wd/watchdog" inst "$T/wd" --run
 check "…run again: nothing changed, systemd not re-executed" bash -c '[ "$2" = 0 ] && ! grep -q "daemon-reexec" "$1/calls" && grep -q "/etc/systemd/system.conf.d/90-zradio-watchdog.conf is current" "$1/out"' _ "$T/wd" "$RC"
+echo "-- zigpy: the release the conf pins is the one installed — on a VM that was installed before, too"
+check "a new venv is stamped with the release it holds" eq "$(cat "$T/w/root/opt/zradio/zigpy/zradio-pin" 2>/dev/null)" "zigpy-cli==2.0.0"
+check "the kit's set of libraries (guest/lib/zigpy-constraints.txt) is for the release the kit pins, and names zigpy and zigpy-znp" bash -c 'v=$(sed -n "s/^ *ZIGPY_VERSION=\([0-9][0-9a-z.]*\)$/\1/p" "$1/guest/lib/zradio-common.sh" | head -n 1) && [ -n "$v" ] && grep -qx "zigpy-cli==$v" "$1/guest/lib/zigpy-constraints.txt" && grep -q "^zigpy==[0-9]" "$1/guest/lib/zigpy-constraints.txt" && grep -q "^zigpy-znp==[0-9]" "$1/guest/lib/zigpy-constraints.txt"' _ "$KIT"
+vm "$T/zv"; inst "$T/zv" --conf "$T/zv/my.conf" --run; echo "ZIGPY_VERSION=2.0.1" >> "$T/zv/my.conf"; : > "$T/zv/calls"; inst "$T/zv" --conf "$T/zv/my.conf" --run
+check "ZIGPY_VERSION changed in the conf: the venv is built again with that release, and nothing of the old one stays" bash -c '[ "$2" = 0 ] && grep -q "^zigpy-setup .*/opt/zradio/zigpy 2.0.1$" "$1/calls" && [ "$(cat "$1/root/opt/zradio/zigpy/zradio-pin")" = "zigpy-cli==2.0.1" ] && grep -q "DONE  zigpy-cli 2.0.1 installed" "$1/out" && [ ! -e "$1/root/opt/zradio/zigpy.old" ]' _ "$T/zv" "$RC"
+: > "$T/zv/calls"; inst "$T/zv" --run
+check "…run again: nothing is built" bash -c '[ "$2" = 0 ] && ! grep -q "^zigpy-setup" "$1/calls" && grep -q "OK    zigpy-cli 2.0.1 is at /opt/zradio/zigpy" "$1/out"' _ "$T/zv" "$RC"
+vm "$T/zf"; inst "$T/zf" --conf "$T/zf/my.conf" --run; echo "ZIGPY_VERSION=2.0.1" >> "$T/zf/my.conf"; : > "$T/zf/zigpy-fail"; inst "$T/zf" --conf "$T/zf/my.conf" --run
+check "the new release does not install: FAIL, and the venv that was there is put back (this VM can still write a copy)" bash -c '[ "$2" != 0 ] && grep -q "FAIL  zigpy-cli 2.0.1 did not install" "$1/out" && [ -x "$1/root/opt/zradio/zigpy/bin/zigpy" ] && [ "$(cat "$1/root/opt/zradio/zigpy/zradio-pin")" = "zigpy-cli==2.0.0" ] && [ ! -e "$1/root/opt/zradio/zigpy.old" ]' _ "$T/zf" "$RC"
+vm "$T/zo"; inst "$T/zo" --conf "$T/zo/my.conf" --run; rm "$T/zo/root/opt/zradio/zigpy/zradio-pin"; : > "$T/zo/calls"; inst "$T/zo" --run
+check "a venv of an earlier kit (no stamp) and pip says it holds the pinned release: stamped, not built again" bash -c '[ "$2" = 0 ] && ! grep -q "^zigpy-setup" "$1/calls" && [ "$(cat "$1/root/opt/zradio/zigpy/zradio-pin")" = "zigpy-cli==2.0.0" ]' _ "$T/zo" "$RC"
+printf 'zigpy==2.3.0\nzigpy-cli==2.0.0\nzigpy-znp==1.1.1\n' > "$T/zo/zigpy-freeze"; inst "$T/zo" --run
+check "the libraries under it are not the ones the kit installs today: said, with both versions (the two VMs of a pair should hold the same)" bash -c '[ "$2" = 0 ] && grep -q "WARN  .*zigpy 2.3.0 here, [0-9.]* in the kit.s set" "$1/out" && ! grep -q "zigpy-znp 1.1.1 here" "$1/out"' _ "$T/zo" "$RC"
+rm "$T/zo/root/opt/zradio/zigpy/zradio-pin"; echo 1.9.0 > "$T/zo/zigpy-has"; : > "$T/zo/calls"; inst "$T/zo" --run
+check "no stamp and pip says ANOTHER release: built again" bash -c '[ "$2" = 0 ] && grep -q "^zigpy-setup .*/opt/zradio/zigpy 2.0.0$" "$1/calls"' _ "$T/zo" "$RC"
+
+echo "-- the conf's time zone and keepalived's word are checked by the programs themselves"
+vm "$T/tz"; echo "SYNC_TZ=Europe/Berln" >> "$T/tz/my.conf"; inst "$T/tz" --conf "$T/tz/my.conf" --run
+check "a time zone systemd does not know (a typo): refused before anything is changed — the timer would never fire, without a word" bash -c '[ "$2" != 0 ] && grep -q "FAIL  .*Europe/Berln" "$1/out" && [ ! -e "$1/root/etc/zradio/zradio.conf" ] && [ ! -e "$1/root/etc/systemd/system/zradio-sync.timer" ]' _ "$T/tz" "$RC"
+vm "$T/tz2"; echo "SYNC_TZ=Europe/Berlin" >> "$T/tz2/my.conf"; inst "$T/tz2" --conf "$T/tz2/my.conf" --run
+check "one it knows: installed with it" bash -c '[ "$2" = 0 ] && grep -q "^OnCalendar=.* Europe/Berlin$" "$1/root/etc/systemd/system/zradio-sync.timer"' _ "$T/tz2" "$RC"
+vm "$T/kw"; : > "$T/kw/kt-warn"; inst "$T/kw" --conf "$T/kw/my.conf" --run
+check "keepalived -t names an unknown keyword and exits 0 all the same [V 2.3.3]: refused, the file is not put in place" bash -c '[ "$2" != 0 ] && grep -q "FAIL  keepalived -t refuses the new config" "$1/out" && [ ! -e "$1/root/etc/keepalived/keepalived.conf" ]' _ "$T/kw" "$RC"
+
+echo "-- the units: a sync that was busy is no failure, and one with retries is not cut off"
+for u in zradio-sync.service zradio-sync-tick.service; do
+  check "$u: exit 75 (another sync is running) counts as success; 30 minutes for a run with its retries" bash -c 'grep -qx "SuccessExitStatus=75" "$1" && grep -qx "TimeoutStartSec=1800" "$1"' _ "$KIT/guest/units/$u"
+done
+
+echo "-- a re-run on a VM that is in the pair: what runs is put onto the new files"
+check "report mode names the gate among what is enabled" bash -c 'grep -q "WOULD systemctl daemon-reload; enable .*zradio-gate" "$1/out"' _ "$T/r"
+vm "$T/up"; inst "$T/up" --conf "$T/up/my.conf" --run
+for u in zradio.target zradio-gate.service zradio-change-watch.service zradio-sync.timer zradio-sync-tick.timer; do echo 1 > "$T/up/$u"; done
+echo "# an older kit's" >> "$T/up/root/usr/local/lib/zradio/zradio-common.sh"; : > "$T/up/calls"; inst "$T/up" --run
+check "zradio-common.sh changed (every tool sources it): the gate, which runs all the time, is restarted on it" bash -c '[ "$2" = 0 ] && grep -qx "systemctl restart zradio-gate.service" "$1/calls"' _ "$T/up" "$RC"
+check "a unit the target wants that is not running here (new in this kit): started; what runs already, and keepalived, are not touched" bash -c 'grep -qx "systemctl start zradio-state.timer" "$1/calls" && ! grep -qE "^systemctl start (zradio-sync.timer|zradio-sync-tick.timer|zradio-gate.service|zradio-change-watch.service|keepalived)" "$1/calls"' _ "$T/up"
+echo "SYNC_AT=03:15" >> "$T/up/my.conf"; : > "$T/up/calls"; inst "$T/up" --conf "$T/up/my.conf" --run
+check "SYNC_AT changed: the nightly timer, which is running, is restarted (systemd keeps the old time until then); the gate reads the new conf" bash -c '[ "$2" = 0 ] && grep -qx "systemctl restart zradio-sync.timer" "$1/calls" && grep -qx "systemctl restart zradio-gate.service" "$1/calls"' _ "$T/up" "$RC"
+echo "# again" >> "$T/up/root/usr/local/lib/zradio/zradio-common.sh"; mkdir -p "$T/up/root/run/zradio"
+( exec 9>"$T/up/root/run/zradio/sync-out.lock"; flock 9; sleep 3 ) & LP=$!
+sleep 0.3; : > "$T/up/calls"; ZRADIO_INSTALL_RESTART_WAIT=1 inst "$T/up" --run; wait "$LP"
+check "a sync runs here (restarting the gate or the watcher ends what they started — a self-raise, a device-change sync): not restarted, and said with the line to run later" bash -c '[ "$2" = 0 ] && ! grep -q "^systemctl restart zradio-gate" "$1/calls" && grep -q "WARN  .*a sync is running here.*systemctl restart zradio-gate.service" "$1/out"' _ "$T/up" "$RC"
+vm "$T/nu"; inst "$T/nu" --conf "$T/nu/my.conf" --run
+check "a VM that is not in the pair yet (zradio.target not started): nothing is started or restarted" bash -c '! grep -qE "^systemctl (start|restart)" "$1/calls"' _ "$T/nu"
+
+echo "-- a stick whose network could not be told"
+vm "$T/hn"; : > "$T/hn/detect-unknown"; inst "$T/hn" --conf "$T/hn/my.conf" --run --initial-role primary
+check "the initial primary, and detection could not tell whether its sticks hold a network: said (it is neither 'holds' nor 'blank')" bash -c '[ "$2" = 0 ] && grep -q "WARN  .*could not be told whether the zigbee zwave stick(s) hold a network" "$1/out"' _ "$T/hn" "$RC"
+echo "-- an update: the library before the tools that need it; a venv built again does not hold the restarts back"
+vm "$T/lo"; inst "$T/lo" --conf "$T/lo/my.conf" --run
+check "zradio-common.sh is put in place before the tools (a new tool beside the old library would not find the library's new functions, for the moment in between)" bash -c 'l=$(grep -n "/usr/local/lib/zradio/zradio-common.sh installed" "$1/out" | cut -d: -f1); s=$(grep -n "/usr/local/sbin/zradio-serve installed" "$1/out" | cut -d: -f1); [ -n "$l" ] && [ -n "$s" ] && [ "$l" -lt "$s" ]' _ "$T/lo"
+vm "$T/zr"; inst "$T/zr" --conf "$T/zr/my.conf" --run
+for u in zradio.target zradio-gate.service zradio-change-watch.service zradio-sync.timer zradio-sync-tick.timer zradio-state.timer; do echo 1 > "$T/zr/$u"; done
+mkdir -p "$T/zr/root/run/zradio"; echo "ZIGPY_VERSION=2.0.1" >> "$T/zr/my.conf"; : > "$T/zr/calls"; ZRADIO_INSTALL_RESTART_WAIT=1 inst "$T/zr" --conf "$T/zr/my.conf" --run
+check "the venv is built again on a VM that is in the pair, and no sync runs: the gate and the watcher are restarted all the same (the installer's own look at the sync's locks must not pass for a sync)" bash -c '[ "$2" = 0 ] && grep -q "^zigpy-setup .* 2.0.1$" "$1/calls" && grep -qx "systemctl restart zradio-gate.service" "$1/calls" && grep -qx "systemctl restart zradio-change-watch.service" "$1/calls" && ! grep -q "a sync is running here" "$1/out"' _ "$T/zr" "$RC"
+echo "-- the Z-Wave JS UI image is started once, with the rights a write gives it, before any sync depends on it"
+check "after the pull: the image's own Node.js is run with exactly those rights — no stick, no port — and its answer is shown" bash -c 'grep -q "^podman run --rm --pull=never --cap-drop=all --cap-add=DAC_OVERRIDE --security-opt no-new-privileges --entrypoint node docker.io/zwavejs/zwave-js-ui:[^ ]* --version$" "$1/calls" && grep -q "OK    the image starts with the rights a write gives it (Node.js v24.22.1)" "$1/out"' _ "$T/lo"
+check "the rights are the ones zradio-apply runs the container with (one definition, in the library)" bash -c 'grep -q "^ZR_ZUI_RUN_OPTS=\"--pull=never --cap-drop=all --cap-add=DAC_OVERRIDE --security-opt no-new-privileges\"" "$1/guest/lib/zradio-common.sh" && grep -q "podman run -d --name \"\$CT\" \$ZR_ZUI_RUN_OPTS " "$1/guest/sbin/zradio-apply" && grep -q "podman run --rm \$ZR_ZUI_RUN_OPTS " "$1/guest/install.sh"' _ "$KIT"
+vm "$T/sf"; : > "$T/sf/start-fail"; inst "$T/sf" --conf "$T/sf/my.conf" --run
+check "the image does not start with them on this machine: FAIL with podman's words, before a unit is touched — an update stops at the standby" bash -c '[ "$2" != 0 ] && grep -q "FAIL  the image .* does not start with the rights a write gives it .*Operation not permitted" "$1/out" && [ ! -e "$1/root/etc/systemd/system/zradio.target" ]' _ "$T/sf" "$RC"
 finish

@@ -63,6 +63,6 @@ check "the VMs' own addresses came from DHCP: each real installer wrote the one 
 check "the first VM had no peer until the second existed, and node 2's run told it (the real installer, --peer): PEER, the unicast lines, the sync's trust from that address" bash -c '
   grep -q "| WARN  no PEER: this VM has no peer yet" "$1/out1" && grep -q "DONE  zradio1 knows its peer now: 192.168.1.22" "$1/out2" &&
   [ "$(grep -v "^#" "$1/g/100/root/etc/zradio/zradio.conf" | sort | tr "\n" " ")" = "NAME=zradio1 PEER=192.168.1.22 PRIORITY=110 SELF=192.168.1.21 VIP=192.168.1.20/24 VRID=50 " ] &&
-  grep -A2 "unicast_src_ip 192.168.1.21" "$1/g/100/root/etc/keepalived/keepalived.conf" | grep -q "^ *192.168.1.22$" && grep -q "from=\"192.168.1.22\",restrict" "$1/g/100/root/root/.ssh/authorized_keys"' _ "$C"
+  grep -A3 "unicast_src_ip 192.168.1.21" "$1/g/100/root/etc/keepalived/keepalived.conf" | grep -q "^ *192.168.1.22$" && grep -q "from=\"192.168.1.22\",restrict" "$1/g/100/root/root/.ssh/authorized_keys"' _ "$C"
 [ -z "${E2E_KEEP:-}" ] || { rm -rf "$E2E_KEEP"; cp -r "$T" "$E2E_KEEP"; }
 finish

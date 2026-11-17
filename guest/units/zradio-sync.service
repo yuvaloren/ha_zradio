@@ -7,4 +7,7 @@ After=keepalived.service
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/zradio-sync run --reason nightly
-TimeoutStartSec=900
+# 30 minutes: a sync with its two retries is three waits of up to 7 minutes for the standby's write, the pauses
+# between them and the reads. Exit 75 is "another sync is running here": nothing failed.
+TimeoutStartSec=1800
+SuccessExitStatus=75
