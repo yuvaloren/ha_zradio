@@ -38,4 +38,6 @@ jobs:
         with:
           persist-credentials: false
       - name: the pinned versions against their makers' end-of-life dates
+        env:
+          GITHUB_TOKEN: ${{ github.token }}      # read-only (permissions, above): GitHub's API answers a runner without one 403
         run: bash tests/check-pins.sh

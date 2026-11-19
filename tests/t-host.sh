@@ -21,20 +21,20 @@ check "no stick: exit 1, and how a stick the table does not know is passed throu
 echo "-- create, report mode: everything is said, nothing is done"
 node "$T/r"; zvm "$T/r" "${BASE[@]}"
 check "exit 0, REPORT ONLY, no qm / pvesh / ha-manager / wget call, no file written" bash -c '[ "$2" = 0 ] && grep -q "^REPORT ONLY" "$1/out" && [ ! -s "$1/calls" ] && [ -z "$(ls "$1/store/snippets")" ]' _ "$T/r" "$RC"
-check "it says the two USB mappings it would make, the VM and the start — in that order; no Proxmox HA" bash -c '
-  o=$(grep -n "WOULD" "$1/out"); l() { printf "%s\n" "$o" | grep -m1 -- "$1" | cut -d: -f1; }
-  a=$(l "pvesh create /cluster/mapping/usb --id zradio-10c4ea70 --map node=nodea,id=10c4:ea70"); b=$(l "pvesh create /cluster/mapping/usb --id zradio-10c4ea60 --map node=nodea,id=10c4:ea60")
-  c=$(l "qm create 109 --name zr2"); g=$(l "qm start 109")
-  [ -n "$a" ] && [ -n "$b" ] && [ "$b" -lt "$c" ] && [ "$c" -lt "$g" ] && ! grep -q "ha-manager" "$1/out"' _ "$T/r"
+check "it says how each stick is named (by its id: host=), the VM and the start — in that order; no USB mapping is made, no Proxmox HA" bash -c '
+  l() { grep -n -m1 -- "$1" "$2/out" | cut -d: -f1; }
+  a=$(l "OK    10c4:ea70: zr2 gets it by its id (host=10c4:ea70), in whichever socket it is" "$1"); b=$(l "OK    10c4:ea60: zr2 gets it by its id (host=10c4:ea60)" "$1")
+  c=$(l "WOULD qm create 109 --name zr2" "$1"); g=$(l "WOULD qm start 109" "$1")
+  [ -n "$a" ] && [ -n "$b" ] && [ "$b" -lt "$c" ] && [ "$c" -lt "$g" ] && ! grep -q "ha-manager" "$1/out" && ! grep -q "mapping/usb --id\|pvesh create\|pvesh set" "$1/out"' _ "$T/r"
 check "the cluster keeps its quorum without one node (the fake has three votes): said" bash -c 'grep -q "OK    the cluster keeps its quorum without one node (3 votes, 2 needed)" "$1/out"' _ "$T/r"
-check "the VM as it would be: both networks, both sticks, onboot, a watchdog that resets it" bash -c 'grep "WOULD qm create" "$1/out" | grep -q -- "--net0 virtio,bridge=vmbr0 --ipconfig0 ip=dhcp --net1 virtio,bridge=vmbrpair --ipconfig1 ip=10.20.30.6/24 .*--onboot 1 --watchdog model=i6300esb,action=reset .*--usb0 mapping=zradio-10c4ea70 --usb1 mapping=zradio-10c4ea60"' _ "$T/r"
+check "the VM as it would be: both networks, both sticks, onboot, a watchdog that resets it" bash -c 'grep "WOULD qm create" "$1/out" | grep -q -- "--net0 virtio,bridge=vmbr0 --ipconfig0 ip=dhcp --net1 virtio,bridge=vmbrpair --ipconfig1 ip=10.20.30.6/24 .*--onboot 1 --watchdog model=i6300esb,action=reset .*--usb0 host=10c4:ea70 --usb1 host=10c4:ea60"' _ "$T/r"
 
 echo "-- create --run on a clean node"
 node "$T/c"; zvm "$T/c" "${BASE[@]}" --run
 check "exit 0" eq "$RC" 0
-check "the calls, in order: mappings, VM, disk, then the start; nothing of Proxmox HA" bash -c '
+check "the calls, in order: VM, disk, then the start; no USB mapping is made or changed, nothing of Proxmox HA" bash -c '
   n() { grep -n -m1 -- "$1" "$2/calls" | cut -d: -f1; }
-  a=$(n "^pvesh create /cluster/mapping/usb --id zradio-10c4ea70" "$1"); b=$(n "^qm create 109 " "$1"); c=$(n "^qm set 109 --scsi0 local-zfs:0,import-from=.*debian-13-generic-amd64.qcow2,discard=on" "$1"); d=$(n "^qm disk resize 109 scsi0 8G" "$1")
+  a=0; ! grep -q "^pvesh \(create\|set\) /cluster/mapping" "$1/calls" || exit 1; b=$(n "^qm create 109 " "$1"); c=$(n "^qm set 109 --scsi0 local-zfs:0,import-from=.*debian-13-generic-amd64.qcow2,discard=on" "$1"); d=$(n "^qm disk resize 109 scsi0 8G" "$1")
   g=$(n "^qm start 109" "$1")
   [ -n "$a" ] && [ "$a" -lt "$b" ] && [ "$b" -lt "$c" ] && [ "$c" -lt "$d" ] && [ "$d" -lt "$g" ] && ! grep -q "^ha-manager" "$1/calls"' _ "$T/c"
 check "the image in the cache is used: no image downloaded" bash -c '! grep -q "^wget .*qcow2" "$1/calls"' _ "$T/c"
@@ -78,13 +78,32 @@ node "$T/k"; printf 'ZWAVE=synced\nZIGBEE=none\n' > "$T/k/radios.conf"; zvm "$T/
 check "a VM that found only a Z-Wave stick: installed, said, and only the Z-Wave line for Home Assistant" bash -c '[ "$2" = 0 ] && grep -q "radios: Z-Wave yes, Zigbee none" "$1/out" && grep -q "Z-Wave JS → tcp://10.20.30.50:6639$" "$1/out" && ! grep -q "ZHA" "$1/out"' _ "$T/k" "$RC"
 check "…and the line for Home Assistant says that the pair has no Zigbee stick" bash -c 'grep -q -- "get.sh)\" _ --radios 10.20.30.50 --no-zigbee$" "$1/out"' _ "$T/k"
 node "$T/k2" zwave; printf 'ZWAVE=none\nZIGBEE=served\n' > "$T/k2/radios.conf"; zvm "$T/k2" "${BASE[@]}" --conf ZIGBEE_PORT=7000 --run
-check "one stick on the node: one USB mapping, one usb line; only Zigbee found: only the ZHA line, on the port of --conf" bash -c '[ "$2" = 0 ] && grep "^qm create" "$1/calls" | grep -q -- "--usb0 mapping=zradio-10c4ea70 --tags" && grep -q "radios: Z-Wave none, Zigbee yes" "$1/out" && grep -q "ZHA → socket://10.20.30.50:7000" "$1/out" && ! grep -q "Z-Wave JS" "$1/out"' _ "$T/k2" "$RC"
+check "one stick on the node: one usb line; only Zigbee found: only the ZHA line, on the port of --conf" bash -c '[ "$2" = 0 ] && grep "^qm create" "$1/calls" | grep -q -- "--usb0 host=10c4:ea70 --hookscript local:snippets/zradio-hook.sh --tags" && grep -q "radios: Z-Wave none, Zigbee yes" "$1/out" && grep -q "ZHA → socket://10.20.30.50:7000" "$1/out" && ! grep -q "Z-Wave JS" "$1/out"' _ "$T/k2" "$RC"
 check "…and the line for Home Assistant carries the other port, and says that the pair has no Z-Wave stick" bash -c 'grep -q -- "get.sh)\" _ --radios 10.20.30.50 --zigbee-port 7000 --no-zwave$" "$1/out"' _ "$T/k2"
 
+echo "-- the hookscript, and the sticks' power"
+check "report mode says the hookscript it would put on the node, and creates the VM with it" bash -c 'grep -q "WOULD put the kit.s hookscript on nodea: $1/store/snippets/zradio-hook.sh (before each start it gives zr2.s sticks a minute to be on the USB)" "$1/out" && grep "WOULD qm create" "$1/out" | grep -q -- "--hookscript local:snippets/zradio-hook.sh " && grep -q "OK    stick power: none for zr2" "$1/out"' _ "$T/r"
+check "--run: the node has the kit's hookscript, the same file, executable, before the VM is created with it" bash -c 'cmp -s "$1/store/snippets/zradio-hook.sh" "$2/host/hook.sh" && [ -x "$1/store/snippets/zradio-hook.sh" ] && grep "^qm create 109 " "$1/calls" | grep -q -- "--hookscript local:snippets/zradio-hook.sh " && [ ! -e "$1/store/snippets/zradio-hook-109.conf" ]' _ "$T/c" "$KIT"
+node "$T/p1"; zvm "$T/p1" "${BASE[@]}" --stick-power 1-3:2 --stick-power 2-4:2 --run
+check "--stick-power, both faces of the hub's port: the VM's conf beside the hookscript names them" bash -c '[ "$2" = 0 ] && grep -qx "POWER_PORTS=1-3:2 2-4:2" "$1/store/snippets/zradio-hook-109.conf" && grep -q "OK    stick power: zr2.s hookscript switches 1-3:2 2-4:2 on before a start and off after a stop" "$1/out"' _ "$T/p1" "$RC"
+check "…and nothing was switched by the installer itself" bash -c '[ "$(cat "$1/sys/1-3:1.0/1-3-port2/disable")$(cat "$1/sys/2-4:1.0/2-4-port2/disable")" = 00 ]' _ "$T/p1"
+node "$T/p2"; ln -s ../../2-4:1.0/2-4-port2 "$T/p2/sys/1-3:1.0/1-3-port2/peer"; zvm "$T/p2" "${BASE[@]}" --stick-power 1-3:2
+check "one face named, and the kernel knows the other: both are taken, said" bash -c '[ "$2" = 0 ] && grep -q "OK    the port 1-3:2 is 2-4:2 on its hub.s other face (USB 2 / USB 3): both are switched" "$1/out" && grep -q "WOULD write .*zradio-hook-109.conf: POWER_PORTS=1-3:2 2-4:2" "$1/out" && ! grep -q "one port" "$1/out"' _ "$T/p2" "$RC"
+node "$T/p3"; zvm "$T/p3" "${BASE[@]}" --stick-power 1-3:2
+check "one face named, and the kernel knows no other: taken, with the note on USB 3 hubs" bash -c '[ "$2" = 0 ] && grep -q "NOTE  --stick-power 1-3:2: one port. A USB 3 hub is two hubs" "$1/out"' _ "$T/p3" "$RC"
+zvm "$T/p3" "${BASE[@]}" --stick-power 1:4 --run
+check "a port the sticks do not hang off: refused, with the ports they do hang off; nothing changed" bash -c '[ "$2" = 1 ] && grep -q "FAIL  --stick-power 1:4: the stick at 1-3.2.1 is below none of them (it hangs off: 1-3.2:1 1-3:2 1:3)" "$1/out" && [ ! -s "$1/calls" ] && [ -z "$(ls "$1/store/snippets")" ]' _ "$T/p3" "$RC"
+zvm "$T/p3" "${BASE[@]}" --stick-power 7-1:3 --run
+check "a port that is not on this node: refused, nothing changed" bash -c '[ "$2" = 1 ] && grep -q "FAIL  --stick-power 7-1:3: no such port on nodea that the kernel can switch" "$1/out" && [ ! -s "$1/calls" ]' _ "$T/p3" "$RC"
+printf '%s\n' INITIAL_ROLE=standby SELF=10.20.30.6/24 PEER=10.20.30.5 VIP=10.20.30.50/24 PAIR_BRIDGE=vmbrpair STICK_POWER=1-3:2 STICK_POWER=2-4:2 > "$T/p3/answers"; zvm "$T/p3" --answers "$T/p3/answers" --name zr2
+check "from an answers file: STICK_POWER, once per port" bash -c '[ "$2" = 0 ] && grep -q "POWER_PORTS=1-3:2 2-4:2" "$1/out"' _ "$T/p3" "$RC"
+zvm "$T/s" --sticks
+check "--sticks lists the hub ports above each stick, nearest first" bash -c 'grep -q "^      1-3.2.1    1-3.2:1 1-3:2 1:3$" "$1/out" && grep -q "^      1-3.2.4    1-3.2:4 1-3:2 1:3$" "$1/out"' _ "$T/s"
+
 echo "-- options"
-node "$T/o"; zvm "$T/o" "${BASE[@]/standby/primary}" --run --start --first --hookscript local:snippets/my-hook.sh --conf SYNC_TZ=Europe/Berlin --conf ELECTION=observe --vmid 150 --priority 110 --vrid 77 --pair-mac BC:24:11:0A:63:36 --memory 1024 --cores 1 --disk 12G
+node "$T/o"; zvm "$T/o" "${BASE[@]/standby/primary}" --run --start --first --conf SYNC_TZ=Europe/Berlin --conf ELECTION=observe --vmid 150 --priority 110 --vrid 77 --pair-mac BC:24:11:0A:63:36 --memory 1024 --cores 1 --disk 12G
 check "--start joins the pair after the install; --first reaches the kit's installer in the VM" bash -c '[ "$2" = 0 ] && grep -q "guest: systemctl start zradio.target" "$1/calls" && grep -q "guest: bash /opt/zradio/kit/guest/install.sh --conf /root/zradio.conf --from-node --run --detect --initial-role primary --first > " "$1/calls" && grep -q "it is in the pair" "$1/out"' _ "$T/o" "$RC"
-check "--hookscript, --vmid, --pair-mac, --memory, --cores, --disk reach qm" bash -c 'grep "^qm create 150 " "$1/calls" | grep -q -- "--cores 1 --memory 1024 .*--net1 virtio=BC:24:11:0A:63:36,bridge=vmbrpair .*--hookscript local:snippets/my-hook.sh" && grep -q "^qm disk resize 150 scsi0 12G" "$1/calls"' _ "$T/o"
+check "--vmid, --pair-mac, --memory, --cores, --disk reach qm" bash -c 'grep "^qm create 150 " "$1/calls" | grep -q -- "--cores 1 --memory 1024 .*--net1 virtio=BC:24:11:0A:63:36,bridge=vmbrpair " && grep -q "^qm disk resize 150 scsi0 12G" "$1/calls"' _ "$T/o"
 check "--conf lines, --priority and --vrid reach zradio.conf" bash -c 'grep -q "^      SYNC_TZ=Europe/Berlin$" "$1" && grep -q "^      ELECTION=observe$" "$1" && grep -q "^      PRIORITY=110$" "$1" && grep -q "^      VRID=77$" "$1"' _ "$T/o/store/snippets/zr2-zradio.yaml"
 node "$T/o2"; zvm "$T/o2" --name zr2 --initial-role standby --self 192.0.2.6/24 --peer 192.0.2.5 --vip 192.0.2.50/24 --gateway 192.0.2.1 --run
 check "no --pair-bridge: one interface, --self on the LAN with the gateway" bash -c '[ "$2" = 0 ] && grep "^qm create" "$1/calls" | grep -q -- "--net0 virtio,bridge=vmbr0 --ipconfig0 ip=192.0.2.6/24,gw=192.0.2.1 --serial0" && ! grep -q "net1" "$1/calls"' _ "$T/o2" "$RC"
@@ -233,13 +252,13 @@ check "--usb-mapping: those two are passed through, none is made" bash -c '[ "$2
 zvm "$T/m" "${BASE[@]}" --name zr9 --usb-mapping zwave --usb-mapping nosuch
 check "a mapping with no entry for this node: refused, nothing changed" bash -c '[ "$2" = 1 ] && grep -q "USB mapping .nosuch. has no entry for nodea" "$1/out" && grep -q "nothing was changed" "$1/out"' _ "$T/m" "$RC"
 node "$T/m2" dark; cp "$T/m/usbmap.json" "$T/m2/usbmap.json"; zvm "$T/m2" "${BASE[@]}" --usb-mapping zwave --usb-mapping zigbee
-check "the mapped sticks are not on the bus (their ports are off) and there is no hookscript: refused" bash -c '[ "$2" = 1 ] && grep -c "no USB device 10c4:ea.0 on nodea right now" "$1/out" | grep -qx 2' _ "$T/m2" "$RC"
-zvm "$T/m2" "${BASE[@]}" --usb-mapping zwave --usb-mapping zigbee --hookscript local:snippets/ports.sh
-check "…with a hookscript: said, and accepted (the hook switches the ports on before the start)" bash -c '[ "$2" = 0 ] && grep -c "NOTE  mapping .*taken as a port your hookscript switches on" "$1/out" | grep -qx 2' _ "$T/m2" "$RC"
+check "the mapped sticks are not on the bus (their port is off) and no --stick-power names it: refused" bash -c '[ "$2" = 1 ] && grep -c "no USB device 10c4:ea.0 on nodea right now" "$1/out" | grep -qx 2' _ "$T/m2" "$RC"
+zvm "$T/m2" "${BASE[@]}" --usb-mapping zwave --usb-mapping zigbee --stick-power 1-3:2
+check "…with --stick-power for that port: said, and accepted (the hookscript switches it on before the start)" bash -c '[ "$2" = 0 ] && grep -c "NOTE  mapping .*taken as a stick whose port (--stick-power 1-3:2) the hookscript switches on" "$1/out" | grep -qx 2 && grep -q "NOTE  the port 1-3:2 is switched off now" "$1/out"' _ "$T/m2" "$RC"
 node "$T/m3"; echo '[{"id":"zradio-10c4ea70","map":["node=nodeb,id=10c4:ea70"]},{"id":"zradio-10c4ea60","map":["node=nodea,id=10c4:ea60"]}]' > "$T/m3/usbmap.json"; zvm "$T/m3" "${BASE[@]}" --run
-check "the second node of a pair: the kit's mapping exists for the OTHER node — this node's entry is added to it, the other's kept" bash -c 'grep -q "^pvesh set /cluster/mapping/usb/zradio-10c4ea70 --map node=nodeb,id=10c4:ea70 --map node=nodea,id=10c4:ea70$" "$1/calls" && ! grep -q "pvesh create" "$1/calls" && ! grep -q "zradio-10c4ea60 --map" "$1/calls"' _ "$T/m3"
+check "USB mappings of an earlier kit are in the cluster (for the other node, for this one): none is read into the new VM, none is changed" bash -c '! grep -q "^pvesh \(create\|set\) /cluster/mapping" "$1/calls" && grep "^qm create" "$1/calls" | grep -q -- "--usb0 host=10c4:ea70 --usb1 host=10c4:ea60 "' _ "$T/m3"
 node "$T/m4" twins; zvm "$T/m4" "${BASE[@]}" --run
-check "two sticks of the same model: one mapping each, told apart by their port" bash -c 'grep -q "^pvesh create /cluster/mapping/usb --id zradio-10c4ea60-1 --map node=nodea,id=10c4:ea60,path=1-3.2.1 " "$1/calls" && grep -q "^pvesh create /cluster/mapping/usb --id zradio-10c4ea60-2 --map node=nodea,id=10c4:ea60,path=1-3.2.4 " "$1/calls" && grep "^qm create" "$1/calls" | grep -q -- "--usb0 mapping=zradio-10c4ea60-1 --usb1 mapping=zradio-10c4ea60-2"' _ "$T/m4"
+check "two sticks of the same model: an id cannot tell them apart, so each is named by its socket, and that is said" bash -c 'grep "^qm create" "$1/calls" | grep -q -- "--usb0 host=1-3.2.1 --usb1 host=1-3.2.4 " && grep -q "OK    10c4:ea60 at 1-3.2.1: zr2 gets it by its socket (host=1-3.2.1), because 2 sticks here have that id. It has to stay in that socket" "$1/out" && ! grep -q "^pvesh create" "$1/calls"' _ "$T/m4"
 node "$T/m5" none; zvm "$T/m5" "${BASE[@]}" --run
 check "no stick at all: refused, nothing changed" bash -c '[ "$2" = 1 ] && grep -q "no stick on nodea" "$1/out" && [ ! -s "$1/calls" ]' _ "$T/m5" "$RC"
 zvm "$T/m5" "${BASE[@]}" --run --allow-no-radios
@@ -271,7 +290,7 @@ echo '[{"vmid":108,"name":"old2","node":"nodea","status":"stopped"}]' > "$T/x3/v
 check "…the same VM stopped (the one this VM replaces): said, and the build goes on" bash -c '[ "$2" = 0 ] && grep -q "NOTE  old2 (stopped) is configured with 10.20.30.6 too: it must stay stopped" "$1/out" && grep -q "^qm create" "$1/calls"' _ "$T/x3" "$RC"
 node "$T/x4"; cp "$T/m/usbmap.json" "$T/x4/usbmap.json"; echo '[{"vmid":108,"name":"old2","node":"nodea","status":"running"}]' > "$T/x4/vms.json"; vmconf "$T/x4" nodea/108 "usb0: mapping=zwave" "usb1: mapping=zigbee"
 zvm "$T/x4" "${BASE[@]}" --usb-mapping zwave --usb-mapping zigbee --run
-check "a RUNNING VM on this node passes the same mapping through: refused (two VMs on one stick)" bash -c '[ "$2" = 1 ] && grep -c "the running VM old2 on nodea has the USB device 10c4:ea.0 (mapping z[a-z]* here) passed through already" "$1/out" | grep -qx 2 && [ ! -s "$1/calls" ]' _ "$T/x4" "$RC"
+check "a RUNNING VM on this node passes the same mapping through: refused (two VMs on one stick)" bash -c '[ "$2" = 1 ] && grep -c "the running VM old2 on nodea has the USB device 10c4:ea.0 (mapping=z[a-z]* here) passed through already" "$1/out" | grep -qx 2 && [ ! -s "$1/calls" ]' _ "$T/x4" "$RC"
 zvm "$T/x4" "${BASE[@]}" --run
 check "…and so is building with the kit's OWN mappings while that VM runs on the same sticks under other mapping names" bash -c '[ "$2" = 1 ] && grep -c "the running VM old2 on nodea has the USB device" "$1/out" | grep -qx 2 && [ ! -s "$1/calls" ]' _ "$T/x4" "$RC"
 vmconf "$T/x4" nodea/108 "usb0: host=10C4:EA70" "usb1: host=1-9"; zvm "$T/x4" "${BASE[@]}" --run
@@ -293,7 +312,7 @@ echo '[{"storage":"local","type":"dir","content":"images,iso"},{"storage":"local
 check "a snippets storage without a folder: refused, nothing changed" bash -c '[ "$2" = 1 ] && grep -q "has no folder for the cloud-init file (snippets): name one that has, with --snippets" "$1/out" && [ ! -s "$1/calls" ]' _ "$T/x6" "$RC"
 node "$T/x7"; : > "$T/x7/keys"; zvm "$T/x7" "${BASE[@]}" --run
 check "no public key for root: refused (the VM would have no way in)" bash -c '[ "$2" = 1 ] && grep -q "no public key in" "$1/out" && [ ! -s "$1/calls" ]' _ "$T/x7" "$RC"
-for bad in "--name Zr2" "--self 10.20.30.6" "--peer 10.20.30.6" "--vip 10.20.30.5/24" "--vrid 0" "--priority 255" "--conf NAME=x" "--conf lower=1" "--conf ELECTON=act" "--hookscript /root/hook.sh" "--disk 8"; do
+for bad in "--name Zr2" "--self 10.20.30.6" "--peer 10.20.30.6" "--vip 10.20.30.5/24" "--vrid 0" "--priority 255" "--conf NAME=x" "--conf lower=1" "--conf ELECTON=act" "--stick-power front-left" "--stick-power 1-3:2 --no-stick-power" "--disk 8"; do
   node "$T/a"; zvm "$T/a" "${BASE[@]}" $bad --run
   check "refused before anything: $bad" bash -c '[ "$2" = 2 ] && grep -q "^die: " "$1/out" && [ ! -s "$1/calls" ]' _ "$T/a" "$RC"
 done
@@ -373,7 +392,7 @@ check "a VM tagged as not finished on this node: refused with how to remove it; 
 zvm "$T/v2" --run
 check "…and the bare command does not take it for a radio VM to update" bash -c '[ "$2" = 2 ] && ! grep -q "an update to" "$1/out" && grep -q "an earlier run did not finish" "$1/out"' _ "$T/v2" "$RC"
 node "$T/v3"; echo 1 > "$T/v3/install.rc"; zvm "$T/v3" "${BASE[@]}" --run
-check "the kit's installer fails in the new VM: exit 1, the VM keeps the not-finished tag, and the run ends with how to start over" bash -c '[ "$2" = 1 ] && ! grep -q "^qm set 109 --tags zradio$" "$1/calls" && [ "$(tail -1 "$1/out")" = "== zr2 (109) was not finished: nothing updates it or pairs with it as it is. To start over: qm stop 109; qm destroy 109 --purge; rm $1/store/snippets/zr2-zradio.yaml; then this again ==" ]' _ "$T/v3" "$RC"
+check "the kit's installer fails in the new VM: exit 1, the VM keeps the not-finished tag, and the run ends with how to start over" bash -c '[ "$2" = 1 ] && ! grep -q "^qm set 109 --tags zradio$" "$1/calls" && [ "$(tail -1 "$1/out")" = "== zr2 (109) was not finished: nothing updates it or pairs with it as it is. To start over: qm stop 109; qm destroy 109 --purge; rm -f $1/store/snippets/zr2-zradio.yaml $1/store/snippets/zradio-hook-109.conf; then this again ==" ]' _ "$T/v3" "$RC"
 node "$T/v4"; zvm "$T/v4" "${BASE[@]}"
 check "a report-only run ends without that line: nothing was made" bash -c '[ "$2" = 0 ] && ! grep -q "was not finished" "$1/out"' _ "$T/v4" "$RC"
 

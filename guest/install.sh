@@ -382,6 +382,12 @@ if [ -e "$WDOG" ]; then
   printf '# zradio (install.sh): systemd feeds the VM'"'"'s watchdog; a hung VM is reset after %s s\n[Manager]\nRuntimeWatchdogSec=%ss\n' "$WATCHDOG_S" "$WATCHDOG_S" > "$TMP/watchdog"
   put "$TMP/watchdog" /etc/systemd/system.conf.d/90-zradio-watchdog.conf 644
 else ok "no watchdog device ($WDOG): a hung machine is not reset by one (a radio VM the node made has one)"; fi
+# A stick that appears (plugged in, its port switched on again, its USB device given back to the driver) powers up with
+# its receiver on: zradio-serve hush silences it at once, and takes back a request for its power. A no-op on a VM that serves.
+printf '%s\n' '# zradio (install.sh): a USB serial port that appears is a radio stick coming back: zradio-serve hush looks at it at once' \
+  'ACTION=="add", SUBSYSTEM=="tty", KERNEL=="ttyUSB*|ttyACM*", TAG+="systemd", ENV{SYSTEMD_WANTS}+="zradio-hush.service"' > "$TMP/hushrule"
+put "$TMP/hushrule" /etc/udev/rules.d/99-zradio-hush.rules 644
+if [ $RUN = 1 ] && [ -z "$R" ] && [[ " $CHANGED " == *" /etc/udev/rules.d/99-zradio-hush.rules "* ]]; then udevadm control --reload >/dev/null 2>&1 || warn "udevadm control --reload failed: the new rule is read at the next boot"; fi
 if [ $RUN = 1 ]; then
   systemctl daemon-reload && systemctl enable zradio.target zradio-quiet.service keepalived.service zradio-sync.timer zradio-sync-tick.timer zradio-state.timer zradio-change-watch.service zradio-gate.service >/dev/null 2>&1 \
     && done_ "enabled: zradio-quiet (silent sticks at boot), keepalived, the nightly sync ($SYNC_AT${SYNC_TZ:+ $SYNC_TZ}), the 15-min tick, the state line, the device-change watcher, the election's gate (ELECTION=$ELECTION) — nothing started" \

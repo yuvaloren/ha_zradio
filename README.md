@@ -22,8 +22,16 @@ It asks a few questions, shows what it will do, and does it after a `y`. Then ru
 it finds the first VM, takes the pair's addresses and settings from it, and sets up the keys between the two. At the end it prints the
 addresses to enter in Home Assistant.
 
-**To update**, run the same line again on either node. It finds the pair, says which kit each VM runs, and updates
-the ones that need it (or says they are up to date) after a `y`. The radios keep running.
+**To update**, run the same line again, on each node. It finds the pair, says which kit each VM runs, and updates
+the ones that need it (or says they are up to date) after a `y`; and it brings that node's hookscript up to date.
+The radios keep running.
+
+A radio VM starts with or without its sticks: its hookscript gives them a minute to be on the node's USB, and
+Proxmox passes a stick through whenever it appears. A stick that stops answering is handed over first and healed
+second: the other VM takes the radios, and this one tries a soft reset, a USB re-bind and, last, a power cycle.
+Only the node can switch a stick's power, so name the hub port(s) the sticks hang off: `--stick-power HUB:PORT`
+(`./install.sh --sticks` lists them). The hookscript then switches them on before the VM starts, off after it stops,
+and off and on when the VM asks (docs/DESIGN.md, "The start, the sticks' power, and a stick that stays away").
 
 Each VM gets its own address from DHCP, and the pair knows it by that address from then on. **Reserve it in your
 DHCP server** (the VM's install ends with the address and the MAC). A VM whose address changes stops serving until it has
@@ -155,7 +163,8 @@ Measured on the pair this kit was extracted from (about 50 Z-Wave nodes):
 
 - [docs/DESIGN.md](docs/DESIGN.md): how it works and why, every option, what is not built, what has run where.
 - Versions: a release is a GitHub release of a git tag; the installers stamp each VM with the kit it runs
-  (docs/DESIGN.md, "Updating"). Another version than the latest: `ZRADIO_REF=<tag or branch>` before the install line.
+  (docs/DESIGN.md, "Updating"). The latest `main` instead of the latest release: `--main` right after the install
+  line's `_` (`bash -c "$(curl -fsSL …/get.sh)" _ --main`); any other version: `--ref <tag or branch>` there.
 - Tests: `bash tests/run.sh` on Linux, `bash tests/docker.sh` anywhere else (macOS lacks the GNU tools they need).
   No hardware needed; they also run on every push (`.github/workflows/tests.yml`). `bash tests/vote-real.sh` (needs
   docker) tests the third vote's container with the real programs, `bash tests/vote-bash.sh` its script under the

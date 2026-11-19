@@ -403,4 +403,52 @@ check "up --force (a person who knows why): served without the address" bash -c 
 echo "-- zradio-notify: a change of state starts the health check's count again"
 host "$T/nu"; : > "$T/nu/run/unserved-since"; notify "$T/nu" INSTANCE RADIO MASTER 100
 check "the noted moment of an earlier time without serving is gone with the new state" bash -c '[ ! -e "$1/run/unserved-since" ]' _ "$T/nu"
+
+echo "-- a stick that does not answer on a VM that does not serve: healed rung by rung (soft reset, USB re-bind, the node's power)"
+# knobs for the probe stub: <dir>/soft-heals (a --soft-reset makes the Z-Wave stick answer again); the fake sleep makes
+# it answer once its USB device was taken from the driver (<dir>/usb-heals); <dir>/zb-dead: the coordinator answers
+# nothing; <dir>/sys is the VM's /sys
+heal_host() { # heal_host <dir> [rf] [zb]: a standby whose sticks have USB devices behind their ttys
+  host "$1" 0 "${2:-fail}" "${3:-0}"; mkdir -p "$1/state" "$1/sys/bus/usb/drivers/usb" "$1/sys/class/tty/zwave" "$1/sys/class/tty/zigbee" \
+    "$1/sys/devices/usb1/1-2/1-2:1.0/ttyUSB0" "$1/sys/devices/usb1/1-3/1-3:1.0/ttyUSB1"
+  echo 10c4 > "$1/sys/devices/usb1/1-2/idVendor"; echo 10c4 > "$1/sys/devices/usb1/1-3/idVendor"
+  ln -s "$1/sys/devices/usb1/1-2/1-2:1.0/ttyUSB0" "$1/sys/class/tty/zwave/device"; ln -s "$1/sys/devices/usb1/1-3/1-3:1.0/ttyUSB1" "$1/sys/class/tty/zigbee/device"
+  : > "$1/sys/bus/usb/drivers/usb/unbind"; : > "$1/sys/bus/usb/drivers/usb/bind"; echo 0 > "$1/zb-ro"
+  sed -i "1i import os, sys\nif '--soft-reset' in sys.argv and os.path.exists('$1/soft-heals'): open('$1/rf', 'w').write('ok')\nif '--zigbee' in sys.argv and os.path.exists('$1/zb-dead'): print('   FAIL  Zigbee on /dev/zradio-zigbee: no answer', file=sys.stderr); sys.exit(1)" "$1/probe.py"
+  fake "$1/bin" sleep "[ ! -e '$1/usb-heals' ] || [ \"\$(cat '$1/sys/bus/usb/drivers/usb/unbind')\" != 1-2 ] || echo ok > '$1/rf'"
+}
+hserve() { local d=$1; shift; ZRADIO_SERVE_SYSFS="$d/sys" serve "$d" "$@"; }
+heal_host "$T/h1"; : > "$T/h1/soft-heals"; hserve "$T/h1" hush
+check "the Z-Wave stick is silent, a soft reset brings it back: exit 0, said, and nothing else is tried" bash -c '[ "$2" = 0 ] && grep -q "event=serve result=healed stick=zwave by=soft-reset" "$1/journal" && grep -q "zradio-probe.py --zwave .* --soft-reset --json" "$1/calls" && [ ! -s "$1/sys/bus/usb/drivers/usb/unbind" ] && [ ! -e "$1/state/want-power" ] && ! grep -q "result=loud" "$1/journal"' _ "$T/h1" "$RC"
+heal_host "$T/h2"; : > "$T/h2/usb-heals"; hserve "$T/h2" hush
+check "a soft reset does not, its USB device taken from the driver and given back does: exit 0, said" bash -c '[ "$2" = 0 ] && [ "$(cat "$1/sys/bus/usb/drivers/usb/unbind")" = 1-2 ] && [ "$(cat "$1/sys/bus/usb/drivers/usb/bind")" = 1-2 ] && grep -q "result=healed stick=zwave by=usb-rebind" "$1/journal" && [ ! -e "$1/state/want-power" ]' _ "$T/h2" "$RC"
+heal_host "$T/h3"; hserve "$T/h3" hush
+check "neither does: the node is asked for the sticks' power (want-power names the stick), said once, exit 1 and the loud line" bash -c '[ "$2" = 1 ] && grep -q "^zwave [0-9]*$" "$1/state/want-power" && grep -q "result=heal-ask stick=zwave — it does not answer after a soft reset and a USB re-bind" "$1/journal" && grep -q "result=loud step=zwave-receiver" "$1/journal"' _ "$T/h3" "$RC"
+W=$(cat "$T/h3/state/want-power"); hserve "$T/h3" hush
+check "…the next look does not ask again: the same request stands" bash -c '[ "$(cat "$1/state/want-power")" = "$2" ] && [ "$(grep -c "result=heal-ask" "$1/journal")" = 1 ]' _ "$T/h3" "$W"
+hserve "$T/h3" power-wanted
+check "power-wanted, as the node's helper asks it: WANT, the stick, since when" bash -c '[ "$2" = 0 ] && grep -qx "WANT stick=zwave since=[0-9]*" "$1/out"' _ "$T/h3" "$RC"
+echo "MASTER 2026-11-18T00:00:00Z" > "$T/h3/run/role"; hserve "$T/h3" power-wanted
+check "…never on a VM that serves or is about to: NO" bash -c 'grep -qx "NO" "$1/out"' _ "$T/h3"
+rm -f "$T/h3/run/role"; hserve "$T/h3" power-done
+check "power-done: the moment is kept and said" bash -c '[ "$2" = 0 ] && grep -q "^[0-9]*$" "$1/state/power-cycled" && grep -q "result=power-cycled the node switched the sticks. power off and on" "$1/journal"' _ "$T/h3" "$RC"
+echo ok > "$T/h3/rf"; echo "zwave x" > "$T/h3/state/stick-wedged"; hserve "$T/h3" hush
+check "after it the stick answers: the request is withdrawn, stick-wedged goes, and the journal says what brought it back" bash -c '[ "$2" = 0 ] && [ ! -e "$1/state/want-power" ] && [ ! -e "$1/state/stick-wedged" ] && grep -q "result=healed stick=zwave by=power-cycle" "$1/journal"' _ "$T/h3" "$RC"
+heal_host "$T/h4" ok; : > "$T/h4/zb-dead"; hserve "$T/h4" hush
+check "the Zigbee coordinator does not answer a read and not its reset: asked for too" bash -c '[ "$2" = 1 ] && grep -q "^zigbee [0-9]*$" "$1/state/want-power" && [ "$(cat "$1/sys/bus/usb/drivers/usb/unbind")" = 1-3 ]' _ "$T/h4" "$RC"
+heal_host "$T/h5"; printf '%s\n' "$(date +%s)" "$(date +%s)" "$(date +%s)" "$(date +%s)" > "$T/h5/state/heal-usb-zwave"; hserve "$T/h5" hush
+check "four USB re-binds of a stick in 24 hours are the limit: the fifth is not made, the node is asked" bash -c '[ ! -s "$1/sys/bus/usb/drivers/usb/unbind" ] && [ -e "$1/state/want-power" ]' _ "$T/h5"
+heal_host "$T/h6" ok; echo "MASTER 2026-11-18T00:00:00Z" > "$T/h6/run/role"; echo fail > "$T/h6/rf"; hserve "$T/h6" hush
+check "a VM that serves or is about to: hush does nothing, so nothing is reset under Home Assistant" bash -c '[ ! -s "$1/calls" ] && [ ! -e "$1/state/want-power" ]' _ "$T/h6"
+echo "-- a stick whose tty is missing: after 5 minutes the node is asked for its power (a hub that did not come back)"
+heal_host "$T/m1" ok; rm -f "$T/m1/dev/zwave"; hserve "$T/m1" down
+check "down at boot without the Z-Wave tty: the moment is noted" bash -c 'grep -q "^[0-9]*$" "$1/state/missing-since"' _ "$T/m1"
+hserve "$T/m1" hush
+check "…a look right after: not asked yet" bash -c '[ ! -e "$1/state/want-power" ]' _ "$T/m1"
+echo $(( $(date +%s) - 301 )) > "$T/m1/state/missing-since"; hserve "$T/m1" hush
+check "…301 s later: asked, and the request names the stick that is missing" bash -c 'grep -q "^zwave [0-9]*$" "$1/state/want-power" && grep -q "result=heal-ask stick=zwave — no tty for .*/dev/zwave for 30[0-9] s" "$1/journal"' _ "$T/m1"
+: > "$T/m1/dev/zwave"; hserve "$T/m1" hush
+check "the tty is back and the stick answers: the request and the noted moment are gone" bash -c '[ ! -e "$1/state/want-power" ] && [ ! -e "$1/state/missing-since" ] && grep -q "result=healed stick=zwave" "$1/journal"' _ "$T/m1"
+hserve "$T/m1" status
+check "status names a standing request" bash -c ': > "$1/state/want-power"; echo "zigbee 1795000000" > "$1/state/want-power"; ZRADIO_SERVE_SYSFS="$1/sys" PATH="$1/bin:$PATH" ZRADIO_SERVE_RUN="$1/run" ZRADIO_SERVE_STATE="$1/state" ZRADIO_RADIOS="$1/radios.conf" bash "$2" status | grep -q "want-power (zigbee 1795000000: this VM asks its node"' _ "$T/m1" "$SERVE"
 finish

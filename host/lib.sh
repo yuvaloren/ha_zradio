@@ -99,6 +99,138 @@ show_sticks() { # the sticks of this node that the kit's table names, one per li
   done <<< "$S"
 }
 
+# --------------------------------------------------------------------- the VM's hookscript, and the sticks' power
+# host/hook.sh is every radio VM's hookscript: it lets the VM start only once its sticks are on the node's USB, and
+# switches their ports' power where --stick-power names the ports (docs/DESIGN.md, "The start, and the sticks'
+# power"). A copy per node, in the snippets storage, and per VM a conf beside it.
+HOOK_FILE=zradio-hook.sh
+port_ok() { [[ "$1" =~ ^[0-9]+(-[0-9]+(\.[0-9]+)*)?:[0-9]+$ ]]; }       # hub:port as uhubctl names them: 1-3:2, or 1:4 on a root hub
+port_dir() { # port_dir <hub:port>: the kernel's folder for that port, which holds its switch (`disable`); 1 when there is none
+  local h=${1%:*} p=${1##*:}
+  if [[ "$h" == *-* ]]; then set -- "$SYS/$h":*/"$h-port$p"; else set -- "$SYS/$h-0":*/"usb$h-port$p"; fi
+  [ -e "$1/disable" ] && echo "$1"
+}
+peer_of() { # peer_of <hub:port>: the same socket's port on the hub's other face (USB 2 / USB 3), where the kernel knows it
+  local d b
+  d=$(port_dir "$1") && [ -e "$d/peer" ] || return 1
+  b=$(basename "$(readlink -f "$d/peer")"); b=${b#usb}
+  [[ "$b" =~ ^(.+)-port([0-9]+)$ ]] && echo "${BASH_REMATCH[1]}:${BASH_REMATCH[2]}"
+}
+below() { # below <hub:port> <bus-port>: the device at that bus-port hangs off that port
+  local h=${1%:*} at
+  if [[ "$h" == *-* ]]; then at="$h.${1##*:}"; else at="$h-${1##*:}"; fi
+  [ "$2" = "$at" ] || [[ "$2" == "$at".* ]]
+}
+ports_above() { # ports_above <bus-port>: the hub ports a device hangs off, nearest first (1-3.2.1: 1-3.2:1 1-3:2 1:3)
+  local d=$1 out=""
+  while [[ "$d" == *.* ]]; do out="$out${d%.*}:${d##*.} "; d=${d%.*}; done
+  echo "$out${d%-*}:${d##*-}"
+}
+vm_sticks() { # vm_sticks <vmid>: where the sticks of that VM of this node are on the bus now, one bus-port per line
+  local line v id path
+  while read -r line; do
+    case "$line" in
+      *mapping=*) v=${line##*mapping=}; v=${v%%,*}; read -r id path <<< "$(mappings | awk -v m="$v" -v n="$NODE" '$1 == m && $2 == n { print $3, $4; exit }')";;
+      *host=*) v=${line##*host=}; v=${v%%,*}; v=${v//0x/}; if [[ "$v" == *:* ]]; then id=${v,,} path=-; else id=- path=$v; fi;;
+      *) continue;;
+    esac
+    [ -n "$id" ] || continue
+    if [ "$path" != - ]; then [ ! -e "$SYS/$path/idVendor" ] || echo "$path"
+    else sticks_at "$id"; fi
+  done < <(sed -n '/^\[/q; /^usb[0-9]*:/p' "$PVE/nodes/$NODE/qemu-server/$1.conf" 2>/dev/null)
+}
+sticks_at() { # sticks_at <vid:pid>: the bus-ports of this node's USB devices with that id
+  local d
+  for d in "$SYS"/*; do
+    [ -r "$d/idVendor" ] && [ "$(cat "$d/idVendor"):$(cat "$d/idProduct" 2>/dev/null)" = "$1" ] && echo "${d##*/}"
+  done
+  return 0
+}
+power_check() { # power_check <name> <the sticks' bus-ports, one per line>: --stick-power's ports, checked and completed
+  # (POWER). Nothing is changed. A port that is off now hides what is below it: its sticks cannot be looked at.
+  local p q s off=0 n=${#POWER[@]}
+  [ "$n" -gt 0 ] || return 0
+  for p in "${POWER[@]}"; do
+    port_ok "$p" || { bad "--stick-power '$p': hub:port as uhubctl names them, like 1-3:2"; continue; }
+    q=$(port_dir "$p") || { bad "--stick-power $p: no such port on $NODE that the kernel can switch (no $SYS/…-port${p##*:}/disable: its hub is not there, or the kernel is older than 6.0)"; continue; }
+    [ "$(cat "$q/disable" 2>/dev/null)" != 1 ] || { off=1; warn "the port $p is switched off now: the hookscript switches it on before $1 starts"; }
+    if q=$(peer_of "$p") && [[ " ${POWER[*]} " != *" $q "* ]]; then POWER+=("$q"); ok "the port $p is $q on its hub's other face (USB 2 / USB 3): both are switched"; fi
+  done
+  [ $FAILS -eq 0 ] || return 0
+  while read -r s; do
+    [ -n "$s" ] || continue
+    for p in "${POWER[@]}"; do ! below "$p" "$s" || continue 2; done
+    bad "--stick-power ${POWER[*]}: the stick at $s is below none of them (it hangs off: $(ports_above "$s")). Its power would stay on"
+  done <<< "$2"
+  [ -n "$2" ] || [ $off = 1 ] || warn "--stick-power: none of $1's sticks is on $NODE's USB now, so whether they hang off ${POWER[*]} was not looked at"
+  [ ${#POWER[@]} -ne 1 ] || warn "--stick-power ${POWER[0]}: one port. A USB 3 hub is two hubs (uhubctl lists both), and its port goes dark only when it is switched on both: name the other one too if this is such a hub"
+  ok "stick power: $1's hookscript switches ${POWER[*]} on before a start and off after a stop, and off and on when $1 asks (a stick that stays silent)"
+}
+usb_host_lines() { # usb_host_lines <vmid> <name> <the VM runs: yes|no>: a stick the VM names through one of the kit's own USB
+  # mappings (zradio-<vid><pid>, as kit 0.1.0 made them) is named directly instead (host=). Proxmox checks a mapping at
+  # every start and refuses the start while the stick is absent; a stick named by host= is passed through when it
+  # appears, and the VM starts without it. Only on a stopped VM: on a running one the change would unplug the stick.
+  # USB_CHANGES: lines changed or to change; USB_LEFT: lines left because the VM runs.
+  local id=$1 name=$2 line key val v mid mpath spec
+  USB_CHANGES=0; USB_LEFT=0
+  while read -r line; do
+    key=${line%%:*}; val=${line#*: }; v=${val##*mapping=}; v=${v%%,*}
+    [[ "$v" =~ ^zradio-[0-9a-f]{8}(-[0-9]+)?$ ]] || { warn "$name's $key is the USB mapping $v, which the kit did not make: left as it is. Proxmox refuses a start of $name while that stick is not on $NODE"; continue; }
+    read -r mid mpath <<< "$(mappings | awk -v m="$v" -v n="$NODE" '$1 == m && $2 == n { print $3, $4; exit }')"
+    [ -n "$mid" ] || { warn "$name's $key: the USB mapping $v has no entry for $NODE: left as it is"; continue; }
+    if [ "$mpath" != - ]; then spec="host=$mpath"; else spec="host=$mid"; fi
+    if [ "$3" = yes ]; then USB_LEFT=$((USB_LEFT + 1)); continue; fi
+    USB_CHANGES=$((USB_CHANGES + 1))
+    do_ qm set "$id" "--$key" "${val/mapping=$v/$spec}" || return 1
+  done < <(sed -n '/^\[/q; /^usb[0-9]*:.*mapping=/p' "$PVE/nodes/$NODE/qemu-server/$id.conf" 2>/dev/null)
+  [ $USB_LEFT = 0 ] || warn "$name names $USB_LEFT stick(s) through USB mappings and runs: Proxmox will refuse its next start if a stick is not on $NODE then. This installer names them directly (host=) while $name is stopped: qm shutdown $id, then ./install.sh again, then qm start $id — the VM that does not serve first"
+  [ $USB_CHANGES -gt 0 ] || [ $USB_LEFT -gt 0 ] || ok "$name's sticks are named directly (host=): it starts with or without them"
+}
+helper_setup() { # helper_setup <vmid> <name> <the VM runs: yes|no> <stick power: yes|no>: the hookscript's helper for a VM that
+  # runs already (a VM that starts gets it from its post-start). Started when it is not there; started again on a new hookscript.
+  [ "$3" = yes ] && [ "$4" = yes ] || return 0
+  local unit="zradio-heal-$1.service"
+  if systemctl is-active --quiet "$unit" 2>/dev/null && [ "${HOOK_FILE_NEW:-0}" = 0 ]; then ok "$2's helper runs on $NODE ($unit): it switches the sticks' power when $2 asks"; return 0; fi
+  HOOK_CHANGES=$((HOOK_CHANGES + 1))
+  if [ "$RUN" = 1 ]; then
+    systemctl stop "$unit" 2>/dev/null || true
+    "$SNIPDIR/$HOOK_FILE" "$1" post-start >/dev/null 2>&1
+    if systemctl is-active --quiet "$unit" 2>/dev/null; then done_ "$2's helper on $NODE ($unit): it switches the sticks' power off and on when $2 asks"
+    else warn "$2's helper did not start on $NODE ($SNIPDIR/$HOOK_FILE $1 post-start; journalctl -t zradio): until $2's next start, its sticks' power is not switched when it asks"; fi
+  else would "start $2's helper on $NODE ($unit): it switches the sticks' power off and on when $2 asks, 3 times a day at most"; fi
+}
+hook_setup() { # hook_setup <vmid> <name> <attach: yes|no>: this node's copy of the hookscript, the VM's stick power, and the
+  # hook on the VM (no: qm create attaches it). Needs SNIP and SNIPDIR. Counts in HOOK_CHANGES what was not as it should be.
+  local id=$1 name=$2 conf="$SNIPDIR/zradio-hook-$1.conf" have want keep
+  HOOK_CHANGES=0; HOOK_FILE_NEW=0
+  if cmp -s "$KIT/host/hook.sh" "$SNIPDIR/$HOOK_FILE" && [ -x "$SNIPDIR/$HOOK_FILE" ]; then ok "the kit's hookscript is on $NODE: $SNIPDIR/$HOOK_FILE"
+  else HOOK_CHANGES=$((HOOK_CHANGES + 1)); HOOK_FILE_NEW=1
+    if [ "$RUN" = 1 ]; then
+      mkdir -p "$SNIPDIR" && install -m 0755 "$KIT/host/hook.sh" "$SNIPDIR/$HOOK_FILE.tmp" && mv -f "$SNIPDIR/$HOOK_FILE.tmp" "$SNIPDIR/$HOOK_FILE" \
+        && done_ "the kit's hookscript on $NODE: $SNIPDIR/$HOOK_FILE" || { bad "could not write $SNIPDIR/$HOOK_FILE"; return 1; }
+    else would "put the kit's hookscript on $NODE: $SNIPDIR/$HOOK_FILE (before each start it gives $name's sticks a minute to be on the USB)"; fi
+  fi
+  have=$(sed -n 's/^POWER_PORTS=//p' "$conf" 2>/dev/null | tail -1)
+  if [ ${#POWER[@]} -gt 0 ]; then want="${POWER[*]}"; elif [ "$NOPOWER" = 1 ]; then want=""; else want=$have; fi
+  if [ "$want" = "$have" ]; then
+    ok "stick power: $([ -n "$have" ] && echo "$name's ports are $have ($conf)" || echo "none for $name: its sticks' ports stay as they are (--stick-power HUB:PORT names the ports to switch)")"
+  else HOOK_CHANGES=$((HOOK_CHANGES + 1))
+    if [ "$RUN" = 1 ]; then
+      keep=$(grep -vE '^(POWER_PORTS=|# )' "$conf" 2>/dev/null)          # WAIT and CYCLE_AFTER, when someone set them
+      { echo "# $name's stick power: written by ha_zradio's install.sh on $NODE, read by $HOOK_FILE (its header has the keys)"
+        [ -z "$want" ] || echo "POWER_PORTS=$want"; [ -z "$keep" ] || printf '%s\n' "$keep"; } > "$conf.tmp" && mv -f "$conf.tmp" "$conf" \
+        && done_ "$conf: $([ -n "$want" ] && echo "POWER_PORTS=$want" || echo "no stick power")" || { bad "could not write $conf"; return 1; }
+    else would "write $conf: $([ -n "$want" ] && echo "POWER_PORTS=$want" || echo "no stick power (was: $have)")"; fi
+  fi
+  [ "$3" = yes ] || return 0
+  have=$(sed -n '/^\[/q; s/^hookscript: *//p' "$PVE/nodes/$NODE/qemu-server/$id.conf" 2>/dev/null | head -1)
+  if [ "$have" = "$SNIP:snippets/$HOOK_FILE" ]; then ok "$name has the kit's hookscript"
+  else HOOK_CHANGES=$((HOOK_CHANGES + 1))
+    [ -z "$have" ] || warn "$name has another hookscript, $have: the kit's takes its place (a VM has one)"
+    do_ qm set "$id" --hookscript "$SNIP:snippets/$HOOK_FILE" || return 1
+  fi
+}
+
 # ------------------------------------------------------------------------------------------------- the votes
 # (A third vote is set up by host/qdevice.sh: ./install.sh --third-vote.)
 # The kit does not use Proxmox HA: the pair decides itself which VM serves, and HA's one use here (restarting a VM on

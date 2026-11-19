@@ -134,9 +134,12 @@ check "ZNP: frames of 5+ bytes count, the coordinator silent 3 min: wedged" eq "
 check "a stick this process never heard answer is never judged (the 2026-11-11 incident: the capture saw no answers at all)" eq "$(wt \
   '0 host zigbee 9' '30 host zigbee 9' '60 host zigbee 9' '90 host zigbee 9' '120 host zigbee 9' '150 host zigbee 9' '400 check')" "400: nothing;"
 
-echo "-- the declaration: observe by default; armed: the marker zradio-serve check fails on, one loud line, a limit of two a day"
-env_ "$T/w0"; PATH="$T/w0/bin:$PATH" ZRADIO_CHANGE_STATE="$T/w0/state" ZRADIO_CHANGE_RUN="$T/w0/run" python3 "$TOOL" declare-test zwave 7 190 > "$T/w0/out" 2>&1
-check "observe mode (the default): False, no marker, one would-wedge line that is not loud" bash -c 'grep -q "^False$" "$1/out" &&
+echo "-- the declaration: the marker zradio-serve check fails on, one loud line, a limit of two a day; no setting for it"
+env_ "$T/w00"; PATH="$T/w00/bin:$PATH" ZRADIO_CHANGE_STATE="$T/w00/state" ZRADIO_CHANGE_RUN="$T/w00/run" python3 "$TOOL" declare-test zwave 7 190 > "$T/w00/out" 2>&1
+check "with nothing set, the check is on: True, and stick-wedged is written" bash -c 'grep -q "^True$" "$1/out" && grep -q "^zwave 20" "$1/state/stick-wedged" && grep -q "result=loud wedged stick=zwave" "$1/journal"' _ "$T/w00"
+check "…and its line says what comes next: zradio-serve hush tries to bring the stick back" bash -c 'grep -q "zradio-serve hush now tries to bring the stick back (a soft reset, a USB re-bind, then its power through the node)" "$1/journal"' _ "$T/w00"
+env_ "$T/w0"; PATH="$T/w0/bin:$PATH" ZRADIO_CHANGE_WEDGE=observe ZRADIO_CHANGE_STATE="$T/w0/state" ZRADIO_CHANGE_RUN="$T/w0/run" python3 "$TOOL" declare-test zwave 7 190 > "$T/w0/out" 2>&1
+check "ZRADIO_CHANGE_WEDGE=observe in the unit's environment (a pair whose check misfires): False, no marker, one would-wedge line that is not loud" bash -c 'grep -q "^False$" "$1/out" &&
   [ ! -e "$1/state/stick-wedged" ] &&
   grep -q "event=change result=would-wedge stick=zwave — 7 requests unanswered for 190 s; observe mode" "$1/journal" &&
   ! grep -q "result=loud" "$1/journal"' _ "$T/w0"
@@ -162,7 +165,7 @@ SEEN_ADD="result=seen zwave add-node mode=1 — the standby is synced after 300 
 SEEN_REM="result=seen zwave remove-node mode=1 — the standby is synced after 300 quiet s;"
 sx() { # sx <dir> <stream-test lines…>: on the active, observe mode; what it said, as one line, in OUT
   local d=$1; shift; env_ "$d"
-  OUT=$(printf '%s\n' "$@" | PATH="$d/bin:$PATH" ZRADIO_CHANGE_STATE="$d/state" ZRADIO_CHANGE_RUN="$d/run" python3 "$TOOL" stream-test 2>&1 | tr '\n' ';'); }
+  OUT=$(printf '%s\n' "$@" | PATH="$d/bin:$PATH" ZRADIO_CHANGE_WEDGE=observe ZRADIO_CHANGE_STATE="$d/state" ZRADIO_CHANGE_RUN="$d/run" python3 "$TOOL" stream-test 2>&1 | tr '\n' ';'); }
 sx "$T/s1" "0 in $HA $ZW PA 1000 500 $ADD" "0.01 out $ZW $HA A 500 1007" "20 check"
 check "a connection that was open before the watcher started (no SYN seen): its first request counts, once" eq "$OUT" "$SEEN_ADD"
 check "…and change-seen is there" test -e "$T/s1/state/change-seen"

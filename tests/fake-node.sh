@@ -4,6 +4,9 @@
 # bridges are folders. The guest agent is real bash: a script install.sh sends into a VM is RUN, with the VM's paths
 # (/etc, /var, /root, /opt, /usr/local) turned into <dir>/g/<vmid>/root/… — so the scripts themselves are tested.
 #   node <dir> [sticks on nodea: both|zwave|none|twins|dark]      the cluster's votes: <dir>/votes ("<total> <quorum>")
+#   nodea's sticks hang off a hub in port 2 of a hub with two faces (1-3: USB 2, 2-4: USB 3), as on the reference
+#   pair's nodes; the kernel's switch for a port is <sys>/<hub>:1.0/<hub>-port<n>/disable (dark: 1-3's port 2 is off).
+#   qm set --hookscript and qm create --hookscript write the VM's hookscript line into its file under <dir>/pve.
 #   the Debian image: the cache holds the one the web's list names (nothing to download). Knobs, files in <dir>:
 #     web (the image the web has now, when it is another one), sum (the checksum its list gives instead of the
 #     true one), list-fail (the list cannot be read), image-fail (the image's download breaks off halfway)
@@ -26,6 +29,8 @@ node() {
     none|dark) ;;
   esac
   usb "$d/sys-nodeb" 2-1 10c4 ea70 "CP2105 Dual USB to UART Bridge Controller"; usb "$d/sys-nodeb" 2-2 10c4 ea60 "Sonoff Zigbee 3.0 USB Dongle Plus"
+  for s in 1-3:1.0/1-3-port2 2-4:1.0/2-4-port2 1-0:1.0/usb1-port4; do mkdir -p "$d/sys/$s"; echo 0 > "$d/sys/$s/disable"; done
+  [ "$sticks" != dark ] || echo 1 > "$d/sys/1-3:1.0/1-3-port2/disable"
   echo '[]' > "$d/usbmap.json"; echo '[]' > "$d/vms.json"
   echo '[{"storage":"local","type":"dir","content":"images,snippets,iso,vztmpl","path":"'"$d"'/store"},{"storage":"local-zfs","type":"zfspool","content":"images,rootdir"}]' > "$d/storages.json"
   echo image-from-the-web > "$d/cache/debian-13-generic-amd64.qcow2"; sha512sum < "$d/cache/debian-13-generic-amd64.qcow2" | cut -d' ' -f1 > "$d/cache/debian-13-generic-amd64.qcow2.sha512"
@@ -37,6 +42,10 @@ node() {
   echo "3 2" > "$d/votes"     # "<total votes> <quorum>": three votes by default; a test of two nodes without a third vote sets "2 2"
   fake "$d/bin" pvecm "case \"\$1\" in status) read -r t q < '$d/votes'; printf 'Expected votes:   %s\\nTotal votes:      %s\\nQuorum:           %s\\n' \"\$t\" \"\$t\" \"\$q\";; *) $rec;; esac"
   fake "$d/bin" pvesm "$rec"
+  # the hookscript's helper, a unit of the node: is-active says whether one runs (<dir>/helper-active), systemd-run starts it
+  fake "$d/bin" systemctl "case \"\$1\" in is-active) [ -e '$d/helper-active' ];; is-system-running) echo running;; stop) $rec; rm -f '$d/helper-active';; *) $rec;; esac"
+  fake "$d/bin" systemd-run "$rec; [ -f '$d/no-helper' ] || : > '$d/helper-active'"
+  fake "$d/bin" logger ':'
   fake "$d/bin" wget "$rec; out=\${*: -1}; web() { cat '$d/web' 2>/dev/null || echo image-from-the-web; }
     u=; for a; do case \"\$a\" in *://*) u=\$a;; esac; done      # the URL, wherever the options put it
     case \"\$u\" in
@@ -57,6 +66,12 @@ node() {
   # vmreg: in a live cluster, qm create / start show up in the cluster's own files, as on a real one
   cat > "$d/bin/vmreg" <<SH
 #!/usr/bin/env bash
+# a hookscript given to qm create or qm set is in the VM's file from then on, live or not: install.sh reads it there
+f="$d/pve/nodes/\${FAKE_NODE:-nodea}/qemu-server/\$2.conf"; i=3
+while [ \$i -lt \$# ]; do j=\$((i + 1)); [ "\${!i}" != --hookscript ] || { touch "\$f"; sed -i '/^hookscript:/d' "\$f"; echo "hookscript: \${!j}" >> "\$f"; }
+  # …and so is a usb line that qm set gives a VM
+  if [ "\$1" = set ] && [[ "\${!i}" =~ ^--(usb[0-9]+)\$ ]]; then touch "\$f"; sed -i "/^\${BASH_REMATCH[1]}:/d" "\$f"; echo "\${BASH_REMATCH[1]}: \${!j}" >> "\$f"; fi
+  i=\$j; done
 [ -f "$d/live" ] || exit 0
 python3 - "$d" "\${FAKE_NODE:-nodea}" "\$@" <<'PY'
 import json, sys
@@ -67,7 +82,7 @@ if verb == "create":
     vms.append({"vmid": vmid, "name": o["name"], "node": node, "status": "stopped", "tags": o.get("tags", ""), "type": "qemu"})
     with open("%s/pve/nodes/%s/qemu-server/%d.conf" % (d, node, vmid), "w") as f:
         for k, v in sorted(o.items()):
-            if k.startswith(("net", "ipconfig", "usb")) or k in ("name", "tags", "cicustom"): f.write("%s: %s\n" % (k, v))
+            if k.startswith(("net", "ipconfig", "usb")) or k in ("name", "tags", "cicustom", "hookscript"): f.write("%s: %s\n" % (k, v))
 elif verb == "set":
     o = dict(zip([a[2:] for a in rest[0::2]], rest[1::2]))
     for v in vms:

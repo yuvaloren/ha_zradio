@@ -157,7 +157,9 @@ if [ $DHCP = 0 ] && [ -z "$PAIR_BRIDGE" ]; then ip4 "$GATEWAY" || die "without -
 [ -z "$PAIR_MAC" ] || [[ "$PAIR_MAC" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]] || die "--pair-mac '$PAIR_MAC'"
 [ -z "$VMID" ] || { [[ "$VMID" =~ ^[0-9]{3,9}$ ]] && [ "$VMID" -ge 100 ]; } || die "--vmid '$VMID'"
 [[ "$MEMORY" =~ ^[0-9]{3,6}$ ]] && [[ "$CORES" =~ ^[0-9]{1,2}$ ]] && [[ "$DISK" =~ ^[0-9]+G$ ]] || die "--memory MB, --cores N, --disk <n>G"
-[ -z "$HOOK" ] || [[ "$HOOK" =~ ^[A-Za-z0-9_-]+:snippets/[A-Za-z0-9._-]+$ ]] || die "--hookscript '$HOOK': a volume id like local:snippets/my-hook.sh"
+for m in ${POWER[@]+"${POWER[@]}"}; do port_ok "$m" || die "--stick-power '$m': hub:port as uhubctl names them, like 1-3:2"; done
+[ $NOPOWER = 0 ] || [ ${#POWER[@]} -eq 0 ] || die "--stick-power and --no-stick-power contradict each other"
+[ $NOUSB = 0 ] || [ ${#POWER[@]} -eq 0 ] || die "--no-usb is a drill without sticks: there is no power to switch (--stick-power)"
 IMAGE_DIR=${IMAGE_DIR%/}
 [[ "$IMAGE_DIR" =~ ^(https?://|file:///)[][A-Za-z0-9._~:/@%+-]+$ ]] || die "--image-dir '$IMAGE_DIR': where the Debian image and its SHA512SUMS are — https://…, or file:///folder for a folder of this node"
 for m in ${USBMAPS[@]+"${USBMAPS[@]}"}; do [[ "$m" =~ ^[A-Za-z][A-Za-z0-9_-]{0,60}$ ]] || die "--usb-mapping '$m'"; done
@@ -260,9 +262,8 @@ vm_with_usb() { # vm_with_usb running|idle <vid:pid> [<bus-port>]: prints the na
   done
   return 1
 }
-USE=()            # the mapping ids the VM gets, in order
+USE=()            # the VM's usb lines, in order: host=<vid:pid>, host=<bus-port>, or mapping=<id> (--usb-mapping)
 DEVS=()           # the device behind each: "<vid:pid> <bus-port or ->"
-TODO=()           # "create <id> <vid:pid> <path|->" or "extend <id> <vid:pid> <path|->"
 if [ $NOUSB = 1 ]; then
   warn "--no-usb: no USB device is passed through. This VM is a drill of the tool: its installer will end with 'no stick found'"
 elif [ ${#USBMAPS[@]} -gt 0 ]; then
@@ -271,25 +272,22 @@ elif [ ${#USBMAPS[@]} -gt 0 ]; then
     if [ -z "$e" ]; then bad "the USB mapping '$m' has no entry for $NODE (pvesh get /cluster/mapping/usb)"; continue; fi
     if usb_present "$e"; then
       ok "mapping $m: $e is plugged into $NODE"
-    elif [ -n "$HOOK" ]; then warn "mapping $m: no $e on $NODE's USB right now — taken as a port your hookscript switches on before the start"
+    elif [ ${#POWER[@]} -gt 0 ]; then warn "mapping $m: no $e on $NODE's USB right now — taken as a stick whose port (--stick-power ${POWER[*]}) the hookscript switches on before the start"
     else bad "mapping $m: no USB device $e on $NODE right now"; fi
-    USE+=("$m"); DEVS+=("$e $(printf '%s\n' "$M" | awk -v m="$m" -v n="$NODE" '$1 == m && $2 == n { print $4; exit }')")
+    USE+=("mapping=$m"); DEVS+=("$e $(printf '%s\n' "$M" | awk -v m="$m" -v n="$NODE" '$1 == m && $2 == n { print $4; exit }')")
   done
+  [ ${#USE[@]} -eq 0 ] || warn "--usb-mapping: Proxmox checks a mapped stick at every start and refuses the start while it is not on $NODE. Without the option the kit names each stick itself (host=), and $NAME starts with or without it"
 else
   [ -n "$S" ] && printf '%s\n' "$S" | sed 's/^/         found: /'
-  declare -A SEEN=()
   while read -r port id _; do
     [ -n "$port" ] || continue
+    # A stick is named by what it is (host=<vid:pid>): Proxmox passes it through whenever it is on the node, in any
+    # socket, and starts the VM without it. Two sticks of one id cannot be told apart that way: each by its socket.
     n=$(printf '%s\n' "$S" | awk -v i="$id" '$2 == i { c++ } END { print c + 0 }')
-    base="zradio-${id/:/}"
-    if [ "$n" -gt 1 ]; then SEEN[$id]=$(( ${SEEN[$id]:-0} + 1 )); mid="$base-${SEEN[$id]}"; path=$port; else mid=$base; path=-; fi
-    have=$(printf '%s\n' "$M" | awk -v m="$mid" -v nn="$NODE" '$1 == m { any = 1 } $1 == m && $2 == nn { here = 1 } END { print (here ? "here" : (any ? "other" : "none")) }')
-    case "$have" in
-      here) ok "USB mapping $mid names $id on $NODE already";;
-      other) TODO+=("extend $mid $id $path");;
-      none) TODO+=("create $mid $id $path");;
-    esac
-    USE+=("$mid"); DEVS+=("$id $port")
+    if [ "$n" -gt 1 ]; then
+      USE+=("host=$port"); ok "$id at $port: $NAME gets it by its socket (host=$port), because $n sticks here have that id. It has to stay in that socket"
+    else USE+=("host=$id"); ok "$id: $NAME gets it by its id (host=$id), in whichever socket it is"; fi
+    DEVS+=("$id $port")
   done <<< "$S"
   if [ ${#USE[@]} -eq 0 ]; then
     if [ $NORADIOS = 1 ]; then warn "no stick on $NODE that the kit's table names — the VM is built without one (--allow-no-radios)"
@@ -297,25 +295,15 @@ else
   fi
 fi
 [ ${#USE[@]} -le 5 ] || bad "${#USE[@]} USB devices: a VM takes five here (usb0-usb4) — name the ones you mean with --usb-mapping"
+power_check "$NAME" "$(for dv in ${DEVS[@]+"${DEVS[@]}"}; do read -r did dpath <<< "$dv"; if [ "$dpath" != - ] && [ -n "$dpath" ]; then echo "$dpath"; else sticks_at "$did"; fi; done)"
 i=0
 for m in ${USE[@]+"${USE[@]}"}; do
   read -r did dpath <<< "${DEVS[$i]}"; i=$((i + 1)); [ "$dpath" != - ] || dpath=""
-  if r=$(vm_with_usb running "$did" "$dpath"); then bad "the running VM $r on $NODE has the USB device $did (mapping $m here) passed through already: two VMs on one stick. Stop it first (it is the VM this one replaces?)"
+  if r=$(vm_with_usb running "$did" "$dpath"); then bad "the running VM $r on $NODE has the USB device $did ($m here) passed through already: two VMs on one stick. Stop it first (it is the VM this one replaces?)"
   elif r=$(vm_with_usb idle "$did" "$dpath"); then warn "$r (not running) on $NODE still has the USB device $did in its config: take that usb line off it while $NAME uses the stick — anything that starts it (a backup in stop mode does) would reach for the stick"; fi
 done
 
 [ $FAILS -eq 0 ] || { echo "== $FAILS FAIL — nothing was changed =="; exit 1; }
-
-for t in ${TODO[@]+"${TODO[@]}"}; do
-  read -r verb mid id path <<< "$t"
-  entry="node=$NODE,id=$id"; [ "$path" = - ] || entry="$entry,path=$path"
-  if [ "$verb" = create ]; then
-    do_ pvesh create /cluster/mapping/usb --id "$mid" --map "$entry" --description "zradio: a radio stick, one entry per node (made by ha_zradio)" || exit 1
-  else # the mapping exists for another node: every entry it has, plus this node's
-    args=(); while read -r _ on oid opath; do [ -n "$on" ] || continue; o="node=$on,id=$oid"; [ "$opath" = - ] || o="$o,path=$opath"; args+=(--map "$o"); done <<< "$(printf '%s\n' "$M" | awk -v m="$mid" '$1 == m')"
-    do_ pvesh set "/cluster/mapping/usb/$mid" "${args[@]}" --map "$entry" || exit 1
-  fi
-done
 
 echo "== 2. the Debian image =="
 # What vouches for the image is HTTPS to cloud.debian.org. Debian publishes no signature of SHA512SUMS beside its cloud
@@ -401,23 +389,25 @@ if [ $RUN = 1 ]; then
     || { bad "could not write $SNIPDIR/$NAME-zradio.yaml"; exit 1; }
 else would "write $SNIPDIR/$NAME-zradio.yaml: root's keys, qemu-guest-agent, the kit's guest folder, zradio.conf (NAME=$NAME$([ $DHCP = 1 ] && echo ", its own address filled in by the VM" || echo " SELF=${SELF%/*}")${PEER:+ PEER=$PEER} VIP=$VIP VRID=$VRID PRIORITY=$PRIORITY${EXTRA[*]:+ ${EXTRA[*]}})"; fi
 
+hook_setup "$VMID" "$NAME" no || exit 1
+
 echo "== 4. the VM $NAME ($VMID) =="
 if [ -n "$PAIR_BRIDGE" ]; then NETS=(--net0 "virtio,bridge=$BRIDGE" --ipconfig0 ip=dhcp --net1 "virtio${PAIR_MAC:+=$PAIR_MAC},bridge=$PAIR_BRIDGE" --ipconfig1 "ip=$SELF")
 elif [ $DHCP = 1 ]; then NETS=(--net0 "virtio${PAIR_MAC:+=$PAIR_MAC},bridge=$BRIDGE" --ipconfig0 ip=dhcp)
 else NETS=(--net0 "virtio${PAIR_MAC:+=$PAIR_MAC},bridge=$BRIDGE" --ipconfig0 "ip=$SELF,gw=$GATEWAY"); fi
-USBS=(); i=0; for m in ${USE[@]+"${USE[@]}"}; do USBS+=("--usb$i" "mapping=$m"); i=$((i + 1)); done
+USBS=(); i=0; for m in ${USE[@]+"${USE[@]}"}; do USBS+=("--usb$i" "$m"); i=$((i + 1)); done
 do_ qm create "$VMID" --name "$NAME" --ostype l26 --machine q35 --bios ovmf --cores "$CORES" --memory "$MEMORY" --cpu host --scsihw virtio-scsi-single \
     --agent enabled=1 "${NETS[@]}" --serial0 socket --vga serial0 --onboot 1 --watchdog model=i6300esb,action=reset --efidisk0 "$STORAGE:1,efitype=4m,pre-enrolled-keys=0" \
-    --ide2 "$STORAGE:cloudinit" --cicustom "user=$SNIP:snippets/$NAME-zradio.yaml" ${USBS[@]+"${USBS[@]}"} ${HOOK:+--hookscript "$HOOK"} \
+    --ide2 "$STORAGE:cloudinit" --cicustom "user=$SNIP:snippets/$NAME-zradio.yaml" ${USBS[@]+"${USBS[@]}"} --hookscript "$SNIP:snippets/$HOOK_FILE" \
     --tags zradio-building --description "$NAME: one radio VM of a zradio pair — this node's Z-Wave / Zigbee sticks, served to Home Assistant on ${VIP%/*} while it holds that address, kept silent otherwise. Pinned to $NODE (its sticks are here). https://github.com/yuvaloren/ha_zradio" || exit 1
 # from here on a run that stops leaves a VM behind: say how to start over, whatever line it stopped at
-[ "$RUN" = 0 ] || trap 'rc=$?; [ $rc = 0 ] || echo "== $NAME ($VMID) was not finished: nothing updates it or pairs with it as it is. To start over: qm stop $VMID; qm destroy $VMID --purge; rm $SNIPDIR/$NAME-zradio.yaml; then this again =="' EXIT
+[ "$RUN" = 0 ] || trap 'rc=$?; [ $rc = 0 ] || echo "== $NAME ($VMID) was not finished: nothing updates it or pairs with it as it is. To start over: qm stop $VMID; qm destroy $VMID --purge; rm -f $SNIPDIR/$NAME-zradio.yaml $SNIPDIR/zradio-hook-$VMID.conf; then this again =="' EXIT
 do_ qm set "$VMID" --scsi0 "$STORAGE:0,import-from=$CACHE/$IMAGE_NAME,discard=on" || exit 1
 do_ qm disk resize "$VMID" scsi0 "$DISK" || exit 1
 do_ qm set "$VMID" --boot order=scsi0 || exit 1
 
 echo "== 5. the start =="
-do_ qm start "$VMID" || exit 1
+do_ qm start "$VMID" || { [ "$RUN" = 0 ] || echo "   (a start the hookscript refused says why above: the sticks it waited for)"; exit 1; }
 
 echo "== 6. the kit, installed in $NAME through its guest agent =="
 if [ $RUN = 0 ]; then
@@ -430,7 +420,7 @@ if [ $RUN = 0 ]; then
   go_ahead "${ARGS[@]}"
 fi
 n=0; until agent_up "$NODE" "$VMID"; do n=$((n + 1)); [ $n -lt 60 ] || break; sleep "$WAIT"; done
-agent_up "$NODE" "$VMID" && ok "the guest agent answers" || { bad "no guest agent in $((60 * WAIT)) s — the VM's console: qm terminal $VMID$([ -n "$HOOK" ] && echo " (a hookscript that refused the start says so in the task log)")"; exit 1; }
+agent_up "$NODE" "$VMID" && ok "the guest agent answers" || { bad "no guest agent in $((60 * WAIT)) s — the VM's console: qm terminal $VMID"; exit 1; }
 st=""; n=0
 while :; do
   st=$(gx "$NODE" "$VMID" 20 'cloud-init status' | awk '/^status:/ { print $2 }')

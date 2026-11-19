@@ -68,8 +68,10 @@ The requests are those of "which packets count" above; the seconds are counted o
 sync that moves the wall clock makes no silence).
 Two guards, from a real outage (2026-11-11: a first version could not see the sticks' answers, called two healthy
 sticks silent in turn, and no VM served for 2 min 22 s): a stick is judged only after this process has seen it answer
-at least once, and the default is OBSERVE — the line `result=would-wedge` and nothing else.
-ZRADIO_CHANGE_WEDGE=act in the unit's environment arms it; read a day of observe lines first.
+at least once, and at most $WEDGE_MAX_PER_DAY declarations are made in a day. The check is on; there is no setting for
+it. (ZRADIO_CHANGE_WEDGE=observe in the unit's environment, a drop-in, puts it back to logging `result=would-wedge`
+only: for looking at a pair whose check misfires.) What brings a silent stick back is zradio-serve hush, on the VM
+that gave the radios up.
 
 The conf is read through zradio-common.sh, as every shell tool of the kit reads it (the same checks, the same defaults).
 NOTHING TO WATCH (radios.conf names no radio, no interface holds SELF, a conf that does not load): the service does
@@ -119,8 +121,8 @@ WEDGE_AFTER = int(os.environ.get("ZRADIO_CHANGE_WEDGE_AFTER", "180"))
 WEDGE_MIN = int(os.environ.get("ZRADIO_CHANGE_WEDGE_MIN", "5"))
 WEDGE_MAX_PER_DAY = int(os.environ.get("ZRADIO_CHANGE_WEDGE_MAX_PER_DAY", "2"))
 WEDGE_TRACE = os.environ.get("ZRADIO_CHANGE_WEDGE_TRACE") == "1"     # print the worst unanswered run seen, change nothing
-WEDGE_MODE = os.environ.get("ZRADIO_CHANGE_WEDGE", "observe")        # observe: say what would be declared, change nothing;
-                                                                    # act: write the marker (keepalived then hands over)
+WEDGE_MODE = os.environ.get("ZRADIO_CHANGE_WEDGE", "act")     # act: write the marker (keepalived then hands over);
+                                                                    # observe: say what would be declared, change nothing
 LOG_MAX = 400                    # the same cut as zradio-common.sh's ZR_LOG_MAX
 DAY = 86400                      # s: both limits count what happened in the last 24 h
 LIMIT_LINE_EVERY = 21600         # s: the "limit reached" line is said at most every 6 h
@@ -348,8 +350,8 @@ def declare_wedged(now, kind, count, age):
     """The active gives the radios up: the marker zradio-serve check fails on, one loud line. False when held back."""
     if not (role() == "MASTER" and serving()): return False
     if WEDGE_MODE != "act":
-        log("result=would-wedge stick=%s — %d requests unanswered for %d s; observe mode (ZRADIO_CHANGE_WEDGE is not "
-            "'act'): nothing is changed" % (kind, count, age))
+        log("result=would-wedge stick=%s — %d requests unanswered for %d s; observe mode (ZRADIO_CHANGE_WEDGE=observe "
+            "in the unit's environment): nothing is changed" % (kind, count, age))
         return False
     xs = epochs_last_day(WEDGE_LOG, now)
     if len(xs) >= WEDGE_MAX_PER_DAY:
@@ -361,8 +363,8 @@ def declare_wedged(now, kind, count, age):
     open(WEDGED + ".tmp", "w").write("%s %s\n" % (kind, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))))
     os.replace(WEDGED + ".tmp", WEDGED)
     log("result=loud wedged stick=%s — Home Assistant sent %d requests in %d s and the stick answered nothing, with "
-        "its tty still there: this VM gives the radios up (%s); the other VM takes over. The stick usually needs a "
-        "power cycle (stop and start this VM)" % (kind, count, age, WEDGED))
+        "its tty still there: this VM gives the radios up (%s); the other VM takes over. zradio-serve hush "
+        "now tries to bring the stick back (a soft reset, a USB re-bind, then its power through the node)" % (kind, count, age, WEDGED))
     return True
 
 

@@ -22,6 +22,12 @@ SOON=60      # days before an end of life from which the pin fails
 ERRORS=0
 err() { echo "::error::$*"; ERRORS=$((ERRORS + 1)); }
 get() { curl -fsSL --retry 3 --max-time 30 "$1"; }      # get <url>: its body, or nothing and a non-zero exit
+gh_get() { # gh_get <url>: the same from GitHub's API, as the workflow's token where there is one (GITHUB_TOKEN). Without
+  # one, a runner shares its address's small allowance with every other runner, and is answered 403 as often as not.
+  # The token goes to curl on its standard input, never on a command line.
+  if [ -n "${GITHUB_TOKEN:-}" ]; then printf 'header = "Authorization: Bearer %s"\n' "$GITHUB_TOKEN" | curl -fsSL --retry 3 --max-time 30 -K - "$1"
+  else get "$1"; fi
+}
 
 ZUI=$(sed -n 's/^ZR_ZUI_IMAGE=\([^ ]*\).*/\1/p' guest/lib/zradio-common.sh)      # name:tag@sha256:…
 ZUI_NAME=${ZUI%%@*}; ZUI_TAG=${ZUI_NAME##*:}; ZUI_DIGEST=${ZUI#*@}; [ "$ZUI_DIGEST" != "$ZUI" ] || ZUI_DIGEST=""
@@ -62,7 +68,7 @@ if NODE=$(docker run --rm --entrypoint node "$ZUI" --version 2>/dev/null) && [[ 
 else err "could not run node in $ZUI (docker, or the image is gone from its registry): the pinned image could not be checked"; fi
 
 # 2. a newer Z-Wave JS UI
-if LATEST=$(get https://api.github.com/repos/zwave-js/zwave-js-ui/releases/latest | tr -d '\n' | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"v\{0,1\}\([^"]*\)".*/\1/p') && [ -n "$LATEST" ]; then
+if LATEST=$(gh_get https://api.github.com/repos/zwave-js/zwave-js-ui/releases/latest | tr -d '\n' | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"v\{0,1\}\([^"]*\)".*/\1/p') && [ -n "$LATEST" ]; then
   if [ "$LATEST" = "$ZUI_TAG" ]; then echo "ok: Z-Wave JS UI $ZUI_TAG is the newest release"
   else echo "::warning::Z-Wave JS UI $ZUI_TAG is pinned and $LATEST is out. To take it: try a sync with ZUI_IMAGE=${ZUI_NAME%:*}:$LATEST in a pair's zradio.conf, then move ZR_ZUI_IMAGE (guest/lib/zradio-common.sh: the tag and its digest) and zradio.conf.example"; fi
 else echo "::warning::GitHub did not say what the newest Z-Wave JS UI is: not compared"; fi

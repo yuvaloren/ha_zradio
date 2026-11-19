@@ -9,7 +9,10 @@
 # runs ./install.sh there, on this terminal: the same questions, the same "Go ahead?". Before that "y" nothing on the
 # node is changed but that folder.
 #   Options for install.sh go after the line:     bash -c "$(curl -fsSL …/get.sh)" _ --sticks
-#   Another version:                               ZRADIO_REF=<tag or branch> bash -c "$(curl -fsSL …/get.sh)"
+#   The latest main, not the latest release:       bash -c "$(curl -fsSL …/get.sh)" _ --main
+#   Any other version:                             bash -c "$(curl -fsSL …/get.sh)" _ --ref <tag or branch>
+#   (--main and --ref are this script's own and come first, before install.sh's options. ZRADIO_REF=<tag or branch>
+#   before the line does the same as --ref.)
 # Not `curl … | bash`: the installer's questions need this terminal on stdin.
 # Tests: tests/t-get.sh. Env for the tests: ZRADIO_REPO, ZRADIO_GITHUB, ZRADIO_GITHUB_API, ZRADIO_DEST.
 set -uo pipefail
@@ -24,17 +27,24 @@ command -v curl >/dev/null 2>&1 && command -v tar >/dev/null 2>&1 || die "needs 
 [[ "$DEST" =~ ^/[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)+$ ]] || die "ZRADIO_DEST '$DEST': an absolute path at least two levels deep"
 
 REF=${ZRADIO_REF:-} RELEASE=""
+while [ $# -gt 0 ]; do      # this script's own options; what follows them is install.sh's
+  case "$1" in
+    --main) REF=main; shift;;
+    --ref) [ $# -ge 2 ] || die "--ref needs a tag or a branch name"; REF=$2; shift 2;;
+    *) break;;
+  esac
+done
 if [ -z "$REF" ]; then          # the latest release. A repository without one (GitHub answers 404): main
   # Any other failure stops here: a node must not get main's unreleased code because GitHub was busy or out of reach.
   if ANSWER=$(curl -fsSL "$API/repos/$REPO/releases/latest" 2>&1); then
     RELEASE=$(printf '%s' "$ANSWER" | tr -d '\n' | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
-    [ -n "$RELEASE" ] || die "GitHub's answer names no latest release ($API/repos/$REPO/releases/latest). A version by name: ZRADIO_REF=<tag or branch> before the line"
+    [ -n "$RELEASE" ] || die "GitHub's answer names no latest release ($API/repos/$REPO/releases/latest). A version by name: --ref <tag or branch> after the line's _ (--main: the latest main)"
   else
-    case "$ANSWER" in *"error: 404"*) ;; *) die "could not ask GitHub for the latest release: $(printf '%s' "$ANSWER" | tail -n 1). Try again, or name a version: ZRADIO_REF=<tag or branch> before the line";; esac
+    case "$ANSWER" in *"error: 404"*) ;; *) die "could not ask GitHub for the latest release: $(printf '%s' "$ANSWER" | tail -n 1). Try again, or name a version: --ref <tag or branch> after the line's _ (--main: the latest main)";; esac
   fi
   REF=${RELEASE:-main}
 fi
-[[ "$REF" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$ ]] && [[ "$REF" != *..* ]] || die "ZRADIO_REF '$REF': a tag or a branch name"
+[[ "$REF" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$ ]] && [[ "$REF" != *..* ]] || die "the version '$REF' (--ref, ZRADIO_REF): a tag or a branch name"
 DIR="$DEST/${REF//\//-}"
 URL="$GH/$REPO/archive/$REF.tar.gz"
 

@@ -172,6 +172,10 @@ zr_markers() {
   APPLYING="$RUN/applying"           # a set is being written onto the sticks (zradio-sync)
   DIRTY="$STATE/standby-dirty"       # a set was not written to the end: this VM may not serve (zradio-sync)
   WEDGED="$STATE/stick-wedged"       # a stick stopped answering (zradio-change-watch; zradio-serve hush clears it)
+  WANT="$STATE/want-power"           # `<stick> <epoch>`: this VM asks its node to switch the sticks' power off and on
+                                     # (zradio-serve hush writes it; the node's helper, host/hook.sh, reads it)
+  POWERED="$STATE/power-cycled"      # the epoch of the node's last such power cycle (zradio-serve power-done)
+  MISSING_SINCE="$STATE/missing-since"  # the epoch a stick's tty was first seen missing (zradio-serve down, hush)
   zr_gate_files "$RUN" "$STATE"
 }
 zr_gate_files() { # zr_gate_files <run dir> <state dir>: the election's files there (zradio-gate writes them; in act

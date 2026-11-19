@@ -8,7 +8,8 @@ VE 9 nodes; Aeotec Z-Stick 10 Pro; Sonoff ZBDongle-P; Z-Wave JS UI and ZHA). "Wh
 
 | Piece | Standard part | The kit's part |
 |---|---|---|
-| A radio VM per node, with the node's sticks | Proxmox VM, USB mapping, a virtual watchdog | `install.sh`, `host/` |
+| A radio VM per node, with the node's sticks | Proxmox VM, USB passthrough, a hookscript, a virtual watchdog | `install.sh`, `host/` |
+| A VM that starts only with its sticks there, and sticks that are dark while it is stopped | Proxmox hookscript; the kernel's switch for a hub port | `host/hook.sh` |
 | Knowing which stick is what | Home Assistant's USB lists | `zradio-detect` |
 | A stick served as a TCP port | ser2net | the config (`zradio-render`) |
 | One floating address, held by one VM | keepalived | the health check, `zradio-notify` |
@@ -25,8 +26,10 @@ address. It takes no part in deciding who serves.
 ## One install line, three kinds of machine
 
 `get.sh` is the line to paste. It asks GitHub for the latest release, downloads that release's archive into
-`/opt/ha_zradio/<version>`, and runs its `install.sh` with the options given after the line. `ZRADIO_REF=<tag or
-branch>` before the line takes that version instead. Where GitHub says there is no release yet, it takes `main`;
+`/opt/ha_zradio/<version>`, and runs its `install.sh` with the options given after the line. `--main` right after
+the line's `_` takes the latest `main` instead of the latest release, and `--ref <tag or branch>` any other version
+(`ZRADIO_REF=<tag or branch>` before the line does the same). The two are `get.sh`'s own and come before
+`install.sh`'s options. Where GitHub says there is no release yet, it takes `main`;
 where GitHub does not answer the question, it stops, so that no machine gets unreleased code by accident. It needs
 bash, curl and tar, and no python: Home Assistant's terminal has none.
 
@@ -119,12 +122,28 @@ the sticks holds one lock, and both checks look at it: a start, a stop or a sync
 finish. A start that turned the receiver on and then failed turns it off again.
 
 **A hung stick.** A stick can stop answering while its serial port is still there. `zradio-change-watch` sees it
-from the packets: requests from Home Assistant with nothing coming back. By default it only logs
-(`result=would-wedge`). `ZRADIO_CHANGE_WEDGE=act` in the unit's environment (a drop-in for
-`zradio-change-watch.service`) makes it fail the health check. Read a day of the logged lines first: an earlier
-version of this check took the radios away from two healthy sticks in turn. The mark names the stick, and `hush`
-clears it only when that stick answered a question; a served-only stick is never asked, so its mark is removed by
-hand after the stick was power-cycled.
+from the packets: requests from Home Assistant with nothing coming back, 5 or more, the first of them 180 s ago. The
+VM that serves then gives the radios up (its health check fails on the mark `stick-wedged`) and the other VM takes
+them: **fail over first, then heal.** There is no setting for it. Two guards come from a real outage, in which an
+earlier version of this check took the radios away from two healthy sticks in turn: a stick is judged only after the
+watcher has seen it answer once, and a VM declares at most two hung sticks in a day. (`ZRADIO_CHANGE_WEDGE=observe`
+in the unit's environment, a drop-in for `zradio-change-watch.service`, makes the check log `result=would-wedge`
+and do nothing else: for a pair on which it misfires.)
+
+**Healing** is `zradio-serve hush`, on a VM that does not serve: at every return to standby, every 15 minutes, and
+the moment a stick's serial port appears (a udev rule starts it). A stick that does not answer there is tried rung
+by rung, and each rung that works ends it (`event=serve result=healed stick=… by=…`):
+
+1. a soft reset over the serial line (Z-Wave SoftReset; Z-Stack `SYS_RESET_REQ`);
+2. the stick's USB device taken from its driver and given back, as if it were plugged in again without losing its
+   power (at most 4 times a day per stick);
+3. its power. A VM cannot switch that; the node can ("The start, the sticks' power, and a stick that stays away").
+   The VM writes `want-power`, and the node's helper asks for it once a minute.
+
+A stick whose serial port is missing for 5 minutes is asked for the same way: that is a hub that did not come back.
+When the sticks are there and answer, the request and `stick-wedged` are removed and the VM is a standby that may
+serve again. A served-only stick is never asked a question, so none of this reaches it: its mark is removed by hand
+after the stick was power-cycled.
 
 The watcher counts a packet only once this VM's own kernel has acknowledged it on that connection. A packet that
 somebody else on the network made up, with Home Assistant's address on it, starts no sync and counts toward no hung
@@ -255,14 +274,15 @@ minute on both VMs, is the line for monitoring: who serves, which copy each hold
 
 0. Checks, all before any change: the name and id are free; no **running** VM uses the sticks (or, with fixed
    addresses, the address).
-1. The node's sticks get USB mappings.
+1. The node's sticks are found, and each gets a line in the VM's config that names it by what it is
+   (`usb0: host=<vendor>:<product>`), or by its socket (`host=<bus>-<port>`) where two sticks have the same id.
 2. Debian 13's generic cloud image is downloaded and checked against the `SHA512SUMS` beside it. Debian signs
    neither; HTTPS is what vouches for them. A cached image is checked against the checksum kept with it before it is
    used, and a run asks the list whether the image is still Debian's current one. Where that cannot be had, a whole
    cached image is used, and the run says so.
 3. A cloud-init file is written: root's keys, the guest agent, the kit's `guest/` folder. A snippets storage that
-   has a folder but not "snippets" in its content gets it added.
-4. The VM is created: started at every boot of the node, with a virtual watchdog. Its tag is `zradio-building`
+   has a folder but not "snippets" in its content gets it added. The kit's hookscript goes into the same storage.
+4. The VM is created: started at every boot of the node, with a virtual watchdog and the hookscript. Its tag is `zradio-building`
    until step 7 is done, and `zradio` from then on: a run that stops halfway leaves no VM that passes for a radio VM.
    Nothing updates it or pairs with it, the run ends with how to remove it, and the next run refuses to build beside
    it.
@@ -318,10 +338,10 @@ not an answer: it belongs on the command line.
 | `--join NAME`, `--no-pair` | the first VM to pair with (found by its tag); or none |
 | `--start`, `--run` | start the VM in the pair; do it (report only without) |
 | `--vrid`, `--priority`, `--pair-mac` | keepalived's router id (50) and priority (110 for the primary, 100 for the standby); a fixed MAC |
-| `--usb-mapping ID` (repeatable) | use USB mappings you already have (five devices at most) |
+| `--usb-mapping ID` (repeatable) | use USB mappings you already have (five devices at most). Proxmox refuses a start of the VM while a mapped stick is absent |
 | `--vmid`, `--storage`, `--snippets` | the VM's id (the next free one), its disk's storage (the first of `local-zfs`, `local-lvm`, `local`), the snippets storage (`local`) |
 | `--memory`, `--cores`, `--disk` | 2048 (MB), 2, `8G` |
-| `--hookscript VOLID` | a hookscript of yours, for example one that powers the sticks' USB ports |
+| `--stick-power HUB:PORT` (repeatable), `--no-stick-power` | the hub ports that switch this node's sticks' power ("The start, the sticks' power, and a stick that stays away"); none |
 | `--ssh-keys FILE` | root's keys in the VM (default: the node's `authorized_keys`) |
 | `--conf KEY=VALUE` (repeatable) | a line for a new VM's `zradio.conf`: one of that file's keys that has no option of its own ([zradio.conf.example](../zradio.conf.example)). An update keeps the VM's own file |
 | `--image-dir URL` | where the Debian image and its `SHA512SUMS` are (default: cloud.debian.org): `https://…`, `file:///folder` on the node, or `http://…` with a note |
@@ -351,6 +371,64 @@ starts no VM. A start checks quorum first (`check_cfs_quorum` in qemu-server's `
 waits for quorum with no time limit (`startall` in pve-manager). With two nodes and no third vote, while one node is
 down the other starts no radio VM, at boot or by hand, until someone runs `pvecm expected 1` on it. VMs already
 running are not affected, so a failover works; a power cut that only one node comes back from does not.
+
+## The start, the sticks' power, and a stick that stays away (`host/hook.sh`)
+
+**A radio VM starts with or without its sticks.** Proxmox passes a stick through when it appears, at the start or
+any time later, when the VM's config names the stick itself (`usbN: host=…`): that is how the installer names
+them. (A stick named through a USB *mapping* is checked by Proxmox at every start, and the start is refused while it
+is absent: "USB Mapping invalid". At a node's boot nothing tries again, and the node is without its radio VM. Kit
+0.1.0 made mappings; an update names the sticks directly instead, on a VM that is stopped, because the change would
+unplug the sticks of a running one.) A VM without a stick is up, says so (`event=state`), and stays out of the pair
+until the stick is there.
+
+Every radio VM has the kit's hookscript, a file in each node's snippets storage (`zradio-hook.sh`, attached with
+`qm set --hookscript`):
+
+- **Before a start** it gives the sticks a minute (`WAIT`) to be on the node's USB, so that a VM that boots with the
+  node silences them in its first seconds. Then the VM starts, and the journal says what was missing
+  (`result=started-without`).
+- It refuses a start in one case: another running VM of the node has one of the sticks. The second VM would take
+  them from the first.
+
+*Measured* on the reference pair's first node: at a warm reboot both sticks were on the bus before Proxmox started
+anything; after a cold boot their hub came 19 s after its port had power.
+
+**Stick power** (`--stick-power HUB:PORT`, once per port; kept in `zradio-hook-<vmid>.conf` beside the hookscript).
+A Z-Wave stick that has power answers on the air whether or not anything talks to it. Where the sticks hang off a
+hub port whose power can be switched, the hookscript switches it:
+
+- **on** before the wait. A stick still missing after `CYCLE_AFTER` (25 s) gets the ports switched off and on once:
+  a hub that hung comes back that way.
+- **off** after the VM has stopped. Not while the node itself shuts down: the sticks are then there at its boot,
+  and the start has no power-on to wait for. Not while another running VM of the node has one of the sticks: a
+  backup in stop mode starts a stopped copy of a VM and stops it again (*measured*, with a hookscript that did not
+  look: the radios were cut under the VM that served, for a night).
+- **never at the node's boot.** Ports that are switched off at boot and on again by the start put a power-on into
+  every boot (*measured*: of two boots that did, both left the node without its radio VM). What a boot leaves on
+  the air until the VM silences its sticks is a Z-Wave receiver, for the seconds the VM takes to start.
+- **off and on while the VM runs, when the VM asks.** A stick that stays silent after a soft reset and a USB
+  re-bind, or whose serial port stays away, needs its power cycled, and only the node can do that. The hookscript's
+  `post-start` starts a helper, the unit `zradio-heal-<vmid>` (`systemd-run`: no file of it is installed, and it
+  ends with the VM). Once a minute it asks the VM through the guest agent (`zradio-serve power-wanted`). A VM that
+  serves, or is about to, never asks. When it asks, the ports go off for 3 s and on again, the VM is told
+  (`power-done`), and the stick is looked at as soon as its port is back. At most 3 times in 24 hours, 15 minutes
+  apart, and never while another running VM of the node has one of the sticks. There is no setting for it; it needs
+  `--stick-power`, because without the ports there is nothing to switch.
+
+The kit does not look for the port. Whether a hub cuts a port's power or only disconnects it cannot be read from
+the node (many hubs say they switch and do not), so the ports are named: `./install.sh --sticks` lists the hub
+ports above each stick, and `uhubctl` shows which hubs say they switch (`ppps`). A USB 3 hub is two hubs, one per
+speed, and its port goes dark only when it is switched on both. Where the kernel links the two, the installer adds
+the other one itself; where it does not, both are named. Every stick has to hang off one of the named ports, or the
+run is refused. The switch is the kernel's own file for the port (`…/<hub>-port<n>/disable`, Linux 6.0 and later),
+the one `uhubctl` writes; `uhubctl` itself is not needed.
+
+A backup of a **stopped** radio VM in stop mode starts it for the length of the backup: its sticks have power for
+that long, with nothing that silences them.
+
+Every run leaves a line in the node's journal: `journalctl -t zradio` (`event=hook result=ok waited_s=…`,
+`started-without`, `refused`, `left-on`, `cycled`, `capped`, `held`, `fail`).
 
 ## The third vote (`vote/install.sh`, `host/qdevice.sh`)
 
@@ -448,6 +526,14 @@ keeps the VM's conf, role and keys, and does not stop the radios ("In a radio VM
 update fails, the one that serves is not touched. The stamp is installed last, so a failed run never claims the new
 kit. To put the kit before back: `bash /opt/zradio/kit.previous/guest/install.sh --from-node --run` in the VM.
 
+Before any of that, the run puts this node's own part right: the hookscript's file, the VM's stick power when
+`--stick-power` or `--no-stick-power` says so, the hookscript on this node's VM, and its helper when the VM runs.
+On a VM that is stopped it also names the sticks directly where kit 0.1.0 had named them through USB mappings
+(`qm shutdown`, the installer, `qm start`: the VM that does not serve first); on a running VM it says that this is
+still to do. That needs no answer from a VM, so it also reaches a VM that is stopped; such a VM's kit is looked at
+once it runs. The hookscript is a file of
+each node: the VMs' kits are updated from either node, the hookscripts by a run on each.
+
 **Versions.** No version number is kept in a file. A release is a GitHub release of a git tag (`v0.1.0`): `get.sh`
 asks GitHub for the latest release, so a tag alone is not found. It writes the version into the kit's
 `gen/version`: the tag, or `<branch>@<commit>` for anything taken with `ZRADIO_REF`. In a clone, the version is `git
@@ -455,15 +541,18 @@ describe` (`v0.1.0-3-g08df12f`, `-dirty` with uncommitted changes).
 
 ## Not built
 
-- Proposing free addresses; powering a stopped VM's USB ports off.
+- Proposing free addresses.
 - A Home Assistant integration (status, "sync now", "switch"); a sync without the pause.
 - More families synced (Silicon Labs EZSP first); Zigbee2MQTT.
 - The pair announcing itself on the network, so that Home Assistant finds it.
 - A restart of a VM whose QEMU process died (no Proxmox HA, above): the other VM serves until it is started.
-- Removing a radio VM: `qm stop`, `qm destroy --purge`, and its cloud-init file in the snippets storage, by hand.
+- A hung stick that still acknowledges: the check counts a stick as answering when it sends anything at all. Pairing
+  each request of Home Assistant with its own answer would see that case, and in half the time; it wants a capture
+  from a live pair first.
+- Removing a radio VM: `qm stop`, `qm destroy --purge`, and its cloud-init file and `zradio-hook-<vmid>.conf` in
+  the snippets storage, by hand.
 
-Built, and off until you turn it on: the election (`ELECTION=act`) and the hung-stick handover
-(`ZRADIO_CHANGE_WEDGE=act`). Both only log by default.
+Built, and off until you turn it on: the election (`ELECTION=act`). It only logs by default.
 
 ## Tests
 
@@ -489,5 +578,8 @@ it was seen on a pair. It runs weekly in CI and whenever a pin changes.
 
 **What has run where.** On real hardware, one pair: the install on two Proxmox VE 9 nodes, the third vote in its
 container on a NAS with `pvecm qdevice setup`, and Home Assistant's side on Home Assistant OS. Not on real hardware:
-the third vote from Debian's package, the election in `act` mode, the hung-stick handover, served-only sticks, and
-Home Assistant's own Z-Wave JS app on the pair (the pair above uses Z-Wave JS UI).
+the hookscript, stick power and the helper (the ports' switch was read from the kernel's and uhubctl's sources, the
+waits are sized from that pair's journals, and that Proxmox starts a VM without a stick named by `host=` is from its
+manual), the healing of a stick that does not answer (a soft reset, a USB re-bind, the power cycle), the hung-stick
+check declaring a stick, the third vote from Debian's package, the election in `act` mode, served-only sticks, and Home Assistant's own Z-Wave JS app on the pair (the pair above uses
+Z-Wave JS UI).

@@ -12,6 +12,14 @@
 #                         On every BACKUP (zradio-hush.service) and every 15 min (zradio-sync tick): a stick that
 #                         re-enumerates comes back listening. Nothing is done on a VM that serves, is about to, or is
 #                         being written to.
+#                         A stick that does not answer there is healed, rung by rung: a soft reset over the serial
+#                         line, its USB device taken from the driver and given back (at most $HEAL_USB_MAX times a day),
+#                         then its power — which only the node can switch: this VM asks (want-power), and the node's
+#                         helper (host/hook.sh) looks once a minute. A stick whose tty stays missing for
+#                         $HEAL_MISSING_AFTER s is asked for the same way.
+#   zradio-serve power-wanted   the node's helper asks: `WANT stick=<kind> since=<epoch>` or `NO`. Never WANT on a
+#                         VM that serves or is about to.
+#   zradio-serve power-done     the helper says: the sticks' power was off and on again
 #   zradio-serve check    keepalived's health check: exit 0 = this VM may hold the address
 #   zradio-serve status   the role as it is: ser2net, the ttys, the markers
 #
@@ -58,6 +66,9 @@ FAILED_FOR=${ZRADIO_SERVE_HOLD:-300}  # s a failed `up` keeps this VM out of the
 GATE_SLACK=240                     # s a boot-wait may outlive ELECTION_WAIT: the gate's last look (a peer hello, a
                                    # Zigbee counter raise) can run past the wait; older = the gate died
 ZIGBEE_RUNNING="8|9"               # Z-Stack device states StartingAsCoordinator, StartedAsCoordinator
+HEAL_USB_MAX=${ZRADIO_SERVE_HEAL_USB_MAX:-4}            # USB re-binds of one stick in 24 h at most
+HEAL_MISSING_AFTER=${ZRADIO_SERVE_HEAL_MISSING_AFTER:-300}   # s a stick's tty may be missing before the node is asked for its power
+SYSFS=${ZRADIO_SERVE_SYSFS:-/sys}
 zr_markers
 UNSERVED="$RUN/unserved-since"     # the health check's own count: when it first saw this VM hold the address without serving
 RADIOS_OK=1; zr_load_radios || RADIOS_OK=0
@@ -100,6 +111,42 @@ serves_without_address() { # ser2net is active and this VM does not hold the flo
   case "$(zr_role)" in BACKUP|FAULT|STOP) return 0;; esac; return 1
 }
 sticks_free() { ( exec 7>>"$STICKS_LOCK" && flock -n 7 ) 2>/dev/null; }      # nobody holds the sticks lock right now (it is not kept)
+# ---- a stick that does not answer, on a VM that does not serve (hush): healed rung by rung
+answers() { # answers zwave|zigbee: the stick answers a question now (and is left silent: receiver off / read only)
+  if [ "$1" = zwave ]; then receiver off; else probe_json --zigbee "$ZB" >/dev/null; fi
+}
+usb_rebind() { # usb_rebind zwave|zigbee <tty>: the stick's USB device taken from its driver and given back, as if it were
+  # plugged in again without losing its power. 1 when there is no such device, or the day's re-binds are used up
+  local f="$STATE/heal-usb-$1" now real dev i=0
+  now=$(date +%s)
+  [ "$(awk -v now="$now" 'now - $1 < 86400' "$f" 2>/dev/null | grep -c .)" -lt "$HEAL_USB_MAX" ] || return 1
+  real=$(readlink -f "$2" 2>/dev/null) && dev=$(readlink -f "$SYSFS/class/tty/${real##*/}/device" 2>/dev/null) || return 1
+  while [ "$dev" != / ] && [ -n "$dev" ] && [ ! -e "$dev/idVendor" ]; do dev=$(dirname "$dev"); done
+  [ -e "$dev/idVendor" ] && [ -e "$SYSFS/bus/usb/drivers/usb/unbind" ] || return 1
+  echo "$now" >> "$f"
+  echo "${dev##*/}" 2>/dev/null > "$SYSFS/bus/usb/drivers/usb/unbind" || return 1
+  sleep 1
+  echo "${dev##*/}" 2>/dev/null > "$SYSFS/bus/usb/drivers/usb/bind" || return 1
+  while [ ! -e "$2" ] && [ $i -lt 20 ]; do sleep 1; i=$((i + 1)); done      # udev names the tty again
+  [ -e "$2" ]
+}
+want_power() { # want_power <stick(s)> <why>: the node is asked to switch the sticks' power off and on. Said once per request
+  [ ! -e "$WANT" ] || return 0
+  printf '%s %s\n' "$1" "$(date +%s)" > "$WANT"
+  say heal-ask "stick=$1 — $2: this VM asks its node to switch the sticks' power off and on (the kit's helper there looks once a minute; without one: stop and start this VM)"
+}
+heal() { # heal zwave|zigbee: 0 when the stick answers again
+  local kind=$1 tty=$ZB
+  [ "$kind" = zigbee ] || tty=$ZW
+  # 1. a soft reset over the serial line
+  if [ "$kind" = zwave ]; then probe_json --zwave "$tty" --soft-reset >/dev/null; else probe_json --zigbee "$tty" --zigbee-reset >/dev/null; fi
+  if answers "$kind"; then say healed "stick=$kind by=soft-reset — it answers again"; return 0; fi
+  # 2. its USB device, away from the driver and back
+  if usb_rebind "$kind" "$tty" && answers "$kind"; then say healed "stick=$kind by=usb-rebind — it answers again"; return 0; fi
+  # 3. its power: the node's to switch
+  want_power "$kind" "it does not answer after a soft reset and a USB re-bind"
+  return 1
+}
 
 case "$MODE" in
 up)
@@ -178,6 +225,7 @@ it runs the network by itself, a second coordinator is on the air"; rc=1
   so=$(served_only); [ -z "$so" ] || did="$did; $so is served only: not touched (its standby stick must hold no network)"
   if [ $rc = 0 ] && [ -z "$gone" ]; then say down "ser2net is stopped$did — silent standby"
   elif [ $rc = 0 ]; then say down-partial "ser2net is stopped; no tty for$gone: that stick could not be silenced (hush does it when the tty is back)"; fi
+  if [ -n "$gone" ]; then [ -e "$MISSING_SINCE" ] || date +%s > "$MISSING_SINCE"; fi
   exit $rc;;
 
 hush)
@@ -198,11 +246,11 @@ hush)
   if zr_master_or_serving; then echo "this VM serves — nothing to hush"; exit 0; fi
   if [ -e "$APPLYING" ]; then echo "a synced set is being written — nothing to hush"; exit 0; fi
   rc=0
-  if zr_has zwave synced && [ -e "$ZW" ] && ! receiver off; then
+  if zr_has zwave synced && [ -e "$ZW" ] && ! receiver off && ! heal zwave; then
     say loud "step=zwave-receiver — hush: SetRFReceiveMode off did not answer in $ZR_RF_TRIES tries ($(why)): this standby stick may listen to the mesh"; rc=1
   fi
   if zr_has zigbee synced && [ -e "$ZB" ]; then
-    if ! J=$(probe_json --zigbee "$ZB"); then say loud "step=zigbee — hush: the coordinator did not answer a read ($(why))"; rc=1
+    if ! J=$(probe_json --zigbee "$ZB") && ! { heal zigbee && J=$(probe_json --zigbee "$ZB"); }; then say loud "step=zigbee — hush: the coordinator did not answer a read ($(why))"; rc=1
     else
       st=$(zr_json - zigbee.device_state <<<"$J")
       if [[ "$st" =~ ^($ZIGBEE_RUNNING)$ ]]; then
@@ -217,7 +265,21 @@ hush)
       echo "stick-wedged stays: it names the $wk stick, which is served only — the kit has no question it could ask that stick. After a power cycle of it (stop and start this VM): rm $WEDGED"
     elif [ $rc = 0 ] && [ -z "$(missing)" ]; then
       rm -f "$WEDGED"; say unwedged "both sticks answer again: stick-wedged is removed, this VM may stand by and serve"
-    else echo "stick-wedged stays: a stick still does not answer (a hung stick wants a power cycle: stop and start this VM)"; fi
+    else echo "stick-wedged stays: a stick still does not answer (the node was asked for a power cycle; by hand: stop and start this VM)"; fi
+  fi
+  # a stick whose tty is not there: after a while, its power is asked for too (a hub that did not come back)
+  gone=$(missing)
+  if [ -n "$gone" ]; then
+    [ -e "$MISSING_SINCE" ] || date +%s > "$MISSING_SINCE"
+    since=$(cat "$MISSING_SINCE" 2>/dev/null); [[ "$since" =~ ^[0-9]+$ ]] || since=$(date +%s)
+    [ $(( $(date +%s) - since )) -lt "$HEAL_MISSING_AFTER" ] || want_power "$(for t in $gone; do [ "$t" = "$ZW" ] && echo zwave || echo zigbee; done | paste -sd, -)" "no tty for $gone for $(( $(date +%s) - since )) s"
+  else
+    rm -f "$MISSING_SINCE"
+    if [ $rc = 0 ] && [ -e "$WANT" ]; then
+      by=""; [ ! -e "$POWERED" ] || [ "$(cat "$POWERED" 2>/dev/null)" -lt "$(cut -d' ' -f2 "$WANT" 2>/dev/null)" ] 2>/dev/null || by=" by=power-cycle"
+      say healed "stick=$(cut -d' ' -f1 "$WANT" 2>/dev/null)$by — the sticks are there and answer: the request for their power is withdrawn"
+      rm -f "$WANT"
+    fi
   fi
   [ $rc = 0 ] && echo "hush: the receiver is off, the coordinator is not on the air"
   exit $rc;;
@@ -254,6 +316,7 @@ status)
   [ -e "$APPLYING" ] && echo "marker: $APPLYING (a synced image is being written)"
   [ -e "$DIRTY" ] && echo "marker: $DIRTY (a synced image was not written to the end: this VM may not serve)"
   [ -e "$WEDGED" ] && echo "marker: $WEDGED ($(cat "$WEDGED" 2>/dev/null): a stick stopped answering; this VM may not serve until the sticks answer a probe)"
+  [ -e "$WANT" ] && echo "marker: $WANT ($(cat "$WANT" 2>/dev/null): this VM asks its node to switch the sticks' power off and on$([ ! -e "$POWERED" ] || echo "; last done $(age_of "$POWERED") s ago"))"
   [ -e "$FAILED" ] && echo "marker: $FAILED ($(age_of "$FAILED") s old; holds this VM out for $FAILED_FOR s)"
   [ -e "$BOOT_WAIT" ] && echo "marker: $BOOT_WAIT (asking the peer who holds the newer networks before this VM may claim)"
   [ -e "$HOLD" ] && echo "marker: $HOLD (this VM holds an older copy: it may serve only after the peer has been silent for the standard wait)"
@@ -267,7 +330,18 @@ so it does not serve. An address from DHCP that changed: give this VM $SELF back
   [ -f "$ROLE_F" ] && echo "keepalived's last word: $(cat "$ROLE_F")"
   exit 0;;
 
+power-wanted)
+  if [ -e "$WANT" ] && ! zr_master_or_serving && read -r wk ws < "$WANT" && [[ "$wk" =~ ^[a-z,]+$ ]] && [[ "$ws" =~ ^[0-9]+$ ]]; then echo "WANT stick=$wk since=$ws"
+  else echo "NO"; fi
+  exit 0;;
+
+power-done)
+  zr_need_root
+  date +%s > "$POWERED"
+  say power-cycled "the node switched the sticks' power off and on (asked for: $(cat "$WANT" 2>/dev/null || echo "nothing on record")); hush looks at them when their ttys are back"
+  exit 0;;
+
 -h|--help) sed -n '2,/^set -uo pipefail$/{/^set -uo pipefail$/!p}' "$0"; exit 0;;
 
-*) echo "usage: zradio-serve up [--force]|down|hush|check|status (--help)" >&2; exit 2;;
+*) echo "usage: zradio-serve up [--force]|down|hush|check|status|power-wanted|power-done (--help)" >&2; exit 2;;
 esac

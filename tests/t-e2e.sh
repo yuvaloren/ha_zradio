@@ -27,7 +27,7 @@ echo "-- the second node (nodeb): no answers at all"
 FAKE_NODE=nodeb zvm "$C" --run --start; cp "$C/out" "$C/out2"
 check "exit 0; it found attic1, called itself attic2, took the other address, the same floating address, bridge and gateway" bash -c '[ "$2" = 0 ] && [ "$(grep -v "^#" "$1/etc/zradio/zradio.conf" | tr "\n" " ")" = "NAME=attic2 SELF=10.20.30.6 PEER=10.20.30.5 VIP=10.20.30.50/24 VRID=50 PRIORITY=100 " ] && grep -q "^ipconfig0: ip=10.20.30.6/24,gw=10.20.30.1$" "$3/pve/nodes/nodeb/qemu-server/101.conf" && grep -q "^net0: virtio,bridge=vmbr0$" "$3/pve/nodes/nodeb/qemu-server/101.conf"' _ "$R2" "$RC" "$C"
 check "it is the initial STANDBY because attic1 is the primary: marked not filled by the real installer, which names the sticks that will be overwritten" bash -c '[ "$(cat "$1/var/lib/zradio/initial-role")" = standby ] && grep -q "^install.sh: the initial standby" "$1/var/lib/zradio/standby-dirty" && grep -q "| .*the zigbee zwave stick(s) hold a network today: it will be OVERWRITTEN" "$2/out2"' _ "$R2" "$C"
-check "its own node's sticks: nodeb's entry added to the USB mappings nodea made" bash -c 'grep -q "^pvesh set /cluster/mapping/usb/zradio-10c4ea70 --map node=nodea,id=10c4:ea70 --map node=nodeb,id=10c4:ea70$" "$1/calls" || grep -q "^pvesh create /cluster/mapping/usb --id zradio-10c4ea70 --map node=nodeb" "$1/calls"' _ "$C"
+check "its own node's sticks: named by their ids in the VM's own config (host=), and no USB mapping is made for either node" bash -c 'grep "^qm create 101 " "$1/calls" | grep -q -- "--usb0 host=10c4:ea70 --usb1 host=10c4:ea60 " && ! grep -q "^pvesh \(create\|set\) /cluster/mapping" "$1/calls"' _ "$C"
 check "the pairing, with real keys: each VM pinned the other's host key and allows the other's sync key — from its address, for the sync only" bash -c '
   k() { cut -d" " -f1,2 < "$1"; }
   grep -qxF "10.20.30.5 $(k "$1/etc/ssh/ssh_host_ed25519_key.pub")" "$2/etc/zradio/sync.known_hosts" && grep -qxF "10.20.30.6 $(k "$2/etc/ssh/ssh_host_ed25519_key.pub")" "$1/etc/zradio/sync.known_hosts" &&
@@ -39,7 +39,7 @@ check "run from the node, the VM's installer does not ask for anything to be pas
 check "the private halves never left their VM: no private key in the node's output or in the cloud-init files" bash -c '! grep -rq "PRIVATE KEY" "$1/out1" "$1/out2" "$1/store/snippets" "$1/calls"' _ "$C"
 
 echo "-- an update: ./install.sh again on nodea, with a kit in which one file changed"
-mkdir -p "$T/kit2"; cp -R "$KIT/guest" "$KIT/zradio.conf.example" "$T/kit2/"; echo "# changed, for the update test" >> "$T/kit2/guest/sbin/zradio-switch"
+mkdir -p "$T/kit2"; cp -R "$KIT/guest" "$KIT/host" "$KIT/zradio.conf.example" "$T/kit2/"; echo "# changed, for the update test" >> "$T/kit2/guest/sbin/zradio-switch"
 ZRADIO_VM_KIT="$T/kit2" zvm "$C" --run; cp "$C/out" "$C/out3"
 check "exit 0: both VMs of the pair updated, each by the kit's REAL installer run again in it" bash -c '[ "$2" = 0 ] && grep -q "^== done: attic1 attic2 run " "$1/out3" && [ "$(grep -c "| == 1. the kit.s files ==" "$1/out3")" = 2 ]' _ "$C" "$RC"
 check "…the changed file is in place in both, and only what changed was replaced" bash -c 'for r in "$1" "$2"; do cmp -s "$r/usr/local/sbin/zradio-switch" "$3/guest/sbin/zradio-switch" || exit 1; done; grep -q "| DONE  /usr/local/sbin/zradio-switch installed (755)" "$4/out3" && grep -q "| OK    /usr/local/sbin/zradio-serve is current" "$4/out3"' _ "$R1" "$R2" "$T/kit2" "$C"

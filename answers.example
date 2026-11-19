@@ -23,4 +23,9 @@ BRIDGE=vmbr0
 # Start the VM in the pair at the end:
 #START=yes
 
+# The hub port(s) that switch this node's sticks' power, once per port (./install.sh --sticks lists them). With them
+# the node switches the sticks off with the VM, and off and on when a stick stays silent:
+#STICK_POWER=1-3:2
+#STICK_POWER=2-4:2
+
 # The second node needs none of this: it takes the network from the first VM and the opposite role. NAME if you like.

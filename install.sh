@@ -3,10 +3,10 @@
 #     ./install.sh
 # It asks what it needs, shows what it would do, and does it after a yes: the VM (Debian 13), this node's Z-Wave
 # and/or Zigbee sticks passed through, the kit installed inside (through the guest agent), a watchdog that resets a
-# hung VM. No Proxmox HA: the two VMs decide between them which one serves. The VM takes its own address from DHCP; the one address
-# asked for is the floating one Home Assistant connects to. On the second node it takes the pair's addresses and
-# settings from the first VM and introduces the two to each other. On a node whose radio VM exists, the same command
-# UPDATES that VM and the pair's other one to this kit (or says they are up to date).
+# hung VM, a hookscript for its start and its sticks' power. It starts with or without its sticks. No Proxmox HA: the two VMs decide who
+# serves. The VM takes its own address from DHCP; the one address asked for is the floating one Home Assistant
+# connects to. On the second node it takes the pair's settings from the first VM and introduces the two. On a node
+# whose radio VM exists, it UPDATES this node's hookscript and both VMs of the pair to this kit (or says: up to date).
 #
 # Without a terminal nothing is asked: every answer is an option, and nothing is changed without --run.
 #   --answers FILE           the options below as lines of a file, KEY=value (answers.example); for unattended runs
@@ -24,8 +24,8 @@
 #   --pair-bridge BR         a link of its own between the nodes for --self; the floating address is on it too
 #   --join NAME              the first radio VM, to pair with (found by itself when there is one);  --no-pair
 #   --start                  put the VM into the pair at the end        --run   do it
-#   more: --vrid --priority --pair-mac --usb-mapping --vmid --storage --snippets --memory --cores --disk --hookscript
-#         --ssh-keys --conf KEY=VALUE --no-usb --allow-no-radios --image-dir --third-vote-port --third-vote-hostkey   (docs/DESIGN.md)
+#   more: --vrid --priority --pair-mac --usb-mapping --vmid --storage --snippets --memory --cores --disk --ssh-keys --conf KEY=VALUE
+#         --no-usb --allow-no-radios --image-dir --stick-power HUB:PORT --no-stick-power --third-vote-port --third-vote-hostkey   (docs/DESIGN.md)
 #   --third-vote A.B.C.D     not a VM: a third vote for a cluster of two nodes, from a machine at that address, where
 #                            this same command went first (there it sets up the vote, and prints the line for here).
 #
@@ -69,9 +69,9 @@ fi
 
 # ----------------------------------------------------------------------------------------------------- the answers
 NAME="" ROLE="" SELF="" PEER="" VIP="" VRID="" PRIORITY="" BRIDGE="" PAIR_BRIDGE="" GATEWAY="" PAIR_MAC="" VMID="" STORAGE="" SNIP=local
-MEMORY=2048 CORES=2 DISK=8G HOOK="" KEYS=${ZRADIO_VM_KEYS:-/root/.ssh/authorized_keys} FIRST=0 START=0 NORADIOS=0 NOUSB=0
+MEMORY=2048 CORES=2 DISK=8G NOPOWER=0 KEYS=${ZRADIO_VM_KEYS:-/root/.ssh/authorized_keys} FIRST=0 START=0 NORADIOS=0 NOUSB=0
 IMAGE_DIR=https://cloud.debian.org/images/cloud/trixie/latest
-USBMAPS=() EXTRA=() STICKS=0 JOIN="" PAIR=1 PASS=() UPDATE="" THIRD=0 VOTE="" VOTE_PORT=22 VOTE_HOSTKEY=""
+USBMAPS=() POWER=() EXTRA=() STICKS=0 JOIN="" PAIR=1 PASS=() UPDATE="" THIRD=0 VOTE="" VOTE_PORT=22 VOTE_HOSTKEY=""
 # --answers FILE: the options as lines, KEY=value (INITIAL_ROLE=primary, SELF=…, USB_MAPPING=… once per mapping) and
 # yes/no for the ones without a value (FIRST=yes, START=yes, NO_PAIR=yes …). An option on the command line wins.
 # RUN is not an answer: nothing is changed without --run on the command line.
@@ -84,14 +84,14 @@ while [ $# -gt 0 ]; do if [ "$1" = --answers ]; then
       k=${BASH_REMATCH[1]}; v=${BASH_REMATCH[2]}; o="--$(printf '%s' "$k" | tr 'A-Z_' 'a-z-')"
       case "$k" in
         RUN|ANSWERS|STICKS|HELP) die "--answers $2: $k is not an answer (it belongs on the command line)";;
-        FIRST|START|NO_PAIR|NO_USB|ALLOW_NO_RADIOS) case "$v" in yes) F+=("$o");; no) ;; *) die "--answers $2: $k is yes or no";; esac;;
+        FIRST|START|NO_PAIR|NO_USB|ALLOW_NO_RADIOS|NO_STICK_POWER) case "$v" in yes) F+=("$o");; no) ;; *) die "--answers $2: $k is yes or no";; esac;;
         *) F+=("$o" "$v");;
       esac
     done < "$2"; shift 2
   else A+=("$1"); shift; fi; done
 set -- ${F[@]+"${F[@]}"} ${A[@]+"${A[@]}"}
 while [ $# -gt 0 ]; do
-  case "$1" in --name|--initial-role|--self|--peer|--vip|--vrid|--priority|--bridge|--pair-bridge|--gateway|--join|--update|--pair-mac|--vmid|--storage|--snippets|--memory|--cores|--disk|--hookscript|--third-vote|--third-vote-port|--third-vote-hostkey|--ssh-keys|--image-dir|--usb-mapping|--conf)
+  case "$1" in --name|--initial-role|--self|--peer|--vip|--vrid|--priority|--bridge|--pair-bridge|--gateway|--join|--update|--pair-mac|--vmid|--storage|--snippets|--memory|--cores|--disk|--stick-power|--third-vote|--third-vote-port|--third-vote-hostkey|--ssh-keys|--image-dir|--usb-mapping|--conf)
     [ $# -ge 2 ] || die "$1 needs a value (./install.sh --help)";; esac
   case "$1" in
   -h|--help) sed -n '2,/^set -uo pipefail$/{/^set -uo pipefail$/!p}' "$0"; exit 0;;
@@ -100,7 +100,7 @@ while [ $# -gt 0 ]; do
   --name) NAME=$2; shift 2;; --initial-role) ROLE=$2; shift 2;; --self) SELF=$2; shift 2;; --peer) PEER=$2; shift 2;; --vip) VIP=$2; shift 2;; --vrid) VRID=$2; shift 2;;
   --priority) PRIORITY=$2; shift 2;; --bridge) BRIDGE=$2; shift 2;; --pair-bridge) PAIR_BRIDGE=$2; shift 2;; --gateway) GATEWAY=$2; shift 2;; --join) JOIN=$2; shift 2;; --update) UPDATE=$2; shift 2;;
   --pair-mac) PAIR_MAC=$2; PASS+=("$1" "$2"); shift 2;; --vmid) VMID=$2; PASS+=("$1" "$2"); shift 2;; --storage) STORAGE=$2; PASS+=("$1" "$2"); shift 2;; --snippets) SNIP=$2; PASS+=("$1" "$2"); shift 2;;
-  --memory) MEMORY=$2; PASS+=("$1" "$2"); shift 2;; --cores) CORES=$2; PASS+=("$1" "$2"); shift 2;; --disk) DISK=$2; PASS+=("$1" "$2"); shift 2;; --hookscript) HOOK=$2; PASS+=("$1" "$2"); shift 2;;
+  --memory) MEMORY=$2; PASS+=("$1" "$2"); shift 2;; --cores) CORES=$2; PASS+=("$1" "$2"); shift 2;; --disk) DISK=$2; PASS+=("$1" "$2"); shift 2;; --stick-power) POWER+=("$2"); PASS+=("$1" "$2"); shift 2;; --no-stick-power) NOPOWER=1; PASS+=("$1"); shift;;
   --third-vote) THIRD=1; VOTE=$2; shift 2;; --third-vote-port) VOTE_PORT=$2; shift 2;; --third-vote-hostkey) VOTE_HOSTKEY=$2; shift 2;;
   --ssh-keys) KEYS=$2; PASS+=("$1" "$2"); shift 2;; --image-dir) IMAGE_DIR=$2; PASS+=("$1" "$2"); shift 2;; --usb-mapping) USBMAPS+=("$2"); PASS+=("$1" "$2"); shift 2;; --conf) EXTRA+=("$2"); PASS+=("$1" "$2"); shift 2;;
   *) echo "unknown option: $1 (./install.sh --help)" >&2; exit 2;; esac; done
@@ -111,7 +111,7 @@ if [ $THIRD = 1 ]; then      # the cluster's third vote, not a VM: no sticks, no
   # shellcheck source=host/qdevice.sh
   . "$HERE/host/qdevice.sh"
 fi
-for f in install.sh sbin/zradio-serve lib/zradio-common.sh lib/zradio-usb-ids.py lib/usb-annotations.json units/zradio.target; do [ -r "$KIT/guest/$f" ] || die "the kit's guest/$f is missing next to this script"; done
+for f in guest/install.sh guest/sbin/zradio-serve guest/lib/zradio-common.sh guest/lib/zradio-usb-ids.py guest/lib/usb-annotations.json guest/units/zradio.target host/hook.sh; do [ -r "$KIT/$f" ] || die "the kit's $f is missing next to this script"; done
 # The table of sticks the kit knows is not kept in git: it is built here, at every run, into the kit's own gen/ folder
 # (the only place the kit writes what it generates), from Home Assistant's USB lists at the commit the kit pins and the
 # kit's notes on each stick. The VM gets it inside the kit (step 3).
@@ -125,6 +125,8 @@ KIT_VERSION=$(kv VERSION "$(cat "$GEN/kit-version")"); KIT_CONTENT=$(kv CONTENT 
 if [ $STICKS = 1 ]; then
   echo "The sticks on $NODE that the kit knows (the VM itself finds out which is what):"
   show_sticks || { echo "      none. A stick the kit's table does not know can still be passed through: make a USB mapping for it and use --usb-mapping."; exit 1; }
+  echo "The hub ports above each (for --stick-power, nearest first; uhubctl says which hubs switch their ports' power: ppps):"
+  sticks_here | while read -r port _; do printf '      %-10s %s\n' "$port" "$(ports_above "$port")"; done
   exit 0
 fi
 
