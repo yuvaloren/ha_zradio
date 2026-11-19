@@ -16,7 +16,7 @@
 #   any other phase of Proxmox: nothing.
 #
 # The helper (`zradio-hook.sh <vmid> heal`, a systemd unit zradio-heal-<vmid> that lives as long as the VM runs; no
-# file of it is installed). A VM cannot switch its own sticks' power, so once a minute the helper asks it, through the
+# file of it is installed). A VM cannot switch its own sticks' power, so every 5 minutes the helper asks it, through the
 # guest agent, whether it wants that (`zradio-serve power-wanted`: a stick that stays silent or absent on a VM that
 # does not serve). When it does, the ports are switched off for 3 s and on again, and the VM is told (`zradio-serve
 # power-done`): at most HEAL_MAX times in 24 hours, HEAL_GAP seconds apart, never while another running VM of this
@@ -30,7 +30,7 @@
 # A port is switched through the kernel's file for it (…/<hub>-port<n>/disable, Linux 6.0 and later), the one uhubctl
 # writes. Whether that cuts the stick's power or only disconnects it is the hub's doing; the kit cannot see which.
 # Every run leaves a line in the node's journal (journalctl -t zradio): event=hook result=… vm=… phase=…
-# Tests: tests/t-hook.sh. Env for them, as install.sh's: ZRADIO_VM_SYS, ZRADIO_VM_PVE; ZRADIO_HOOK_RUN.
+# Tests: tests/t-hook.sh. Env for them, as install.sh's: ZRADIO_VM_SYS, ZRADIO_VM_PVE; ZRADIO_HOOK_RUN, ZRADIO_HOOK_QEMU.
 set -uo pipefail
 VMID=${1:-}; PHASE=${2:-}
 case "$PHASE" in pre-start|post-start|post-stop|heal|heal-once) ;; *) exit 0;; esac
@@ -40,10 +40,11 @@ CONFS="${ZRADIO_VM_PVE:-/etc/pve}/nodes/$(hostname -s)/qemu-server"
 HERE=$(cd "$(dirname "$0")" && pwd)
 CONF="$HERE/zradio-hook-$VMID.conf"
 HEAL_RUN=${ZRADIO_HOOK_RUN:-/run/zradio-hook}      # the helper's own notes (this boot's): the cycles it made, what it said
+QRUN=${ZRADIO_HOOK_QEMU:-/run/qemu-server}      # <vmid>.pid: a running VM's QEMU process (Proxmox writes it)
 conf() { local v; v=$(sed -n "s/^$1=//p" "$CONF" 2>/dev/null | tail -1); echo "${v:-$2}"; }      # conf <KEY> <default>
 num() { local v; v=$(conf "$1" "$2"); [[ "$v" =~ ^[0-9]+$ ]] && echo "$v" || echo "$2"; }         # num <KEY> <default>
 POWER_PORTS=$(conf POWER_PORTS ""); WAIT=$(num WAIT 60); CYCLE_AFTER=$(num CYCLE_AFTER 25)
-HEAL_MAX=$(num HEAL_MAX 3); HEAL_GAP=$(num HEAL_GAP 900); HEAL_EVERY=$(num HEAL_EVERY 60)
+HEAL_MAX=$(num HEAL_MAX 3); HEAL_GAP=$(num HEAL_GAP 900); HEAL_EVERY=$(num HEAL_EVERY 300)
 vm_name() { local n; n=$(sed -n '/^\[/q; s/^name: *//p' "$CONFS/$1.conf" 2>/dev/null | head -1); echo "${n:-VM $1}"; }
 [ "$PHASE" = pre-start ] || [ -n "$POWER_PORTS" ] || exit 0      # without stick power only a start has something to do
 NAME=$(vm_name "$VMID")
@@ -121,6 +122,10 @@ power() { # power on|off: every port of POWER_PORTS, where it is not that way al
   [ "$1" = on ] || sleep 0.2      # a USB 3 hub takes a moment to switch off (uhubctl waits 150 ms)
   return $rc
 }
+vm_runs() { # this VM's QEMU process lives (its pid file, as Proxmox writes it). Not `qm status`: the helper looks for
+  # as long as the VM runs, and every qm is a second of the node's CPU (2026-11-18: 59 s in 40 minutes, with two a look)
+  local p; p=$(cat "$QRUN/$VMID.pid" 2>/dev/null) && [[ "$p" =~ ^[0-9]+$ ]] && [ -d "/proc/$p" ]
+}
 in_vm() { # in_vm <words of a command…>: its stdout, through the guest agent; 1 when it did not end with 0 in 20 s
   qm guest exec "$VMID" --timeout 20 -- "$@" 2>/dev/null | python3 -c '
 import json, sys
@@ -188,7 +193,7 @@ case "$PHASE" in
     exit 0;;                          # a start is never failed over the helper
   heal)
     while :; do
-      case "$(qm status "$VMID" 2>/dev/null)" in *running*) ;; *) exit 0;; esac
+      vm_runs || exit 0
       heal_once
       sleep "$HEAL_EVERY"
     done;;

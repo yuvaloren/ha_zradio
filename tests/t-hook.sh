@@ -162,9 +162,9 @@ world "$T/z2"; hostvm "$T/z2"; power "$T/z2" "POWER_PORTS=1-3:2 2-4:2"; : > "$T/
 check "the helper does not start: said, and the start is not failed over it" bash -c '[ "$2" = 0 ] && grep -q "the helper zradio-heal-100 did not start" "$1/out" && grep -q "result=fail .*helper=not-started" "$1/journal"' _ "$T/z2" "$RC"
 
 echo "-- the helper's look: the VM asks, the node switches its sticks' power off and on"
-heal() { local d=$1; shift; ZRADIO_HOOK_RUN="$d/run" hook "$d" 100 "${1:-heal-once}"; }      # heal <dir> [phase]
+heal() { local d=$1; shift; ZRADIO_HOOK_RUN="$d/run" ZRADIO_HOOK_QEMU="$d/qrun" hook "$d" 100 "${1:-heal-once}"; }      # heal <dir> [phase]
 asks() { echo "WANT stick=zwave since=1795000000" > "$1/guest-power-wanted"; : > "$1/guest-power-done"; }
-helper() { world "$1"; hostvm "$1"; power "$1" "POWER_PORTS=1-3:2 2-4:2" "${@:2}"; echo 100 > "$1/running"; }      # helper <dir> [conf lines…]
+helper() { world "$1"; hostvm "$1"; power "$1" "POWER_PORTS=1-3:2 2-4:2" "${@:2}"; echo 100 > "$1/running"; mkdir -p "$1/qrun"; echo $$ > "$1/qrun/100.pid"; }      # helper <dir> [conf lines…]: zradio1 runs (its QEMU's pid file: a process that lives, this one)
 helper "$T/h1"; echo "NO" > "$T/h1/guest-power-wanted"; heal "$T/h1"
 check "the VM does not ask: nothing is switched, nothing said" bash -c '[ "$2" = 0 ] && [ "$(ports "$1")" = 00 ] && [ ! -s "$1/journal" ] && ! grep -q "^sleep" "$1/calls"' _ "$T/h1" "$RC"
 helper "$T/h2"; heal "$T/h2"
@@ -186,8 +186,14 @@ helper "$T/h6" "HEAL_MAX=1"; asks "$T/h6"; mkdir -p "$T/h6/run"; echo $(( $(date
 check "a cycle more than 24 hours ago does not count" bash -c 'grep -q "result=cycled .*cycles_24h=1" "$1/journal"' _ "$T/h6"
 helper "$T/h7"; asks "$T/h7"; other "$T/h7" drill "usb0: host=10c4:ea60"; echo 9001 >> "$T/h7/running"; heal "$T/h7"
 check "another running VM of the node has one of the sticks: held, nothing switched under it" bash -c '[ "$(ports "$1")" = 00 ] && ! grep -q "^sleep 3" "$1/calls" && grep -q "result=held .*other=drill" "$1/journal"' _ "$T/h7"
-helper "$T/h8"; asks "$T/h8"; : > "$T/h8/running"; heal "$T/h8" heal
-check "the loop (heal): a VM that does not run ends it at once, and nobody is asked" bash -c '[ "$2" = 0 ] && ! grep -q "guest exec" "$1/calls"' _ "$T/h8" "$RC"
-helper "$T/h9"; asks "$T/h9"; fake "$T/h9/bin" sleep "echo \"sleep \$*\" >> '$T/h9/calls'; [ \"\$1\" != 60 ] || : > '$T/h9/running'"; heal "$T/h9" heal
-check "…while it runs: a look, a minute, and again; it ends with the VM" bash -c '[ "$2" = 0 ] && [ "$(grep -c "power-wanted" "$1/calls")" = 1 ] && grep -qx "sleep 60" "$1/calls"' _ "$T/h9" "$RC"
+# (the loop's own tests: `sleep` there ends the VM at the helper's pause, and ends a loop that will not end by itself)
+looping() { fake "$1/bin" sleep "echo \"sleep \$*\" >> '$1/calls'; [ \"\$1\" != 300 ] || rm -f '$1/qrun/100.pid'; [ \$(grep -c '^sleep' '$1/calls') -lt 8 ] || kill \$PPID"; }
+helper "$T/h8"; asks "$T/h8"; looping "$T/h8"; rm -f "$T/h8/qrun/100.pid"; heal "$T/h8" heal
+check "the loop (heal): a VM that does not run (no pid file of its QEMU) ends it at once, and nobody is asked" bash -c '[ "$2" = 0 ] && ! grep -q "guest exec" "$1/calls"' _ "$T/h8" "$RC"
+helper "$T/h8b"; asks "$T/h8b"; looping "$T/h8b"; echo 4194399 > "$T/h8b/qrun/100.pid"; heal "$T/h8b" heal      # (above the kernel's highest pid)
+check "…and a pid file whose process is gone (a QEMU that died): the same" bash -c '[ "$2" = 0 ] && ! grep -q "guest exec" "$1/calls"' _ "$T/h8b" "$RC"
+helper "$T/h9"; asks "$T/h9"; looping "$T/h9"; heal "$T/h9" heal
+check "…while it runs: a look, 5 minutes, and again; it ends with the VM" bash -c '[ "$2" = 0 ] && [ "$(grep -c "power-wanted" "$1/calls")" = 1 ] && grep -qx "sleep 300" "$1/calls"' _ "$T/h9" "$RC"
+helper "$T/h10"; echo "NO" > "$T/h10/guest-power-wanted"; looping "$T/h10"; heal "$T/h10" heal
+check "…and a look that finds nothing to do costs the node one qm, the question to the VM: no qm status (every qm is a second of CPU)" bash -c '[ "$2" = 0 ] && [ "$(grep -c "^qm " "$1/calls")" = 1 ] && grep -q "^qm guest exec 100 .*power-wanted" "$1/calls"' _ "$T/h10" "$RC"
 finish

@@ -127,7 +127,14 @@ for f in $SBIN; do [ -f "$HERE/sbin/$f" ] || miss="$miss sbin/$f"; done
 for f in $LIBF zradio-usb-ids.py usb-annotations.json zradio-kit-stamp.sh zigpy-constraints.txt; do [ -f "$HERE/lib/$f" ] || miss="$miss lib/$f"; done
 for f in $UNITS; do [ -f "$HERE/units/$f" ] || miss="$miss units/$f"; done
 [ -z "$miss" ] && ok "the kit's files are all here ($HERE)" || bad "missing in $HERE:$miss"
-TMP=$(mktemp -d) || exit 1; trap 'rm -rf "$TMP"' EXIT
+TIMER_HELD=0        # 1 while this run holds zradio-sync.timer stopped (step 5); timer_release starts it again
+timer_release() { # after systemd has read the timer's file again. Also on every way out of this script (the trap)
+  [ "$TIMER_HELD" = 1 ] || return 0; TIMER_HELD=0
+  systemctl daemon-reload >/dev/null 2>&1
+  systemctl start zradio-sync.timer >/dev/null 2>&1 && ok "zradio-sync.timer was stopped while its file changed and runs again: the nightly sync is next at $SYNC_AT${SYNC_TZ:+ $SYNC_TZ}, not now" \
+    || bad "systemctl start zradio-sync.timer failed: the nightly sync does not run until it is started"
+}
+TMP=$(mktemp -d) || exit 1; trap 'timer_release; rm -rf "$TMP"' EXIT
 if [ -n "$CONF_SRC" ]; then
   [ -r "$CONF_SRC" ] || { bad "--conf $CONF_SRC: no such file"; CONF_SRC=""; }
   ZR_CONF=${CONF_SRC:-$R/etc/zradio/zradio.conf}
@@ -356,7 +363,18 @@ if bash "$RENDER" --keepalived > "$TMP/keepalived.conf" 2> "$TMP/err"; then
   elif keepalived -t -f "$TMP/keepalived.conf" > "$TMP/kt" 2>&1 && ! grep -qi 'unknown keyword' "$TMP/kt"; then put "$TMP/keepalived.conf" /etc/keepalived/keepalived.conf 644; ok "keepalived -t accepts the config"
   else bad "keepalived -t refuses the new config: $(grep -i -m2 'unknown keyword' "$TMP/kt" | tr '\n' ' ')$(tail -2 "$TMP/kt" | tr '\n' ' ') — /etc/keepalived/keepalived.conf is left as it was"; fi
 else bad "keepalived.conf does not render: $(cat "$TMP/err")"; fi
-if bash "$RENDER" --timer > "$TMP/zradio-sync.timer" 2> "$TMP/err"; then put "$TMP/zradio-sync.timer" /etc/systemd/system/zradio-sync.timer 644
+# The nightly timer, and a time that changes (SYNC_AT, SYNC_TZ). A timer that has run keeps the moment; at the next
+# daemon-reload systemd finds the NEW time's next turn after that moment already past and runs the sync on the spot
+# (2026-11-18: an update did that on the VM that served — 12 s without radios in the evening). A timer that is stopped
+# while its file changes and started after the reload forgets its last run: the sync next runs when the clock says so
+# [V systemd 255: tests/timer-real.sh]. So: stopped here, started below, right after the reload.
+if bash "$RENDER" --timer > "$TMP/zradio-sync.timer" 2> "$TMP/err"; then
+  if [ -f "$R/etc/systemd/system/zradio-sync.timer" ] && ! cmp -s "$TMP/zradio-sync.timer" "$R/etc/systemd/system/zradio-sync.timer" && active zradio-sync.timer; then
+    if [ $RUN = 0 ]; then would "stop zradio-sync.timer while its file changes and start it after the reload (a new time must not run the sync now)"
+    elif systemctl stop zradio-sync.timer >/dev/null 2>&1; then TIMER_HELD=1
+    else warn "systemctl stop zradio-sync.timer failed: if its time changes, systemd may run the nightly sync at the reload below (about 12 s without radios on the VM that serves)"; fi
+  fi
+  put "$TMP/zradio-sync.timer" /etc/systemd/system/zradio-sync.timer 644
 else bad "the nightly timer does not render: $(cat "$TMP/err")"; fi
 if [ $RADIOS_KNOWN = 1 ]; then
   if bash "$RENDER" --ser2net > "$TMP/ser2net.yaml" 2> "$TMP/err"; then
@@ -392,6 +410,7 @@ if [ $RUN = 1 ]; then
   systemctl daemon-reload && systemctl enable zradio.target zradio-quiet.service keepalived.service zradio-sync.timer zradio-sync-tick.timer zradio-state.timer zradio-change-watch.service zradio-gate.service >/dev/null 2>&1 \
     && done_ "enabled: zradio-quiet (silent sticks at boot), keepalived, the nightly sync ($SYNC_AT${SYNC_TZ:+ $SYNC_TZ}), the 15-min tick, the state line, the device-change watcher, the election's gate (ELECTION=$ELECTION) — nothing started" \
     || bad "systemctl enable failed"
+  timer_release      # whatever the lines above said: the nightly sync must not stay without its timer
   systemctl disable ser2net >/dev/null 2>&1 || true
 else would "systemctl daemon-reload; enable zradio.target, zradio-quiet, keepalived, zradio-sync.timer, zradio-sync-tick.timer, zradio-state.timer, zradio-change-watch, zradio-gate (nothing is started on a VM that is not in the pair)"; fi
 # a re-run on a VM that is in the pair: say what still runs on the old files
@@ -408,7 +427,7 @@ if [ $RUN = 1 ]; then
   # conf and the library every tool sources.
   case " $CHANGED " in *zradio-change-watch*|*" /etc/zradio/zradio.conf "*) ! active zradio-change-watch.service || idle_restart zradio-change-watch.service "it only watches";; esac
   case " $CHANGED " in *zradio-gate*|*zradio-common.sh*|*" /etc/zradio/zradio.conf "*) ! active zradio-gate.service || idle_restart zradio-gate.service "ELECTION=$ELECTION";; esac
-  for t in zradio-sync.timer zradio-sync-tick.timer zradio-state.timer; do
+  for t in zradio-sync-tick.timer zradio-state.timer; do      # (zradio-sync.timer: stopped and started around its change, above)
     case " $CHANGED " in *" /etc/systemd/system/$t "*) ! active "$t" || { systemctl restart "$t" >/dev/null 2>&1 && ok "$t restarted: its new times are in force" || warn "systemctl restart $t failed: it keeps its old times until then"; };; esac
   done
   # a VM that is in the pair, and a unit of the target that is not running: new in this kit (enabled above, which

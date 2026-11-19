@@ -138,7 +138,7 @@ by rung, and each rung that works ends it (`event=serve result=healed stick=… 
 2. the stick's USB device taken from its driver and given back, as if it were plugged in again without losing its
    power (at most 4 times a day per stick);
 3. its power. A VM cannot switch that; the node can ("The start, the sticks' power, and a stick that stays away").
-   The VM writes `want-power`, and the node's helper asks for it once a minute.
+   The VM writes `want-power`, and the node's helper asks for it every 5 minutes.
 
 A stick whose serial port is missing for 5 minutes is asked for the same way: that is a hub that did not come back.
 When the sticks are there and answer, the request and `stick-wedged` are removed and the VM is a standby that may
@@ -259,7 +259,9 @@ the new config, before either is put in place.
 
 On a VM that is in the pair, the installer puts what runs onto the new files: the gate and the watcher are
 restarted when a file they read changed, a timer when its times changed, and a unit that is new in the kit is
-started. A restart of the gate or the watcher would end a sync they started, so it waits while one runs (5 minutes
+started. The nightly sync's timer is stopped while its file changes and started after systemd has read it again: a
+timer that has run and is read again with a new time whose turn has passed since runs at that moment, and that
+would be a sync, 12 s without radios, at the time of an update (`tests/timer-real.sh` shows both). A restart of the gate or the watcher would end a sync they started, so it waits while one runs (5 minutes
 at most, then it says what to run later). keepalived and a serving ser2net are not restarted: the installer's notes
 say what a changed file of theirs needs. A changed `ZIGPY_VERSION` builds zigpy's venv again, and puts the old one
 back if that fails.
@@ -410,7 +412,8 @@ hub port whose power can be switched, the hookscript switches it:
 - **off and on while the VM runs, when the VM asks.** A stick that stays silent after a soft reset and a USB
   re-bind, or whose serial port stays away, needs its power cycled, and only the node can do that. The hookscript's
   `post-start` starts a helper, the unit `zradio-heal-<vmid>` (`systemd-run`: no file of it is installed, and it
-  ends with the VM). Once a minute it asks the VM through the guest agent (`zradio-serve power-wanted`). A VM that
+  ends with the VM). Every 5 minutes it asks the VM through the guest agent (`zradio-serve power-wanted`: one `qm`
+  a look, which is all it costs the node). A VM that
   serves, or is about to, never asks. When it asks, the ports go off for 3 s and on again, the VM is told
   (`power-done`), and the stick is looked at as soon as its port is back. At most 3 times in 24 hours, 15 minutes
   apart, and never while another running VM of the node has one of the sticks. There is no setting for it; it needs
@@ -566,6 +569,7 @@ The tests are for development. A release's archive, which is what `get.sh` puts 
 | `bash tests/vote-bash.sh` (docker) | the third vote's script under bash 3.2 and 4.4 (what a NAS may have) | bash | docker (a fake) |
 | `bash tests/hass-real.sh` (docker) | Home Assistant's side | the install line and the script on the kind of machine Home Assistant's terminal is (Alpine, busybox, no python) | Home Assistant |
 | `sudo bash tests/rehearse-election.sh` | the election | keepalived, in two network namespaces | radio VMs, sticks |
+| `sudo ZRADIO_THROWAWAY=1 bash tests/timer-real.sh` (a throwaway Linux) | the nightly timer across a change of its time | systemd, a timer like `zradio-sync.timer`, `daemon-reload` | the installer (`t-install.sh` holds it to the order shown) |
 
 `bash tests/check-pins.sh` (docker, the network) is not a test of the kit but of what it pins where Dependabot cannot
 see it: the Z-Wave JS UI image (the Node.js inside it), zigpy-cli and Debian 13, against their makers' end-of-life
@@ -577,9 +581,10 @@ it was seen on a pair. It runs weekly in CI and whenever a pin changes.
 `tests/try.sh` (docker) is a shell on a pretend two-node cluster, to see the install without a node.
 
 **What has run where.** On real hardware, one pair: the install on two Proxmox VE 9 nodes, the third vote in its
-container on a NAS with `pvecm qdevice setup`, and Home Assistant's side on Home Assistant OS. Not on real hardware:
-the hookscript, stick power and the helper (the ports' switch was read from the kernel's and uhubctl's sources, the
-waits are sized from that pair's journals, and that Proxmox starts a VM without a stick named by `host=` is from its
-manual), the healing of a stick that does not answer (a soft reset, a USB re-bind, the power cycle), the hung-stick
-check declaring a stick, the third vote from Debian's package, the election in `act` mode, served-only sticks, and Home Assistant's own Z-Wave JS app on the pair (the pair above uses
-Z-Wave JS UI).
+container on a NAS with `pvecm qdevice setup`, Home Assistant's side on Home Assistant OS, an update of both VMs,
+and the hookscript at a VM's stop and start with stick power (the ports of a USB 3 hub off after the stop, on before
+the start, the sticks back within a second), its helper started and stopped with the VM and asking through the guest
+agent. Not on real hardware: a start without a stick (that Proxmox starts a VM without a stick named by `host=` is
+from its manual), a power cycle that a VM asked for, the healing of a stick that does not answer (a soft reset, a
+USB re-bind), the hung-stick check declaring a stick, the third vote from Debian's package, the election in `act`
+mode, served-only sticks, and Home Assistant's own Z-Wave JS app on the pair (the pair above uses Z-Wave JS UI).

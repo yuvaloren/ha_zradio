@@ -12,7 +12,8 @@ vm() { # vm <dir> [radios: both|zwave-only|served|blank] [ser2net active: 0|1]
   local rec; rec="echo \"\$(basename \$0) \$*\" >> '$d/calls'"
   fake "$d/bin" id 'case "${1:-}" in -u) echo 0;; *) command -p id "$@";; esac'
   fake "$d/bin" ip 'printf "2: eth0    inet 192.168.1.44/24 scope global eth0\n3: eth1    inet 10.20.30.6/24 scope global eth1\n"'
-  fake "$d/bin" systemctl "$rec; case \"\$1\" in is-active) u=\${*: -1}; [ \"\$(cat '$d/'\$u 2>/dev/null)\" = 1 ];; disable) case \" \$* \" in *' --now '*) echo 0 > '$d/'\${*: -1};; esac;; *) exit 0;; esac"
+  # (a stop of the nightly timer: the timer's file as it is at that moment is kept as <dir>/timer-at-stop; <dir>/stop-fail: it fails)
+  fake "$d/bin" systemctl "$rec; case \"\$1\" in is-active) u=\${*: -1}; [ \"\$(cat '$d/'\$u 2>/dev/null)\" = 1 ];; disable) case \" \$* \" in *' --now '*) echo 0 > '$d/'\${*: -1};; esac;; stop) [ ! -f '$d/stop-fail' ] || exit 1; [ \"\$2\" != zradio-sync.timer ] || cp '$d/root/etc/systemd/system/zradio-sync.timer' '$d/timer-at-stop';; *) exit 0;; esac"
   fake "$d/bin" dpkg-query "grep -qx \"\${*: -1}\" '$d/pkgs' && { case \"\$*\" in *Status*) printf 'install ok installed';; *) printf '1.2.3-1';; esac; exit 0; }; exit 1"
   fake "$d/bin" apt-get "$rec; [ -f '$d/apt-fail' ] && exit 100; echo \"\${*: -1}\" >> '$d/pkgs'; case \"\${*: -1}\" in keepalived|ser2net) echo 1 > '$d/'\${*: -1};; esac; exit 0"
   fake "$d/bin" keepalived "$rec; [ -f '$d/kt-fail' ] && { echo 'Unknown keyword'; exit 1; }; [ -f '$d/kt-warn' ] && echo \"(x: Line 31) Unknown keyword 'check_unicast_srcx'\"; exit 0"

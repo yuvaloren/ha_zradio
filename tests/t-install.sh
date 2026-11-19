@@ -231,13 +231,26 @@ echo "# an older kit's" >> "$T/up/root/usr/local/lib/zradio/zradio-common.sh"; :
 check "zradio-common.sh changed (every tool sources it): the gate, which runs all the time, is restarted on it" bash -c '[ "$2" = 0 ] && grep -qx "systemctl restart zradio-gate.service" "$1/calls"' _ "$T/up" "$RC"
 check "a unit the target wants that is not running here (new in this kit): started; what runs already, and keepalived, are not touched" bash -c 'grep -qx "systemctl start zradio-state.timer" "$1/calls" && ! grep -qE "^systemctl start (zradio-sync.timer|zradio-sync-tick.timer|zradio-gate.service|zradio-change-watch.service|keepalived)" "$1/calls"' _ "$T/up"
 echo "SYNC_AT=03:15" >> "$T/up/my.conf"; : > "$T/up/calls"; inst "$T/up" --conf "$T/up/my.conf" --run
-check "SYNC_AT changed: the nightly timer, which is running, is restarted (systemd keeps the old time until then); the gate reads the new conf" bash -c '[ "$2" = 0 ] && grep -qx "systemctl restart zradio-sync.timer" "$1/calls" && grep -qx "systemctl restart zradio-gate.service" "$1/calls"' _ "$T/up" "$RC"
+order() { local a b c; a=$(grep -nx "systemctl stop zradio-sync.timer" "$1/calls" | head -1 | cut -d: -f1); b=$(grep -nx "systemctl daemon-reload" "$1/calls" | head -1 | cut -d: -f1); c=$(grep -nx "systemctl start zradio-sync.timer" "$1/calls" | tail -1 | cut -d: -f1); [ -n "$a" ] && [ -n "$b" ] && [ -n "$c" ] && [ "$a" -lt "$b" ] && [ "$b" -lt "$c" ]; }
+export -f order
+check "SYNC_AT changed and the nightly timer runs: it is stopped BEFORE its file changes and before systemd reads it again, and started after (a timer that ran, read again with a new time, runs the sync at the reload: 2026-11-18)" bash -c '[ "$2" = 0 ] && order "$1" && grep -q "^OnCalendar=\*-\*-\* 04:30:00" "$1/timer-at-stop" && grep -q "^OnCalendar=\*-\*-\* 03:15:00" "$1/root/etc/systemd/system/zradio-sync.timer"' _ "$T/up" "$RC"
+check "…once each, never a restart of it (a restart comes after the reload, too late), and it is said; the gate reads the new conf" bash -c '[ "$(grep -c "^systemctl \(stop\|start\|restart\) zradio-sync.timer" "$1/calls")" = 2 ] && grep -q "OK    zradio-sync.timer was stopped while its file changed and runs again: the nightly sync is next at 03:15, not now" "$1/out" && grep -qx "systemctl restart zradio-gate.service" "$1/calls"' _ "$T/up" "$RC"
+: > "$T/up/calls"; inst "$T/up" --conf "$T/up/my.conf" --run
+check "the same again: the timer's file is as it should be, and the timer is left alone" bash -c '[ "$2" = 0 ] && ! grep -q "zradio-sync.timer$" <(grep "^systemctl \(stop\|start\|restart\)" "$1/calls")' _ "$T/up" "$RC"
+sed -i "s/^SYNC_AT=.*/SYNC_AT=02:10/" "$T/up/my.conf"; : > "$T/up/calls"; inst "$T/up" --conf "$T/up/my.conf"
+check "report mode with a new time: it says the timer would be stopped across the change, and stops nothing" bash -c 'grep -q "WOULD stop zradio-sync.timer while its file changes and start it after the reload" "$1/out" && ! grep -q "^systemctl \(stop\|start\)" "$1/calls"' _ "$T/up"
+: > "$T/up/kt-fail"; : > "$T/up/calls"; inst "$T/up" --conf "$T/up/my.conf" --run; rm -f "$T/up/kt-fail"
+check "a run that fails after the stop (here: keepalived refuses its config, so the run ends before the units): the timer is started again all the same, after a reload" bash -c '[ "$2" != 0 ] && grep -q "FAILED before the units were touched" "$1/out" && order "$1"' _ "$T/up" "$RC"
+sed -i "s/^SYNC_AT=.*/SYNC_AT=01:05/" "$T/up/my.conf"; : > "$T/up/stop-fail"; : > "$T/up/calls"; inst "$T/up" --conf "$T/up/my.conf" --run; rm -f "$T/up/stop-fail"
+check "the stop fails: said with what may follow, and no start that was not owed" bash -c '[ "$2" = 0 ] && grep -q "WARN  systemctl stop zradio-sync.timer failed: if its time changes, systemd may run the nightly sync at the reload" "$1/out" && ! grep -qx "systemctl start zradio-sync.timer" "$1/calls"' _ "$T/up" "$RC"
 echo "# again" >> "$T/up/root/usr/local/lib/zradio/zradio-common.sh"; mkdir -p "$T/up/root/run/zradio"
 ( exec 9>"$T/up/root/run/zradio/sync-out.lock"; flock 9; sleep 3 ) & LP=$!
 sleep 0.3; : > "$T/up/calls"; ZRADIO_INSTALL_RESTART_WAIT=1 inst "$T/up" --run; wait "$LP"
 check "a sync runs here (restarting the gate or the watcher ends what they started — a self-raise, a device-change sync): not restarted, and said with the line to run later" bash -c '[ "$2" = 0 ] && ! grep -q "^systemctl restart zradio-gate" "$1/calls" && grep -q "WARN  .*a sync is running here.*systemctl restart zradio-gate.service" "$1/out"' _ "$T/up" "$RC"
 vm "$T/nu"; inst "$T/nu" --conf "$T/nu/my.conf" --run
 check "a VM that is not in the pair yet (zradio.target not started): nothing is started or restarted" bash -c '! grep -qE "^systemctl (start|restart)" "$1/calls"' _ "$T/nu"
+echo "SYNC_AT=03:15" >> "$T/nu/my.conf"; : > "$T/nu/calls"; inst "$T/nu" --conf "$T/nu/my.conf" --run
+check "…and a new time there: the timer does not run, so there is nothing to stop or start" bash -c '[ "$2" = 0 ] && grep -q "^OnCalendar=\*-\*-\* 03:15:00" "$1/root/etc/systemd/system/zradio-sync.timer" && ! grep -qE "^systemctl (stop|start|restart)" "$1/calls"' _ "$T/nu" "$RC"
 
 echo "-- a stick whose network could not be told"
 vm "$T/hn"; : > "$T/hn/detect-unknown"; inst "$T/hn" --conf "$T/hn/my.conf" --run --initial-role primary
