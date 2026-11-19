@@ -6,7 +6,8 @@
 # left alone. The VM that does not serve goes first, so a failed update leaves the one that serves untouched.
 # First of all, this node's own part: the kit's hookscript, this VM's stick power and its helper (host/hook.sh), and
 # its sticks named directly (host=) where kit 0.1.0 had named them through USB mappings. It needs no answer from any
-# VM, so it is put right on a VM that is stopped too; the stick lines are changed only on a stopped one.
+# VM, so it is put right on a VM that is stopped too; the stick lines are changed only on a stopped one — stopped as its
+# node says now (vm_state), not as the cluster's list has it.
 
 if [ -n "$UPDATE" ]; then
   U=$(printf '%s\n' "$MINE" | awk -v n="$UPDATE" '$2 == n')
@@ -31,7 +32,7 @@ print(s.get("path", "") if "snippets" in s.get("content", "").split(",") else ""
 power_check "$UNAME" "$(vm_sticks "$UVMID")"
 [ $FAILS -eq 0 ] || { echo "== $FAILS FAIL — nothing was changed =="; exit 1; }
 hook_setup "$UVMID" "$UNAME" yes || { echo "== $FAILS FAIL =="; exit 1; }
-URUN=no; printf '%s\n' "$VMS" | awk -v i="$UVMID" '$1 == i && $4 == "running" { f = 1 } END { exit !f }' && URUN=yes
+URUN=yes; [ "$(vm_state "$NODE" "$UVMID")" != stopped ] || URUN=no      # asked of the node: the cluster's list lags a shutdown and a start
 UPOWER=no; { [ ${#POWER[@]} -gt 0 ] || { [ $NOPOWER = 0 ] && grep -q '^POWER_PORTS=.' "$SNIPDIR/zradio-hook-$UVMID.conf" 2>/dev/null; }; } && UPOWER=yes
 helper_setup "$UVMID" "$UNAME" "$URUN" "$UPOWER"
 HOST_CHANGES=$HOOK_CHANGES
@@ -56,8 +57,8 @@ TODO=() STOPPED=() SERVES="" HA=""      # HA: what ha_lines takes, from the firs
 for t in "${TARGETS[@]}"; do
   read -r tn ti tname <<< "$t"
   if ! agent_up "$tn" "$ti"; then
-    if printf '%s\n' "$VMS" | awk -v i="$ti" '$1 == i && $4 != "running" { f = 1 } END { exit !f }'; then STOPPED+=("$tname"); warn "$tname on $tn is not running: which kit it holds was not looked at. Start it (qm start $ti on $tn), then this again"
-    else bad "$tname on $tn does not answer (its guest agent): start it first (qm start $ti on $tn)"; fi
+    if [ "$(vm_state "$tn" "$ti")" != running ]; then STOPPED+=("$tname"); warn "$tname on $tn is not running: which kit it holds was not looked at. Start it (qm start $ti on $tn), then this again"
+    else bad "$tname on $tn runs and does not answer (its guest agent): if it has just started, give it a minute and run this again"; fi
     continue
   fi
   st=$(vm_kit "$tn" "$ti") || { bad "could not ask $tname which kit it runs (through its guest agent)"; continue; }

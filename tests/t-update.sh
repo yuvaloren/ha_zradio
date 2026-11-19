@@ -74,7 +74,12 @@ sed -i '/^usb/d' "$T/w/pve/nodes/nodea/qemu-server/109.conf"          # (attic1'
 zvm "$T/w" --name attic5 --initial-role primary --vip 192.168.1.21 --no-pair --vmid 150
 check "--name of a VM that does not exist: a new VM, not an update" bash -c '! grep -q "an update to" "$1/out" && grep -q "WOULD qm create" "$1/out"' _ "$T/w"
 : > "$T/w/agent-down-110"; zvm "$T/w" --run
-check "the other VM does not answer: refused before anything is sent, with how to start it" bash -c '[ "$2" = 1 ] && grep -q "attic2 on nodeb does not answer (its guest agent): start it first" "$1/out" && [ "$(pieces "$1")" = 0 ]' _ "$T/w" "$RC"
+check "the other VM runs and does not answer: refused before anything is sent, and said that it may just have started" bash -c '[ "$2" = 1 ] && grep -q "attic2 on nodeb runs and does not answer (its guest agent): if it has just started, give it a minute" "$1/out" && [ "$(pieces "$1")" = 0 ]' _ "$T/w" "$RC"
+echo stopped > "$T/w/state-110"; : > "$T/w/calls"; zvm "$T/w" --run
+check "…the cluster's list still says it runs, its node says stopped (the list lags a shutdown by up to 10 s): the node is believed — not running, said, no FAIL" bash -c '[ "$2" = 0 ] && grep -q "NOTE  attic2 on nodeb is not running" "$1/out" && ! grep -q "does not answer" "$1/out"' _ "$T/w" "$RC"
+rm "$T/w/state-110"; : > "$T/w/node-silent-nodeb"; zvm "$T/w" --run
+check "…its node gives no answer about it: the list is what is left, and it says running — refused as before" bash -c '[ "$2" = 1 ] && grep -q "attic2 on nodeb runs and does not answer" "$1/out"' _ "$T/w" "$RC"
+rm "$T/w/node-silent-nodeb" "$T/w/agent-down-110"
 
 echo "-- a second try after a failed update keeps the kit to go back to"
 pair "$T/k"; for id in 109 110; do mkdir -p "$T/k/g/$id/root/opt/zradio/kit/gen"; echo "the kit that works" > "$T/k/g/$id/root/opt/zradio/kit/marker"; echo "CONTENT=0000000000000000" > "$T/k/g/$id/root/opt/zradio/kit/gen/kit-version"; done
@@ -128,6 +133,17 @@ zvm "$T/u2" --run
 check "--run: each stick by its id; the other node's VM and the mappings themselves are not touched" bash -c '[ "$2" = 0 ] && grep -qx "qm set 109 --usb0 host=10c4:ea70" "$1/calls" && grep -qx "qm set 109 --usb1 host=10c4:ea60" "$1/calls" && ! grep -q "^qm set 110 --usb\|^pvesh \(set\|create\|delete\) /cluster/mapping" "$1/calls"' _ "$T/u2" "$RC"
 : > "$T/u2/calls"; zvm "$T/u2" --run
 check "the same again: nothing to change, and said" bash -c '! grep -q "^qm set 109 --usb" "$1/calls" && grep -q "OK    attic1.s sticks are named directly (host=): it starts with or without them" "$1/out"' _ "$T/u2"
+echo "-- the cluster's list lags the node by up to 10 s (ob2, 2026-11-19: ./install.sh two seconds after qm shutdown): the node is asked"
+pair "$T/u5"; : > "$T/u5/agent-down-109"; echo stopped > "$T/u5/state-109"; zvm "$T/u5"
+check "just shut down — the list still says running, the node says stopped: the two lines it would set, not running said, no FAIL" bash -c '[ "$2" = 0 ] && grep -q "WOULD qm set 109 --usb0 host=10c4:ea70" "$1/out" && grep -q "WOULD qm set 109 --usb1 host=10c4:ea60" "$1/out" && grep -q "NOTE  attic1 on nodea is not running" "$1/out" && ! grep -q "and runs\|does not answer\|FAIL" "$1/out"' _ "$T/u5" "$RC"
+zvm "$T/u5" --stick-power 1-3:2 --stick-power 2-4:2 --run
+check "…--run: the lines are set, and no helper is started for a VM that does not run" bash -c '[ "$2" = 0 ] && grep -qx "qm set 109 --usb0 host=10c4:ea70" "$1/calls" && grep -qx "qm set 109 --usb1 host=10c4:ea60" "$1/calls" && ! grep -q "^systemd-run" "$1/calls"' _ "$T/u5" "$RC"
+pair "$T/u6"; sed -i 's/"name": "attic1", "node": "nodea", "status": "running"/"name": "attic1", "node": "nodea", "status": "stopped"/' "$T/u6/vms.json"; echo running > "$T/u6/state-109"; zvm "$T/u6" --run
+check "just started — the list still says stopped, the node says running: no usb line is touched (a change would unplug the sticks of a running VM)" bash -c '! grep -q "^qm set 109 --usb" "$1/calls" && grep -q "^usb0: mapping=zradio-10c4ea70$" "$1/pve/nodes/nodea/qemu-server/109.conf" && grep -q "names 2 stick(s) through USB mappings and runs" "$1/out"' _ "$T/u6"
+pair "$T/u7"; : > "$T/u7/node-silent-nodea"; zvm "$T/u7" --run
+check "the node gives no answer about its own VM: the list is what is left (it says running), no usb line is touched" bash -c '! grep -q "^qm set 109 --usb" "$1/calls" && grep -q "and runs" "$1/out"' _ "$T/u7"
+pair "$T/u8"; python3 -c 'import json, sys; json.dump([v for v in json.load(open(sys.argv[1])) if v["vmid"] != 109] + [{"vmid": 109, "name": "attic1", "node": "nodea", "tags": "zradio", "type": "qemu"}], open(sys.argv[1], "w"))' "$T/u8/vms.json"; : > "$T/u8/node-silent-nodea"; zvm "$T/u8" --run
+check "neither the node nor the list says whether it runs: no usb line is touched (only a VM known to be stopped is changed)" bash -c '! grep -q "^qm set 109 --usb" "$1/calls" && grep -q "^usb0: mapping=zradio-10c4ea70$" "$1/pve/nodes/nodea/qemu-server/109.conf"' _ "$T/u8"
 pair "$T/u3"; stopped "$T/u3"
 echo '[{"id":"zradio-10c4ea60-1","map":["node=nodea,id=10c4:ea60,path=1-3.2.1"]},{"id":"zradio-10c4ea60-2","map":["node=nodea,id=10c4:ea60,path=1-3.2.4"]},{"id":"zwave","map":["node=nodea,id=10c4:ea70"]}]' > "$T/u3/usbmap.json"
 vmconf "$T/u3" nodea/109 "name: attic1" "cicustom: user=local:snippets/attic1-zradio.yaml" "usb0: mapping=zradio-10c4ea60-1,usb3=1" "usb1: mapping=zradio-10c4ea60-2" "usb2: mapping=zwave" "hookscript: local:snippets/zradio-hook.sh" "tags: zradio"

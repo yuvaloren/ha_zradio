@@ -288,6 +288,12 @@ node "$T/x3"; echo '[{"vmid":108,"name":"old2","node":"nodea","status":"running"
 check "a RUNNING VM has --self already: refused (two VMs on one address)" bash -c '[ "$2" = 1 ] && grep -q "old2 runs with the address 10.20.30.6 already" "$1/out" && [ ! -s "$1/calls" ]' _ "$T/x3" "$RC"
 echo '[{"vmid":108,"name":"old2","node":"nodea","status":"stopped"}]' > "$T/x3/vms.json"; zvm "$T/x3" "${BASE[@]}" --run
 check "…the same VM stopped (the one this VM replaces): said, and the build goes on" bash -c '[ "$2" = 0 ] && grep -q "NOTE  old2 (stopped) is configured with 10.20.30.6 too: it must stay stopped" "$1/out" && grep -q "^qm create" "$1/calls"' _ "$T/x3" "$RC"
+node "$T/x3b"; echo '[{"vmid":108,"name":"old2","node":"nodea","status":"stopped"}]' > "$T/x3b/vms.json"; vmconf "$T/x3b" nodea/108 "ipconfig1: ip=10.20.30.6/24" "usb0: host=1-1"; echo running > "$T/x3b/state-108"; zvm "$T/x3b" "${BASE[@]}" --run
+check "…that VM has just been started — the cluster's list still says stopped, its node says running: the node is believed, refused" bash -c '[ "$2" = 1 ] && grep -q "old2 runs with the address 10.20.30.6 already" "$1/out" && [ ! -s "$1/calls" ]' _ "$T/x3b" "$RC"
+echo '[{"vmid":108,"name":"old2","node":"nodea","status":"running"}]' > "$T/x3b/vms.json"; echo stopped > "$T/x3b/state-108"; zvm "$T/x3b" "${BASE[@]}" --run
+check "…just shut down — the list still says running, its node says stopped: said, and the build goes on" bash -c '[ "$2" = 0 ] && grep -q "NOTE  old2 (stopped) is configured with 10.20.30.6 too" "$1/out" && grep -q "^qm create" "$1/calls"' _ "$T/x3b" "$RC"
+node "$T/x3c"; echo '[{"vmid":108,"name":"old2","node":"nodeb","status":"stopped"}]' > "$T/x3c/vms.json"; vmconf "$T/x3c" nodeb/108 "ipconfig1: ip=10.20.30.6/24"; echo running > "$T/x3c/state-108"; zvm "$T/x3c" "${BASE[@]}" --run
+check "…and a VM on the OTHER node that has just been started: its own node is the one asked, refused" bash -c '[ "$2" = 1 ] && grep -q "old2 runs with the address 10.20.30.6 already" "$1/out" && [ ! -s "$1/calls" ]' _ "$T/x3c" "$RC"
 node "$T/x4"; cp "$T/m/usbmap.json" "$T/x4/usbmap.json"; echo '[{"vmid":108,"name":"old2","node":"nodea","status":"running"}]' > "$T/x4/vms.json"; vmconf "$T/x4" nodea/108 "usb0: mapping=zwave" "usb1: mapping=zigbee"
 zvm "$T/x4" "${BASE[@]}" --usb-mapping zwave --usb-mapping zigbee --run
 check "a RUNNING VM on this node passes the same mapping through: refused (two VMs on one stick)" bash -c '[ "$2" = 1 ] && grep -c "the running VM old2 on nodea has the USB device 10c4:ea.0 (mapping=z[a-z]* here) passed through already" "$1/out" | grep -qx 2 && [ ! -s "$1/calls" ]' _ "$T/x4" "$RC"
@@ -300,6 +306,9 @@ check "…a mapping whose name only starts the same, or a usb line in a snapshot
 echo '[{"vmid":108,"name":"old2","node":"nodea","status":"stopped"}]' > "$T/x4/vms.json"; vmconf "$T/x4" nodea/108 "usb0: mapping=zwave" "usb1: mapping=zigbee"; : > "$T/x4/calls"; zvm "$T/x4" "${BASE[@]}" --name zr8 --usb-mapping zwave --usb-mapping zigbee --run
 check "…the same VM STOPPED still carries the sticks: the build goes on (stopping it was the point)" eq "$RC" 0
 check "…and it is said that its usb lines should come off (something may start it: a backup in stop mode does)" bash -c 'grep -c "NOTE  old2 (not running) on nodea still has the USB device" "$1/out" | grep -qx 2' _ "$T/x4"
+echo running > "$T/x4/state-108"; : > "$T/x4/calls"; zvm "$T/x4" "${BASE[@]}" --name zr9 --usb-mapping zwave --usb-mapping zigbee --run
+check "…and just started again — the list still says stopped, its node says running: refused (two VMs on one stick)" bash -c '[ "$2" = 1 ] && grep -c "the running VM old2 on nodea has the USB device" "$1/out" | grep -qx 2 && [ ! -s "$1/calls" ]' _ "$T/x4" "$RC"
+rm "$T/x4/state-108"
 node "$T/x5"; echo "2 2" > "$T/x5/votes"; zvm "$T/x5" "${BASE[@]}" --run
 check "two votes (two nodes, no third vote): built all the same, what that costs said once, and a third vote recommended" bash -c '[ "$2" = 0 ] && grep -c "this cluster has 2 vote(s) and needs 2: while one node is down, Proxmox starts no VM on the other, zr2 among them, at boot or by hand" "$1/out" | grep -qx 1 && grep -q "pvecm expected 1" "$1/out" && grep -q "Recommended: a third vote" "$1/out" && grep -q "^qm start 109" "$1/calls"' _ "$T/x5" "$RC"
 node "$T/x5b"; rm -f "$T/x5b/votes"; zvm "$T/x5b" "${BASE[@]}"

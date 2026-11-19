@@ -15,6 +15,8 @@
 #     The VM's conf is the one cloud-init wrote; one without SELF (a VM on DHCP) gets the address in <dir>/lease.
 #   live (touch <dir>/live): qm create really registers the VM in the cluster's files, and the guests are the fake
 #     radio VMs of tests/fake-guest.sh, in which the kit's real installer runs (tests/t-e2e.sh).
+#   state-<vmid> (running|stopped): what the VM's own node says, when the cluster's list (vms.json) lags behind it;
+#     node-silent-<node>: that node does not answer for its VMs.
 #   FAKE_NODE=nodeb: the command runs on the other node (its sticks: <dir>/sys-nodeb).
 node() {
   local d=$1 sticks=${2:-both}
@@ -60,9 +62,26 @@ node() {
     'get /storage') cat '$d/storages.json';;
     'get /storage/local') python3 -c 'import json,sys; print(json.dumps([s for s in json.load(open(sys.argv[1])) if s[\"storage\"] == \"local\"][0]))' '$d/storages.json';;
     *\\ /nodes/*/qemu/*/agent/*) exec '$d/bin/ga' \"\$@\";;
+    get\\ /nodes/*/qemu/*/status/current) exec '$d/bin/vmstate' \"\$2\";;
     get\\ *) exit 2;;
     *) $rec; [ ! -f '$d/pvesh-fail' ];;
   esac"
+  # vmstate: what a VM's own node says of it right now (pvesh get /nodes/<node>/qemu/<vmid>/status/current): what the
+  # cluster's list has (vms.json), unless <dir>/state-<vmid> says running or stopped — on a real cluster the list lags
+  # the node by up to 10 s after a shutdown or a start. <dir>/node-silent-<node>: that node gives no answer.
+  cat > "$d/bin/vmstate" <<SH
+#!/usr/bin/env bash
+p=\${1#/nodes/}; node=\${p%%/*}; id=\${p#*/qemu/}; id=\${id%%/*}
+[ ! -f "$d/node-silent-\$node" ] || exit 2
+# a node answers for its own VMs only
+on=\$(python3 -c 'import json, sys; print(next((v.get("node", "") for v in json.load(open(sys.argv[1])) if v.get("vmid") == int(sys.argv[2])), ""))' "$d/vms.json" "\$id")
+[ -z "\$on" ] || [ "\$on" = "\$node" ] || exit 2
+if [ -f "$d/state-\$id" ]; then s=\$(cat "$d/state-\$id")
+else s=\$(python3 -c 'import json, sys; print(next((v.get("status", "") for v in json.load(open(sys.argv[1])) if v.get("vmid") == int(sys.argv[2])), ""))' "$d/vms.json" "\$id"); fi
+[ -n "\$s" ] || exit 2
+printf '{"status":"%s","vmid":%s}\\n' "\$s" "\$id"
+SH
+  chmod +x "$d/bin/vmstate"
   # vmreg: in a live cluster, qm create / start show up in the cluster's own files, as on a real one
   cat > "$d/bin/vmreg" <<SH
 #!/usr/bin/env bash

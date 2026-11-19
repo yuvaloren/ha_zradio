@@ -203,7 +203,7 @@ if printf '%s\n' "$VMS" | awk -v i="$VMID" '$1 == i { f = 1 } END { exit !f }'; 
 for f in "$PVE"/nodes/*/qemu-server/*.conf; do
   [ -f "$f" ] && [ $DHCP = 0 ] || continue
   grep -qE "^ipconfig[0-9]+:.*ip=${SELF%/*}/" "$f" || continue
-  oid=$(basename "$f" .conf); oname=$(printf '%s\n' "$VMS" | awk -v i="$oid" '$1 == i { print $2 }'); ost=$(printf '%s\n' "$VMS" | awk -v i="$oid" '$1 == i { print $4 }')
+  oid=$(basename "$f" .conf); oname=$(printf '%s\n' "$VMS" | awk -v i="$oid" '$1 == i { print $2 }'); on=${f%/qemu-server/*}; ost=$(vm_state "${on##*/}" "$oid")
   if [ "$ost" = running ]; then bad "${oname:-VM $oid} runs with the address ${SELF%/*} already: two VMs on one address. Stop it first (it is the VM this one replaces?), or give this one another --self"
   else warn "${oname:-VM $oid} (${ost:-stopped}) is configured with ${SELF%/*} too: it must stay stopped while $NAME runs"; fi
 done
@@ -248,7 +248,6 @@ vm_with_usb() { # vm_with_usb running|idle <vid:pid> [<bus-port>]: prints the na
   for f in "$PVE"/nodes/"$NODE"/qemu-server/*.conf; do
     [ -f "$f" ] || continue
     id=$(basename "$f" .conf)
-    if printf '%s\n' "$VMS" | awk -v i="$id" '$1 == i && $4 == "running" { f = 1 } END { exit !f }'; then [ "$want" = running ] || continue; else [ "$want" = idle ] || continue; fi
     while read -r line; do
       case "$line" in
         *mapping=*) v=${line##*mapping=}; v=${v%%,*}
@@ -257,6 +256,8 @@ vm_with_usb() { # vm_with_usb running|idle <vid:pid> [<bus-port>]: prints the na
           [ "${v,,}" = "$1" ] || { [ -n "${2:-}" ] && [ "$v" = "$2" ]; } || continue;;
         *) continue;;
       esac
+      # one of its lines reaches the device: does it run? Asked of the node, and only now (one question per such VM)
+      if [ "$(vm_state "$NODE" "$id")" = running ]; then [ "$want" = running ] || continue 2; else [ "$want" = idle ] || continue 2; fi
       v=$(printf '%s\n' "$VMS" | awk -v i="$id" '$1 == i { print $2 }'); echo "${v:-VM $id}"; return 0
     done < <(sed -n '/^\[/q; /^usb[0-9]*:/p' "$f")          # the current config only, not its snapshots' sections
   done

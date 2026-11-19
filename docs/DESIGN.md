@@ -534,7 +534,11 @@ Before any of that, the run puts this node's own part right: the hookscript's fi
 On a VM that is stopped it also names the sticks directly where kit 0.1.0 had named them through USB mappings
 (`qm shutdown`, the installer, `qm start`: the VM that does not serve first); on a running VM it says that this is
 still to do. That needs no answer from a VM, so it also reaches a VM that is stopped; such a VM's kit is looked at
-once it runs. The hookscript is a file of
+once it runs. Whether a VM runs is asked of the node it is on (`/nodes/<node>/qemu/<vmid>/status/current`, which that
+node answers from the VM's pid file), not read from the cluster's list of VMs: pvestatd refreshes that list every
+10 s, so for some seconds after a shutdown it still says running and after a start still stopped. An installer run
+right after `qm shutdown` took the stopped VM for running and left its stick lines; run right after a start it
+would have changed the lines of a running VM. Only a VM known to be stopped is changed. The hookscript is a file of
 each node: the VMs' kits are updated from either node, the hookscripts by a run on each.
 
 **Versions.** No version number is kept in a file. A release is a GitHub release of a git tag (`v0.1.0`): `get.sh`

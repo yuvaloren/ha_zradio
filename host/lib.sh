@@ -74,6 +74,19 @@ try: vms = json.load(sys.stdin)
 except ValueError: vms = []
 for v in vms: print(v.get("vmid"), "_".join(str(v.get("name") or "-").split()), v.get("node", "-"), v.get("status", "-"), v.get("tags") or "-")'
 }
+vm_state() { # vm_state <node> <vmid>: running | stopped | unknown — as the VM's own node says NOW. The cluster's list (VMS, vm_lines)
+  # is what pvestatd last sent, and it sends every 10 s: for some seconds after a shutdown the list still says running,
+  # and after a start still stopped (ob2, 2026-11-19: ./install.sh two seconds after qm shutdown took the VM for running,
+  # left its stick lines, and then failed on its silent guest agent). /nodes/<node>/qemu/<vmid>/status/current is
+  # answered by the node the VM is on, from the VM's pid file. Only when that gives no answer: what the list said.
+  local s
+  s=$(pvesh get "/nodes/$1/qemu/$2/status/current" --output-format json 2>/dev/null | python3 -c '
+import json, sys
+try: print(json.load(sys.stdin).get("status") or "")
+except (ValueError, AttributeError): pass' 2>/dev/null)
+  [ -n "$s" ] || s=$(printf '%s\n' "$VMS" | awk -v i="$2" '$1 == i { print $4; exit }')
+  echo "${s:-unknown}"
+}
 kit_vms() { # kit_vms here|elsewhere: the kit's radio VMs (tag zradio) on this node, or on the other nodes: vm_lines' lines
   printf '%s\n' "$VMS" | awk -v me="$NODE" -v w="$1" '(";" $5 ";") ~ /;zradio;/ && (w == "here") == ($3 == me)'
 }
